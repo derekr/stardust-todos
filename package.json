@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "A todo app backed by Stardust — with a CLI and a Datastar web UI, both live via reactor SSE.",
+  "description": "A todo app backed by Stardust \u2014 with a CLI and a Datastar web UI, both live via reactor SSE.",
   "scripts": {
     "web": "node src/server.ts",
     "cli": "node src/cli.ts",
@@ -12,9 +12,19 @@
     "demo:projects": "node src/demo-projects.ts",
     "demo:workflow": "node src/demo-workflow.ts",
     "worker": "node src/worker.ts",
-    "seed": "node src/seed-demo.ts"
+    "seed": "node src/seed-demo.ts",
+    "typecheck": "tsgo --noEmit",
+    "gen:types": "node scripts/gen-types.ts",
+    "demo:typed": "node src/demo-typed.ts"
   },
   "dependencies": {
-    "@starfederation/datastar-sdk": "^1.0.0"
+    "@starfederation/datastar-sdk": "^1.0.0",
+    "arktype": "^2.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "@typescript/native-preview": "^7.0.0-dev.20260707.2",
+    "json-schema-to-typescript": "^15.0.4",
+    "openapi-typescript": "^7.13.0"
   }
 }

@@ -158,9 +158,13 @@ export async function createReactor(body: unknown): Promise<EntityId> {
   return (await req("POST", "/reactors.json", { body })).json.reactorId["#"];
 }
 
-/** Run a one-shot datalog query (find/where/...) without storing a reactor. */
-export async function query(body: unknown): Promise<unknown[]> {
-  return (await req("POST", "/reactors/dry-run.json", { body })).json as unknown[];
+/**
+ * Run a one-shot datalog query (find/where/...) without storing a reactor.
+ * `Row` types the result: `query<[EntityId, string]>(...)` for find-tuples, or
+ * `query<Pick<Todo, "title" | "status">>(...)` for a `then.project` shape.
+ */
+export async function query<Row = unknown>(body: unknown): Promise<Row[]> {
+  return (await req("POST", "/reactors/dry-run.json", { body })).json as Row[];
 }
 
 export async function readResults(id: EntityId): Promise<unknown[]> {
