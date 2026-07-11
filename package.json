@@ -7,7 +7,8 @@
   "scripts": {
     "web": "node src/server.ts",
     "cli": "node src/cli.ts",
-    "demo:tenancy": "node src/demo-tenancy.ts"
+    "demo:tenancy": "node src/demo-tenancy.ts",
+    "demo:fields": "node src/demo-fields.ts"
   },
   "dependencies": {
     "@starfederation/datastar-sdk": "^1.0.0"

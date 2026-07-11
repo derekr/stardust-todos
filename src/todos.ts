@@ -14,6 +14,7 @@ import type { WorkspaceCtx } from "./workspace.ts";
 import { APP } from "./tenancy.ts";
 import {
   type EntityId,
+  type MergePatch,
   createSchema,
   createSchemaEntity,
   deleteEntity,
@@ -28,6 +29,7 @@ import {
 } from "./stardust.ts";
 
 export type Priority = "low" | "med" | "high";
+export type Status = "todo" | "doing" | "blocked" | "done";
 
 export interface Todo {
   id: EntityId;
@@ -42,13 +44,18 @@ interface TodoDoc {
   priority: Priority;
   workspace: { "#": EntityId };
   app: string;
+  status?: Status;
+  due?: { "#utc": string };
+  project?: { "#": EntityId };
 }
 
 const STATE_FILE = new URL("../.state.json", import.meta.url);
 
-// Evolved schema: a schema-written todo is born reactor-ready — it carries its
-// own `workspace` ref and `app` tag, so ONE write produces the exact shape the
-// reactor expects (no follow-up transact to tag it).
+// Evolved schema. It has grown three times without a rewrite or downtime:
+//   v1  title, done, priority
+//   v2  + workspace, app        (multi-tenancy)
+//   v3  + status, due, project  (richer exploration fields)
+// Old todos stay valid facts; new fields are optional, so nothing breaks.
 const TODO_SCHEMA = {
   title: "Todo",
   type: "object",
@@ -59,6 +66,9 @@ const TODO_SCHEMA = {
     priority: { type: "string", enum: ["low", "med", "high"] },
     workspace: { type: "object" },
     app: { type: "string" },
+    status: { type: "string", enum: ["todo", "doing", "blocked", "done"] },
+    due: { type: "object" }, // Stardust instant {#utc ...}
+    project: { type: "object" }, // ref to a project entity
   },
   additionalProperties: false,
 };
@@ -83,7 +93,13 @@ export async function ensureTodoSchema(): Promise<EntityId> {
     // In-place evolution of an existing single-tenant schema: add `workspace`,
     // replace `required`. Merge-patch — existing todos are not migrated.
     await patchSchema(schemaId, {
-      properties: { workspace: { type: "object" }, app: { type: "string" } },
+      properties: {
+        workspace: { type: "object" },
+        app: { type: "string" },
+        status: { type: "string", enum: ["todo", "doing", "blocked", "done"] },
+        due: { type: "object" },
+        project: { type: "object" },
+      },
       required: ["title", "done", "workspace", "app"],
     });
   } else {
@@ -110,15 +126,22 @@ async function authorizeWrite(ctx: WorkspaceCtx, id: EntityId): Promise<Record<s
 
 // ---- Commands (all scoped to ctx) ----------------------------------------
 
-export async function addTodo(ctx: WorkspaceCtx, title: string, priority: Priority = "med"): Promise<EntityId> {
+export async function addTodo(
+  ctx: WorkspaceCtx,
+  title: string,
+  priority: Priority = "med",
+  extra: Partial<Pick<TodoDoc, "due" | "project">> = {},
+): Promise<EntityId> {
   const schemaId = await ensureTodoSchema();
   // ONE write: schema-validated todo, born with its workspace ref + app tag.
   const created = await createSchemaEntity<TodoDoc>(schemaId, {
     title,
     done: false,
+    status: "todo",
     priority,
     workspace: { "#": ctx.workspaceId },
     app: APP,
+    ...extra,
   });
   if (!created.ok) {
     const why = created.error.details.map((d) => `${d.instanceLocation} ${JSON.stringify(d.errors)}`).join(", ");
@@ -127,18 +150,31 @@ export async function addTodo(ctx: WorkspaceCtx, title: string, priority: Priori
   return created.entityId;
 }
 
-export async function setDone(ctx: WorkspaceCtx, id: EntityId, done: boolean): Promise<void> {
+async function patchTodo(ctx: WorkspaceCtx, id: EntityId, patch: MergePatch<TodoDoc>): Promise<void> {
   await authorizeWrite(ctx, id);
   const schemaId = await ensureTodoSchema();
-  const r = await patchSchemaEntity<TodoDoc>(schemaId, id, { done });
+  const r = await patchSchemaEntity<TodoDoc>(schemaId, id, patch);
   if (!r.ok) throw new Error(`could not update ${id}`);
+}
+
+// `done` (used by the web checkbox) and `status` are kept consistent: whichever
+// you set, the other follows.
+export async function setDone(ctx: WorkspaceCtx, id: EntityId, done: boolean): Promise<void> {
+  await patchTodo(ctx, id, { done, status: done ? "done" : "todo" });
+}
+
+export async function setStatus(ctx: WorkspaceCtx, id: EntityId, status: Status): Promise<void> {
+  await patchTodo(ctx, id, { status, done: status === "done" });
+}
+
+export async function setDue(ctx: WorkspaceCtx, id: EntityId, dueIso: string | null): Promise<void> {
+  await patchTodo(ctx, id, { due: dueIso ? { "#utc": dueIso } : null });
 }
 
 export async function toggleTodo(ctx: WorkspaceCtx, id: EntityId): Promise<boolean> {
   const e = await authorizeWrite(ctx, id); // reuse the read — no second fetch
   const next = !(e.done === true);
-  const schemaId = await ensureTodoSchema();
-  await patchSchemaEntity<TodoDoc>(schemaId, id, { done: next });
+  await patchTodo(ctx, id, { done: next, status: next ? "done" : "todo" });
   return next;
 }
 
