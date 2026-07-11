@@ -83,6 +83,11 @@ export async function createReactor(body: unknown): Promise<EntityId> {
   return (await req("POST", "/reactors.json", { body })).json.reactorId["#"];
 }
 
+/** Run a one-shot datalog query (find/where/...) without storing a reactor. */
+export async function query(body: unknown): Promise<unknown[]> {
+  return (await req("POST", "/reactors/dry-run.json", { body })).json as unknown[];
+}
+
 export async function readResults(id: EntityId): Promise<unknown[]> {
   return (await fetch(`${BASE}/reactors/${id}/results.json`)).json();
 }
