@@ -1,0 +1,14 @@
+{
+  "name": "todo-stardust",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "A todo app backed by Stardust — with a CLI and a Datastar web UI, both live via reactor SSE.",
+  "scripts": {
+    "web": "node src/server.ts",
+    "cli": "node src/cli.ts"
+  },
+  "dependencies": {
+    "@starfederation/datastar-sdk": "^1.0.0"
+  }
+}
