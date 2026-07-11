@@ -6,6 +6,7 @@
 import type { WorkspaceCtx } from "./workspace.ts";
 import type { Priority, Status, Todo } from "./todos.ts";
 import { type EntityId, query } from "./stardust.ts";
+import { query as tquery } from "./typed-query.ts"; // compile-time-checked query for static literals
 import { APP } from "./tenancy.ts";
 import { overdue, ready } from "./features.ts";
 
@@ -77,13 +78,16 @@ export async function filteredTodos(ctx: WorkspaceCtx, f: Filter, mineActor?: st
   return todos;
 }
 
-/** Count of todos per status in the workspace (groupBy aggregate). */
+/** Count of todos per status in the workspace (groupBy aggregate).
+ *  Written with the compile-time-checked `tquery`: field names (app / workspace
+ *  / status) are validated against the generated schema map — a typo is a build
+ *  error. (Dynamic filter-building, e.g. filteredTodos, stays on the raw query.) */
 export async function statusCounts(ctx: WorkspaceCtx): Promise<Record<string, number>> {
-  const rows = (await query({
+  const rows = (await tquery({
     find: ["?status", ["count", "?t"]],
     where: [["?t", "app", APP], ["?t", "workspace", { "#": ctx.workspaceId }], ["?t", "status", "?status"]],
     groupBy: ["?status"],
-  })) as [string, number][];
+  } as const)) as unknown as [string, number][];
   return Object.fromEntries(rows);
 }
 

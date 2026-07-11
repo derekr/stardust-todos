@@ -15,7 +15,9 @@
     "seed": "node src/seed-demo.ts",
     "typecheck": "tsgo --noEmit",
     "gen:types": "node scripts/gen-types.ts",
-    "demo:typed": "node src/demo-typed.ts"
+    "demo:typed": "node src/demo-typed.ts",
+    "gen:query": "node scripts/gen-query.ts",
+    "demo:hybrid": "node src/demo-hybrid.ts"
   },
   "dependencies": {
     "@starfederation/datastar-sdk": "^1.0.0",
