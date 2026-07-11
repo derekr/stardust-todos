@@ -157,10 +157,19 @@ export async function streamResults(
   onRows: (rows: unknown[]) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  const res = await fetch(`${BASE}/reactors/${id}/results?format=json`, {
-    headers: { Accept: "text/event-stream" },
-    signal,
-  });
+  // One connection attempt. Returns (does not throw) when the stream drops —
+  // Node's fetch has a ~5-min idle body timeout — so the caller can reconnect.
+  // Only a real abort propagates.
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}/reactors/${id}/results?format=json`, {
+      headers: { Accept: "text/event-stream" },
+      signal,
+    });
+  } catch (e) {
+    if ((e as Error).name === "AbortError") throw e;
+    return;
+  }
   const reader = res.body!.getReader();
   const dec = new TextDecoder();
   let buf = "";
@@ -188,6 +197,7 @@ export async function streamResults(
       }
     }
   } catch (e) {
-    if ((e as Error).name !== "AbortError") throw e;
+    if ((e as Error).name === "AbortError") throw e;
+    // body timeout / network drop — return so the caller reconnects
   }
 }

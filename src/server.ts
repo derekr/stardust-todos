@@ -125,6 +125,9 @@ const server = http.createServer(async (req, res) => {
           stream.patchElements(wsBar(await listWorkspaces(personaId), ctx.workspaceId));
           await watchTodos(ctx, () => void renderBoard(stream), inner.signal);
           switchControllers.delete(inner);
+          // Deliberate switch/close aborts inner → re-render instantly.
+          // A dropped upstream stream (idle timeout) did NOT abort → back off.
+          if (!closed && !inner.signal.aborted) await new Promise((r) => setTimeout(r, 500));
         }
       });
       return;

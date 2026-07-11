@@ -54,7 +54,7 @@ export function toolbar(role: Role | null, globalCmds: ProjectedCommand[]): stri
     <button class="rtab ${role === "member" ? "active" : ""}" data-on:click="@post('/viewas/member')">Teammate</button>
     <span class="fsep"></span>
     ${controls}
-    <button class="cmdbtn palette" data-on:click="@get('/palette')">⌘ Commands</button>
+    <button class="cmdbtn palette" data-on:click="@get('/palette')">Commands <kbd class="kbd">⌘K</kbd></button>
   </div>`;
 }
 
@@ -342,6 +342,7 @@ export function page(): string {
     .palitem { text-align:left; border:1px solid var(--line); background:var(--card2); color:var(--fg); padding:9px 12px; border-radius:9px; cursor:pointer; font-size:14px; display:flex; align-items:center; }
     .palitem:hover:not(:disabled) { border-color:var(--accent); }
     .mitem.denied, .palitem.denied { justify-content:space-between; }
+    .kbd { font-family:var(--mono); font-size:10px; border:1px solid var(--line); border-radius:4px; padding:0 4px; margin-left:5px; color:var(--faint); }
   </style>
 </head>
 <body data-signals="{newTitle: '', newPriority: 'med', newWs: '', error: '', toast: ''}">
@@ -375,6 +376,18 @@ export function page(): string {
     <div id="menu"></div>
     <div id="palette"></div>
   </div>
+  <script>
+    // Keyboard shortcut shim: Cmd/Ctrl+K opens the palette, Escape closes it.
+    // It just triggers the same Datastar-wired controls — no client state.
+    addEventListener("keydown", (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        document.querySelector(".cmdbtn.palette")?.click();
+      } else if (e.key === "Escape") {
+        document.querySelector("#palette .backdrop")?.click();
+      }
+    });
+  </script>
 </body>
 </html>`;
 }
