@@ -47,7 +47,21 @@ async function main() {
   } as const);
   for (const t of active) console.log(`   ${t.priority.padEnd(4)} ${t.title}`); // t.priority: "low"|"med"|"high"
 
-  console.log(g(`\n   ✓ ${todos.length} + ${active.length} rows validated at the boundary`));
+  console.log(d("\n3 — a MULTI-KIND query, typed purely by FIELDS (no 'entity type' anywhere)"));
+  const grants = await query({
+    find: ["?wsName", "?role"],
+    where: [
+      ["?g", "kind", "grant"],
+      ["?g", "persona", { "#": ctx.personaId }],
+      ["?g", "workspace", "?w"],
+      ["?w", "name", "?wsName"],
+      ["?g", "role", "?role"],
+    ],
+    then: { project: { workspace: "?wsName", role: "?role" } },
+  } as const);
+  for (const g2 of grants) console.log(`   ${g2.role.padEnd(6)} on ${g2.workspace}`); // role: "owner"|"member"
+
+  console.log(g(`\n   ✓ ${todos.length} + ${active.length} + ${grants.length} rows validated at the boundary`));
   console.log(d("   (invalid-query compile proofs live in _wontCompile below — see the source)\n"));
 }
 
@@ -80,6 +94,12 @@ async function _wontCompile() {
 
   // @ts-expect-error — aggregate op is only legal in `find`, not `where`
   await query({ find: ["?t"], where: [["count", "?t", "?x"]] } as const);
+
+  // Declared (open-world) fields are typed too:
+  // @ts-expect-error — role only allows "owner" | "member"
+  await query({ find: ["?g"], where: [["?g", "role", "admin"]] } as const);
+  // valid:
+  await query({ find: ["?g"], where: [["?g", "kind", "grant"], ["?g", "role", "owner"]] } as const);
 }
 void _wontCompile;
 

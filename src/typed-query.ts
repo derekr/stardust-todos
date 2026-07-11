@@ -11,12 +11,12 @@
 // The call site stays plain JSON: `query({ find, where, then })` — no builder.
 
 import { query as rawQuery } from "./stardust.ts";
-import type { TodoFields } from "./generated/query-fields.ts";
-import { todoValidators } from "./generated/query-fields.ts";
+import type { FieldTypes } from "./field-registry.ts";
+import { validators } from "./field-registry.ts";
 
-// The observable-field map the checker is bound to (swap per entity / registry).
-type Fields = TodoFields;
-const validators = todoValidators as Record<string, (v: unknown) => boolean>;
+// The observable-field vocabulary the checker is bound to — a FIELD registry
+// (schema-derived ∪ declared), not an entity shape. Stardust has no entity types.
+type Fields = FieldTypes;
 
 // ---------------------------------------------------------------------------
 // Operator vocabularies + the branded compile-error carrier.
