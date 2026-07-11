@@ -9,7 +9,7 @@ import { type EntityId, query } from "./stardust.ts";
 import { APP } from "./tenancy.ts";
 import { overdue, ready } from "./features.ts";
 
-export type DerivedView = "all" | "ready" | "overdue";
+export type DerivedView = "all" | "ready" | "overdue" | "mine";
 export type GroupBy = "none" | "status" | "priority";
 
 export interface Filter {
@@ -27,7 +27,7 @@ const asId = (v: unknown): EntityId => (typeof v === "number" ? v : (v as { "#":
 const NOW_ISO = "2026-07-11T00:00:00Z";
 
 /** Todos matching the filter (AND-composed), projected app-shaped by Stardust. */
-export async function filteredTodos(ctx: WorkspaceCtx, f: Filter): Promise<Todo[]> {
+export async function filteredTodos(ctx: WorkspaceCtx, f: Filter, mineActor?: string): Promise<Todo[]> {
   const where: unknown[] = [
     ["?t", "app", APP],
     ["?t", "workspace", { "#": ctx.workspaceId }],
@@ -35,20 +35,31 @@ export async function filteredTodos(ctx: WorkspaceCtx, f: Filter): Promise<Todo[
     ["?t", "status", "?status"],
     ["?t", "priority", "?priority"],
     ["?t", "done", "?done"],
+    ["?t", "lastActor", "?lastActor"],
   ];
   // Multi-select membership: `contains {#set [...]} ?field` (an expression
   // predicate — the correct Stardust idiom for "value in a set").
   if (f.status.length) where.push(["contains", { "#set": f.status }, "?status"]);
   if (f.priority.length) where.push(["contains", { "#set": f.priority }, "?priority"]);
+  if (f.view === "mine" && mineActor) where.push(["?t", "lastActor", mineActor]); // "changed by me"
   if (f.tags.length) {
     where.push(["?e", "kind", "tag"], ["?e", "todo", "?t"], ["?e", "label", "?l"], ["contains", { "#set": f.tags }, "?l"]);
   }
 
   const rows = (await query({
-    find: ["?t", "?title", "?done", "?priority", "?status"],
+    find: ["?t", "?title", "?done", "?priority", "?status", "?lastActor"],
     where,
     orderBy: ["?priority", "?title"],
-    then: { project: { id: "?t", title: "?title", done: "?done", priority: "?priority", status: "?status" } },
+    then: {
+      project: {
+        id: "?t",
+        title: "?title",
+        done: "?done",
+        priority: "?priority",
+        status: "?status",
+        lastActor: "?lastActor",
+      },
+    },
   })) as Todo[];
 
   // A tag join can duplicate a todo (one row per matching tag) — dedupe by id.

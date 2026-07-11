@@ -5,7 +5,16 @@
 
 import http from "node:http";
 import { ServerSentEventGenerator } from "@starfederation/datastar-sdk/node";
-import { type Priority, type Status, addTodo, removeTodo, setPriority, setStatus, toggleTodo } from "./todos.ts";
+import {
+  type Priority,
+  type Status,
+  addTodo,
+  backfillActor,
+  removeTodo,
+  setPriority,
+  setStatus,
+  toggleTodo,
+} from "./todos.ts";
 import { type WorkspaceCtx, defaultWorkspace, openWorkspace } from "./workspace.ts";
 import {
   createPersona,
@@ -42,6 +51,7 @@ let filter: Filter = { ...emptyFilter };
 // with a member grant so "view as" can switch role and drive the command
 // projection. Commands themselves are seeded as data.
 await ensureCommandCatalog();
+await backfillActor(); // give pre-existing todos a lastActor so the board projection is complete
 const OWNER_PERSONA = ctx.personaId;
 const demoUser = await ensureUser("default@local");
 if (!(await listPersonas(demoUser)).some((p) => p.name === "Teammate")) {
@@ -78,7 +88,7 @@ const toggle = <T>(arr: T[], v: T): T[] => (arr.includes(v) ? arr.filter((x) => 
 // Render the filter bar + board for the current workspace & filter.
 async function renderBoard(stream: any) {
   const [todos, sc, pc, tags, blockers] = await Promise.all([
-    filteredTodos(ctx, filter),
+    filteredTodos(ctx, filter, actorName()),
     statusCounts(ctx),
     priorityCounts(ctx),
     availableTags(ctx),

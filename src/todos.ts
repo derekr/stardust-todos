@@ -37,6 +37,7 @@ export interface Todo {
   done: boolean;
   priority: Priority;
   status: Status;
+  lastActor?: string;
 }
 
 interface TodoDoc {
@@ -48,6 +49,7 @@ interface TodoDoc {
   status?: Status;
   due?: { "#utc": string };
   project?: { "#": EntityId };
+  lastActor?: string; // materialized: who last changed this todo (cheap per-row read)
 }
 
 const STATE_FILE = new URL("../.state.json", import.meta.url);
@@ -70,6 +72,7 @@ const TODO_SCHEMA = {
     status: { type: "string", enum: ["todo", "doing", "blocked", "done"] },
     due: { type: "object" }, // Stardust instant {#utc ...}
     project: { type: "object" }, // ref to a project entity
+    lastActor: { type: "string" },
   },
   additionalProperties: false,
 };
@@ -100,6 +103,7 @@ export async function ensureTodoSchema(): Promise<EntityId> {
         status: { type: "string", enum: ["todo", "doing", "blocked", "done"] },
         due: { type: "object" },
         project: { type: "object" },
+        lastActor: { type: "string" },
       },
       required: ["title", "done", "workspace", "app"],
     });
@@ -138,7 +142,16 @@ export async function addTodo(
   // ONE write: schema-validated todo, born with its workspace ref + app tag.
   const created = await createSchemaEntity<TodoDoc>(
     schemaId,
-    { title, done: false, status: "todo", priority, workspace: { "#": ctx.workspaceId }, app: APP, ...extra },
+    {
+      title,
+      done: false,
+      status: "todo",
+      priority,
+      workspace: { "#": ctx.workspaceId },
+      app: APP,
+      lastActor: actor ?? "seed",
+      ...extra,
+    },
     { actor },
   );
   if (!created.ok) {
@@ -151,8 +164,22 @@ export async function addTodo(
 async function patchTodo(ctx: WorkspaceCtx, id: EntityId, patch: MergePatch<TodoDoc>, actor?: string): Promise<void> {
   await authorizeWrite(ctx, id);
   const schemaId = await ensureTodoSchema();
-  const r = await patchSchemaEntity<TodoDoc>(schemaId, id, patch, { actor });
+  const full = actor ? { ...patch, lastActor: actor } : patch; // materialize who changed it
+  const r = await patchSchemaEntity<TodoDoc>(schemaId, id, full, { actor });
   if (!r.ok) throw new Error(`could not update ${id}`);
+}
+
+/** One-time backfill: give app todos without a lastActor a placeholder. */
+export async function backfillActor(): Promise<number> {
+  const rows = (await query({
+    find: ["?t"],
+    where: [["?t", "app", APP], ["not", ["?t", "lastActor", "?a"]]],
+  })) as [EntityId][];
+  if (!rows.length) return 0;
+  const patch: Record<string, Record<string, unknown>> = {};
+  for (const [id] of rows) patch[id] = { lastActor: "seed" };
+  await transact(patch);
+  return rows.length;
 }
 
 // `done` (used by the web checkbox) and `status` are kept consistent: whichever

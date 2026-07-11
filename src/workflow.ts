@@ -116,8 +116,8 @@ export interface WorkflowRun {
 export async function runWorkflows(causationId?: string): Promise<WorkflowRun> {
   const [blocked, unblocked, closed, reopened] = await Promise.all([toBlock(), toUnblock(), toClose(), toReopen()]);
   const patch: Record<string, Record<string, unknown>> = {};
-  for (const id of blocked) patch[id] = { status: "blocked", done: false };
-  for (const id of unblocked) patch[id] = { status: "todo", done: false };
+  for (const id of blocked) patch[id] = { status: "blocked", done: false, lastActor: "workflow" };
+  for (const id of unblocked) patch[id] = { status: "todo", done: false, lastActor: "workflow" };
   for (const id of closed) patch[id] = { status: "done" };
   for (const id of reopened) patch[id] = { status: "active" };
   const applied = Object.keys(patch).length;

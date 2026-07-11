@@ -12,6 +12,7 @@ export interface HistoryEntry {
   at: string; // ISO commit time
   tx: number;
   actor?: string; // who committed the change (from Tx-Meta-Actor / causation)
+  via?: string; // for workflow changes: the actor of the triggering transaction
 }
 
 /**
@@ -77,8 +78,19 @@ export async function statusHistory(id: EntityId): Promise<HistoryEntry[]> {
       try {
         const txe = await readEntity(e.tx);
         const actor = txe.actor as string | undefined;
-        const causedByWorkflow = String(txe.causationId ?? "").startsWith("workflow");
-        e.actor = actor ?? (causedByWorkflow ? "workflow" : undefined);
+        const cause = String(txe.causationId ?? "");
+        e.actor = actor ?? (cause.startsWith("workflow") ? "workflow" : undefined);
+        // Causation hop: a workflow write carries workflow:tx:<N> — read that
+        // triggering transaction's actor so we can show *why* it fired.
+        const m = cause.match(/^workflow:tx:(\d+)$/);
+        if (m) {
+          try {
+            const trigger = await readEntity(Number(m[1]));
+            e.via = trigger.actor as string | undefined;
+          } catch {
+            /* trigger unreadable */
+          }
+        }
       } catch {
         /* tx entity unreadable — leave unattributed */
       }

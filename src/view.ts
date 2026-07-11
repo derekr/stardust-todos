@@ -90,7 +90,7 @@ export function filterBar(
   priorityCounts: Record<string, number>,
   tags: string[],
 ): string {
-  const views = (["all", "ready", "overdue"] as const)
+  const views = (["all", "ready", "overdue", "mine"] as const)
     .map((v) => chip(v[0].toUpperCase() + v.slice(1), f.view === v, `/filter/view/${v}`))
     .join("");
   const statuses = STATUS_ORDER.map((s) =>
@@ -133,6 +133,7 @@ function row(t: Todo, blockers: Blocker[]): string {
     <span class="title">${esc(t.title)}</span>
     ${blockedBy}
     ${t.status && t.status !== "todo" ? `<span class="status status-${t.status}">${STATUS_LABEL[t.status]}</span>` : ""}
+    ${t.lastActor === "workflow" ? `<span class="byws" title="last changed by the workflow">workflow</span>` : ""}
     <button class="iconbtn" aria-label="actions for ${esc(t.title)}" data-on:click="@get('/menu/${t.id}')">⋯</button>
     <button class="iconbtn del" aria-label="delete ${esc(t.title)}" data-on:click="@delete('/remove/${t.id}')">×</button>
   </li>`;
@@ -164,7 +165,7 @@ export function boardFragment(todos: Todo[], blockers: Map<number, Blocker[]>, f
 
 // ---- Action menu (Datastar-driven overlay) -------------------------------
 
-type HistEntry = { status: string; at: string; actor?: string };
+type HistEntry = { status: string; at: string; actor?: string; via?: string };
 
 /** Patchable history container — streamed in after the menu appears. */
 export function historySection(history: HistEntry[]): string {
@@ -179,7 +180,9 @@ function historyTimeline(history: HistEntry[]): string {
     history
       .map((h) => {
         const who = h.actor
-          ? `<span class="tlactor ${h.actor === "workflow" ? "sys" : ""}">${esc(h.actor)}</span>`
+          ? `<span class="tlactor ${h.actor === "workflow" ? "sys" : ""}">${esc(h.actor)}${
+              h.via ? ` · via ${esc(h.via)}` : ""
+            }</span>`
           : "";
         return `<div class="tl"><span class="tldot status-${h.status}"></span><span class="tlstatus">${
           STATUS_LABEL[h.status as Status] ?? h.status
@@ -307,6 +310,7 @@ export function page(): string {
     .status-doing { color:#6c7bff; background:#6c7bff1a; }
     .status-done { color:#35b37e; background:#35b37e1a; }
     .blockedrow { opacity:.7; }
+    .byws { font-size:10px; font-family:var(--mono); color:var(--accent-ink); border:1px solid var(--line); border-radius:20px; padding:1px 7px; flex:0 0 auto; text-transform:uppercase; letter-spacing:.03em; }
     .blockedby { display:inline-flex; align-items:center; gap:5px; font-size:11px; color:#f2555a; }
     .bchip { background:#f2555a1a; border-radius:5px; padding:1px 6px; }
     .iconbtn { border:0; background:transparent; color:var(--mut); font-size:17px; line-height:1; cursor:pointer; padding:0 4px; flex:0 0 auto; }
