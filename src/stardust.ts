@@ -29,9 +29,9 @@ export const BASE = process.env.STARDUST_URL ?? "http://localhost:1981";
 async function req(
   method: string,
   path: string,
-  opts: { body?: unknown; contentType?: string } = {},
+  opts: { body?: unknown; contentType?: string; headers?: Record<string, string> } = {},
 ): Promise<{ status: number; json: any }> {
-  const headers: Record<string, string> = { Accept: "application/json" };
+  const headers: Record<string, string> = { Accept: "application/json", ...opts.headers };
   let body: string | undefined;
   if (opts.body !== undefined) {
     headers["Content-Type"] = opts.contentType ?? "application/json";
@@ -42,8 +42,51 @@ async function req(
   return { status: res.status, json: text ? JSON.parse(text) : null };
 }
 
-export async function transact(map: Record<string, MergePatch<Record<string, unknown>>>): Promise<TxResult> {
-  return (await req("POST", "/commands/transact.json", { body: map })).json as TxResult;
+export interface TxMeta {
+  /** Links a derived write to the transaction that caused it (dataflow chains). */
+  causationId?: string;
+  correlationId?: string;
+}
+
+export async function transact(
+  map: Record<string, MergePatch<Record<string, unknown>>>,
+  meta: TxMeta = {},
+): Promise<TxResult> {
+  const headers: Record<string, string> = {};
+  if (meta.causationId) headers["Tx-Causation-Id"] = meta.causationId;
+  if (meta.correlationId) headers["Tx-Correlation-Id"] = meta.correlationId;
+  return (await req("POST", "/commands/transact.json", { body: map, headers })).json as TxResult;
+}
+
+/**
+ * Subscribe to the committed-transaction event bus. Fires `onTx(id)` for each
+ * transaction event (the id is the transaction id text). This is Stardust's
+ * durable change feed — the trigger for event-driven dataflow.
+ */
+export async function subscribeTransactions(onTx: (txId: string) => void, signal: AbortSignal): Promise<void> {
+  const res = await fetch(`${BASE}/events/bus/stardust/transactions`, {
+    headers: { Accept: "text/event-stream" },
+    signal,
+  });
+  const reader = res.body!.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const idLine = frame.split("\n").find((l) => l.startsWith("id:"));
+        if (idLine && frame.includes("event: stardust-transaction")) onTx(idLine.slice(3).trim());
+      }
+    }
+  } catch (e) {
+    if ((e as Error).name !== "AbortError") throw e;
+  }
 }
 
 export async function readEntity(id: EntityId): Promise<Record<string, unknown>> {

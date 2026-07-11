@@ -9,7 +9,9 @@
     "cli": "node src/cli.ts",
     "demo:tenancy": "node src/demo-tenancy.ts",
     "demo:fields": "node src/demo-fields.ts",
-    "demo:projects": "node src/demo-projects.ts"
+    "demo:projects": "node src/demo-projects.ts",
+    "demo:workflow": "node src/demo-workflow.ts",
+    "worker": "node src/worker.ts"
   },
   "dependencies": {
     "@starfederation/datastar-sdk": "^1.0.0"
