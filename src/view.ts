@@ -121,10 +121,28 @@ export function boardFragment(todos: Todo[], blockers: Map<number, Blocker[]>, f
 
 // ---- Action menu (Datastar-driven overlay) -------------------------------
 
+function historyTimeline(history: { status: string; at: string }[]): string {
+  if (!history.length) return `<div class="mnote">no changes yet</div>`;
+  const fmt = (iso: string) => iso.replace("T", " ").replace(/\..*/, "").slice(5, 16); // MM-DD HH:MM
+  return (
+    `<div class="timeline">` +
+    history
+      .map(
+        (h) =>
+          `<div class="tl"><span class="tldot status-${h.status}"></span><span class="tlstatus">${
+            STATUS_LABEL[h.status as Status] ?? h.status
+          }</span><span class="tltime">${fmt(h.at)}</span></div>`,
+      )
+      .join("") +
+    `</div>`
+  );
+}
+
 export function menuFragment(
   todo: Todo | null,
   blockers: Blocker[],
   candidates: { id: number; title: string }[],
+  history: { status: string; at: string }[] = [],
 ): string {
   if (!todo) return `<div id="menu"></div>`;
   const statusBtns = (["todo", "doing", "done"] as const)
@@ -162,6 +180,7 @@ export function menuFragment(
       <div class="msec"><div class="mlabel">Priority</div><div class="mrow">${prioBtns}</div></div>
       <div class="msec"><div class="mlabel">Blocked by</div>${current}</div>
       <div class="msec"><div class="mlabel">Add blocker</div><div class="mcol">${addOpts}</div></div>
+      <div class="msec"><div class="mlabel">Activity — status history</div>${historyTimeline(history)}</div>
       <div class="msec"><button class="mdanger" data-on:click="@delete('/remove/${todo.id}'); @get('/menu/0')">Delete todo</button></div>
       <button class="mclose" data-on:click="@get('/menu/0')">Close</button>
     </div>
@@ -249,6 +268,12 @@ export function page(): string {
     .xmini { border:0; background:transparent; color:#f2555a; cursor:pointer; font-size:16px; }
     .mdanger { width:100%; border:1px solid #f2555a55; background:transparent; color:#f2555a; padding:7px; border-radius:8px; cursor:pointer; }
     .mclose { width:100%; margin-top:6px; border:1px solid var(--line); background:var(--card2); color:var(--fg); padding:7px; border-radius:8px; cursor:pointer; }
+    .timeline { display:flex; flex-direction:column; gap:0; border-left:1.5px solid var(--line); margin-left:5px; padding-left:12px; }
+    .tl { display:flex; align-items:center; gap:8px; padding:3px 0; position:relative; }
+    .tldot { width:9px; height:9px; border-radius:50%; position:absolute; left:-17px; background:var(--mut); }
+    .tldot.status-blocked { background:#f2555a; } .tldot.status-doing { background:#6c7bff; } .tldot.status-done { background:#35b37e; } .tldot.status-todo { background:var(--mut); }
+    .tlstatus { font-size:12.5px; }
+    .tltime { font-size:11px; color:var(--faint); font-family:var(--mono); margin-left:auto; }
   </style>
 </head>
 <body data-signals="{newTitle: '', newPriority: 'med', newWs: '', error: ''}">

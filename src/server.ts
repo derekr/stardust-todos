@@ -20,6 +20,7 @@ import {
   todoOptions,
 } from "./board.ts";
 import { readEntity } from "./stardust.ts";
+import { statusHistory } from "./history.ts";
 import { boardFragment, filterBar, menuFragment, page, wsBar } from "./view.ts";
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -64,7 +65,8 @@ async function menuElements(id: number): Promise<string> {
   const blockers = (await blockerMap(ctx)).get(id) ?? [];
   const blockerIds = new Set(blockers.map((b) => b.id));
   const candidates = (await todoOptions(ctx)).filter((o) => o.id !== id && !blockerIds.has(o.id));
-  return menuFragment(todo, blockers, candidates);
+  const history = await statusHistory(id);
+  return menuFragment(todo, blockers, candidates, history);
 }
 
 const server = http.createServer(async (req, res) => {

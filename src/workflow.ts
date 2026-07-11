@@ -162,5 +162,17 @@ export async function startWorker(
     } while (pending);
     running = false;
   };
-  await subscribeTransactions((txId) => void pump(txId), signal);
+
+  // Resilient loop: reconnect whenever the SSE stream drops (idle body timeout,
+  // server restart, network blip). On (re)connect, run a full fixpoint to catch
+  // up on anything missed while disconnected, then resume listening.
+  while (!signal.aborted) {
+    await pump("catch-up");
+    try {
+      await subscribeTransactions((txId) => void pump(txId), signal);
+    } catch {
+      break; // aborted
+    }
+    if (signal.aborted) break;
+  }
 }
