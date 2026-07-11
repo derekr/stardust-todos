@@ -20,11 +20,12 @@ const PORT = Number(process.env.PORT ?? 3000);
 let ctx: WorkspaceCtx = await defaultWorkspace();
 const personaId = ctx.personaId;
 
-// Open long-lived streams; aborted on workspace switch so clients reconnect.
-const streams = new Set<AbortController>();
-const closeAllStreams = () => {
-  for (const ac of streams) ac.abort();
-  streams.clear();
+// One inner controller per active stream iteration. On a workspace switch we
+// abort them so each stream's loop re-subscribes to the new workspace's reactor
+// over the SAME browser connection (no reconnect needed).
+const switchControllers = new Set<AbortController>();
+const rerenderAll = () => {
+  for (const c of switchControllers) c.abort();
 };
 
 function noopStream(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -32,7 +33,9 @@ function noopStream(req: http.IncomingMessage, res: http.ServerResponse) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = req.url ?? "/";
+  // Datastar sends signals on a GET as ?datastar=... — match on the PATH only,
+  // never the full URL, or those requests 404.
+  const url = new URL(req.url ?? "/", "http://localhost").pathname;
   const method = req.method ?? "GET";
 
   try {
@@ -42,17 +45,24 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Long-lived read stream: renders the switcher once, then streams the list.
+    // Long-lived read stream. Each loop iteration renders the switcher for the
+    // current workspace, then streams that workspace's list until a switch
+    // aborts the inner controller — then it re-renders for the new workspace.
     if (url === "/stream" && method === "GET") {
-      const ac = new AbortController();
-      streams.add(ac);
+      let closed = false;
+      let inner: AbortController | null = null;
       req.on("close", () => {
-        streams.delete(ac);
-        ac.abort();
+        closed = true;
+        inner?.abort();
       });
       ServerSentEventGenerator.stream(req, res, async (stream) => {
-        stream.patchElements(wsBar(await listWorkspaces(personaId), ctx.workspaceId));
-        await watchTodos(ctx, (todos) => stream.patchElements(listFragment(todos)), ac.signal);
+        while (!closed) {
+          inner = new AbortController();
+          switchControllers.add(inner);
+          stream.patchElements(wsBar(await listWorkspaces(personaId), ctx.workspaceId));
+          await watchTodos(ctx, (todos) => stream.patchElements(listFragment(todos)), inner.signal);
+          switchControllers.delete(inner);
+        }
       });
       return;
     }
@@ -61,7 +71,7 @@ const server = http.createServer(async (req, res) => {
     const switchMatch = url.match(/^\/switch\/(\d+)$/);
     if (switchMatch && method === "POST") {
       ctx = await openWorkspace(personaId, Number(switchMatch[1])); // access-checked
-      closeAllStreams();
+      rerenderAll();
       noopStream(req, res);
       return;
     }
@@ -75,7 +85,7 @@ const server = http.createServer(async (req, res) => {
         const ws = await createWorkspace(personaId, name);
         ctx = await openWorkspace(personaId, ws.id);
         stream.patchSignals(JSON.stringify({ newWs: "" }));
-        closeAllStreams();
+        rerenderAll();
       });
       return;
     }

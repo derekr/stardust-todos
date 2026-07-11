@@ -18,12 +18,12 @@ export function wsBar(workspaces: Workspace[], activeId: number): string {
     <span class="wslabel">workspace</span>
     ${tabs}
     <form class="wsnew" data-on:submit__prevent="@post('/new-workspace')">
-      <input type="text" data-bind:newWs placeholder="+ new workspace" />
+      <input type="text" name="newWs" data-bind:new-ws placeholder="+ new workspace" />
     </form>
   </div>`;
 }
 
-const DATASTAR = "https://cdn.jsdelivr.net/gh/starfederation/datastar@1.0.0/bundles/datastar.js";
+const DATASTAR = "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.2/bundles/datastar.js";
 
 /** The live-updated list. Stable id (#list) so Datastar can morph it. */
 export function listFragment(todos: Todo[]): string {
@@ -32,10 +32,10 @@ export function listFragment(todos: Todo[]): string {
     ? todos
         .map(
           (t) => `
-      <li class="row ${t.done ? "done" : ""} ${t.status === "blocked" ? "blockedrow" : ""}">
-        <input type="checkbox" ${t.done ? "checked" : ""}
-               aria-label="toggle ${esc(t.title)}"
-               data-on:change="@post('/toggle/${t.id}')" />
+      <li id="todo-${t.id}" class="row ${t.done ? "done" : ""} ${t.status === "blocked" ? "blockedrow" : ""}">
+        <button class="check ${t.done ? "checked" : ""}" role="checkbox" aria-checked="${t.done}"
+                aria-label="toggle ${esc(t.title)}" ${t.status === "blocked" ? "disabled" : ""}
+                data-on:click="@post('/toggle/${t.id}')">${t.done ? "✓" : ""}</button>
         <span class="prio prio-${t.priority}">${t.priority}</span>
         <span class="title">${esc(t.title)}</span>
         ${t.status && t.status !== "todo" ? `<span class="status status-${t.status}">${t.status}</span>` : ""}
@@ -75,7 +75,9 @@ export function page(todos: Todo[]): string {
     ul { list-style:none; margin:0; padding:0; background:var(--card); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
     .row { display:flex; align-items:center; gap:10px; padding:11px 14px; border-top:1px solid var(--line); }
     .row:first-child { border-top:0; }
-    .row input[type=checkbox] { width:18px; height:18px; accent-color:var(--accent); cursor:pointer; }
+    .check { width:20px; height:20px; flex:0 0 auto; border:1.5px solid var(--mut); border-radius:6px; background:transparent; color:#fff; cursor:pointer; font-size:13px; line-height:1; display:flex; align-items:center; justify-content:center; padding:0; }
+    .check.checked { background:var(--accent); border-color:var(--accent); }
+    .check:disabled { cursor:not-allowed; opacity:.4; }
     .title { flex:1; }
     .done .title { text-decoration:line-through; color:var(--mut); }
     .prio { font-size:11px; text-transform:uppercase; letter-spacing:.04em; padding:2px 7px; border-radius:20px; border:1px solid var(--line); color:var(--mut); }
@@ -111,8 +113,8 @@ export function page(todos: Todo[]): string {
     <div id="wsbar"></div>
 
     <form data-on:submit__prevent="@post('/add')">
-      <input type="text" data-bind:newTitle placeholder="What needs doing?" autofocus />
-      <select data-bind:newPriority>
+      <input type="text" name="newTitle" data-bind:new-title placeholder="What needs doing?" autofocus />
+      <select name="newPriority" data-bind:new-priority>
         <option value="high">high</option>
         <option value="med">med</option>
         <option value="low">low</option>
@@ -124,7 +126,7 @@ export function page(todos: Todo[]): string {
     <!-- Long-lived read stream (CQRS): the active workspace's reactor drives
          every client's list. Switching workspaces closes streams; Datastar
          auto-reconnects here and re-renders against the new workspace. -->
-    <div data-on-load="@get('/stream', {retryInterval: 300, retryMaxCount: 100000})">
+    <div data-init="@get('/stream', {retryInterval: 300, retryMaxCount: 100000})">
       ${listFragment(todos)}
     </div>
   </div>
