@@ -58,7 +58,9 @@ type EnvOfClause<C, F> = C extends readonly [infer S, infer B, infer O]
     : {}
   : {};
 
-type BuildEnv<W, F, Acc = {}> = W extends readonly [infer H, ...infer T] ? BuildEnv<T, F, Acc & EnvOfClause<H, F>> : Acc;
+type BuildEnv<W, F, Acc = {}> = W extends readonly [infer H, ...infer T]
+  ? BuildEnv<T, F, Acc & EnvOfClause<H, F>>
+  : Acc;
 
 type VarType<V, E> = V extends keyof E ? (E[V] extends "@id" ? number : E[V]) : unknown;
 
@@ -68,7 +70,7 @@ type VarType<V, E> = V extends keyof E ? (E[V] extends "@id" ? number : E[V]) : 
 type FactObj<T> = Var | T; // a var, or a literal of the field's type (refs are {"#":n})
 type FactSubj = Var | { "#": number } | number;
 
-type CheckFact<C, F> = C extends readonly [infer S, infer K, infer O]
+type CheckFact<C, F> = C extends readonly [infer _S, infer K, infer O]
   ? K extends keyof F
     ? O extends readonly unknown[] // array destructure [?a, field, [?x, ?y]]
       ? F[K] extends readonly unknown[]
@@ -177,26 +179,47 @@ export type ResultOf<Q extends QueryLiteral> = Q extends { then: { project: infe
 // ===========================================================================
 // Runtime — boundary validation from the SAME generated validators.
 // ===========================================================================
-function rowValidator(where: readonly unknown[], project: Record<string, string>): (row: unknown) => string | null {
+export interface ValidationCheck {
+  key: string; // the projected output key
+  field: string; // the Stardust field it's bound to ("@id" for a subject var)
+  check: (v: unknown) => boolean; // the validator (generated from the schema)
+}
+
+/**
+ * The runtime validation PLAN for a query — this is the whole mechanism, made
+ * inspectable. It (1) walks `where` to bind each ?var to its field, then
+ * (2) maps each projected key to that field's generated validator. So the boundary
+ * check is derived entirely from the query + the schema-generated field map.
+ */
+export function validationPlan(where: readonly unknown[], project: Record<string, string>): ValidationCheck[] {
   const bind: Record<string, string> = {};
   for (const c of where) {
     if (!Array.isArray(c) || c.length !== 3) continue;
     const [s, f, o] = c;
     if (typeof f === "string" && f in validators) {
-      if (typeof s === "string" && s.startsWith("?")) bind[s] = "@id";
-      if (typeof o === "string" && o.startsWith("?")) bind[o] = f;
+      // Subject binding (@id) ALWAYS wins over an object/ref binding, regardless
+      // of clause order: if a var ever appears in subject position it names an
+      // entity, so `then.project` returns its numeric id. This mirrors the
+      // compile-time VarType (the "@id" & Fieldtype intersection resolves to id).
+      if (typeof s === "string" && s.startsWith("?")) bind[s] = "@id"; // always
+      if (typeof o === "string" && o.startsWith("?") && bind[o] !== "@id") bind[o] = f;
     }
   }
-  const checks: Array<[string, string, (v: unknown) => boolean]> = [];
+  const plan: ValidationCheck[] = [];
   for (const [key, v] of Object.entries(project)) {
     const field = bind[v];
-    if (field === "@id") checks.push([key, "@id", (x) => typeof x === "number"]);
-    else if (field && validators[field]) checks.push([key, field, validators[field]]);
+    if (field === "@id") plan.push({ key, field: "@id", check: (x) => typeof x === "number" });
+    else if (field && validators[field]) plan.push({ key, field, check: validators[field] });
   }
+  return plan;
+}
+
+function rowValidator(where: readonly unknown[], project: Record<string, string>): (row: unknown) => string | null {
+  const plan = validationPlan(where, project);
   return (row) => {
     if (typeof row !== "object" || row === null) return "row is not an object";
-    for (const [key, field, val] of checks) {
-      if (!val((row as Record<string, unknown>)[key])) {
+    for (const { key, field, check } of plan) {
+      if (!check((row as Record<string, unknown>)[key])) {
         return `field '${key}' (${field}) failed validation: got ${JSON.stringify((row as Record<string, unknown>)[key])}`;
       }
     }

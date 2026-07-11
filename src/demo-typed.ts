@@ -18,7 +18,11 @@ import type { Todo } from "./generated/entities.ts";
 import { defaultWorkspace } from "./workspace.ts";
 import { APP } from "./tenancy.ts";
 
-const c = { g: (s: string) => `\x1b[32m${s}\x1b[0m`, r: (s: string) => `\x1b[31m${s}\x1b[0m`, d: (s: string) => `\x1b[2m${s}\x1b[0m` };
+const c = {
+  g: (s: string) => `\x1b[32m${s}\x1b[0m`,
+  r: (s: string) => `\x1b[31m${s}\x1b[0m`,
+  d: (s: string) => `\x1b[2m${s}\x1b[0m`,
+};
 
 // The projection our board reactor returns. Written once, in arktype's TS-like
 // syntax; `TodoRow` (the type) is inferred from it — single source of truth.
@@ -56,7 +60,14 @@ async function main() {
     orderBy: ["?title"],
     limit: 3,
     then: {
-      project: { id: "?t", title: "?title", done: "?done", priority: "?priority", status: "?status", lastActor: "?lastActor" },
+      project: {
+        id: "?t",
+        title: "?title",
+        done: "?done",
+        priority: "?priority",
+        status: "?status",
+        lastActor: "?lastActor",
+      },
     },
   };
 

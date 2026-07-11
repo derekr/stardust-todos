@@ -8,7 +8,7 @@
 // changing access is a fact write, not a deploy.
 
 import type { Role } from "./tenancy.ts";
-import { type EntityId, query } from "./stardust.ts";
+import { query as tquery } from "./typed-query.ts";
 
 // role hierarchy: any(0) < member(1) < owner(2)
 export const roleRank = (role: Role | null): number => (role === "owner" ? 2 : role === "member" ? 1 : 0);
@@ -33,7 +33,9 @@ export interface ProjectedCommand extends CommandDef {
 
 /** All command entities of a scope, ordered. */
 export async function catalog(scope: Scope): Promise<CommandDef[]> {
-  const rows = (await query({
+  // All seven columns are scalar fields → tquery infers the tuple exactly:
+  // [string, string, number, boolean, boolean, "global" | "todo", number].
+  const rows = await tquery({
     find: ["?cmdId", "?label", "?minRank", "?showWhenDenied", "?danger", "?scope", "?order"],
     where: [
       ["?c", "kind", "command"],
@@ -46,7 +48,7 @@ export async function catalog(scope: Scope): Promise<CommandDef[]> {
       ["?c", "order", "?order"],
     ],
     orderBy: ["?order"],
-  })) as [string, string, number, boolean, boolean, Scope, number][];
+  } as const);
   return rows
     .map(([cmdId, label, minRank, showWhenDenied, danger, s, order]) => ({
       cmdId,
@@ -82,7 +84,7 @@ export async function authorizeCommand(cmdId: string, role: Role | null): Promis
 
 /** Seed the catalog + a member persona (idempotent). Returns nothing. */
 export async function ensureCommandCatalog(): Promise<void> {
-  const existing = await query({ find: ["?c"], where: [["?c", "kind", "command"]], limit: 1 });
+  const existing = await tquery({ find: ["?c"], where: [["?c", "kind", "command"]], limit: 1 } as const);
   if (existing.length) return;
   const { transact } = await import("./stardust.ts");
   const cmd = (

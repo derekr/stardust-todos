@@ -21,7 +21,7 @@ import { ensureTodoSchema, migrateOrphanTodos } from "./todos.ts";
 export interface WorkspaceCtx {
   readonly personaId: EntityId;
   readonly workspaceId: EntityId;
-  readonly reactorId: EntityId;
+  readonly reactorId: EntityId; // board reactor (drives the live todo stream)
 }
 
 /** Open a workspace as a persona. Throws AccessDenied without a grant. */
@@ -60,6 +60,7 @@ export async function defaultWorkspace(): Promise<WorkspaceCtx> {
     const ctx = { personaId, workspaceId: ws.id, reactorId: ws.reactorId };
     const n = await migrateOrphanTodos(ctx);
     if (n) console.error(`(backfilled ${n} legacy todo(s) into the default workspace)`);
+    return ctx;
   }
   return { personaId, workspaceId: ws.id, reactorId: ws.reactorId };
 }

@@ -1,16 +1,24 @@
 // Linear-style filtering, grouping, and aggregates — powered by Stardust
-// queries. Every filter is an AND-composed positive predicate (Stardust's `or`
-// and compound `not` are unreliable — verified — so multi-value/negation is
-// composed in this thin layer instead). Counts use groupBy aggregates.
+// queries. Multi-value membership uses `contains {#set …}`; correlated negation
+// (blocked/ready) uses `exists`/`notExists` subqueries (see derive.ts). The bare
+// `not` verb only handles single-fact absence, and an `or(owned, not …)` scope was
+// verified to leak across tenants — so those shapes are avoided. Counts are a
+// per-viewer projection folded here (the group key, EFFECTIVE status, is derived
+// on read, so it can't be a stored-field groupBy aggregate).
 
 import type { WorkspaceCtx } from "./workspace.ts";
 import type { Priority, Status, Todo } from "./todos.ts";
-import { type EntityId, query } from "./stardust.ts";
+import { type EntityId, query, refId } from "./stardust.ts";
 import { query as tquery } from "./typed-query.ts"; // compile-time-checked query for static literals
 import { APP } from "./tenancy.ts";
-import { overdue, ready } from "./features.ts";
+import { ready } from "./features.ts";
+import { openBlockerExists, overdueExists, visibleTo } from "./derive.ts";
 
-export type DerivedView = "all" | "ready" | "overdue" | "mine";
+/** Effective display status: "blocked" is DERIVED (not stored). `done` wins. */
+export const effectiveStatus = (t: Pick<Todo, "status" | "blocked">): Status =>
+  t.blocked && t.status !== "done" ? "blocked" : t.status;
+
+export type DerivedView = "all" | "ready" | "overdue" | "mine" | "done";
 export type GroupBy = "none" | "status" | "priority";
 
 export interface Filter {
@@ -21,14 +29,26 @@ export interface Filter {
   group: GroupBy;
 }
 
-export const emptyFilter: Filter = { status: [], priority: [], tags: [], view: "all", group: "status" };
+export const emptyFilter: Filter = {
+  status: [],
+  priority: [],
+  tags: [],
+  view: "all",
+  group: "status",
+};
 
-const asId = (v: unknown): EntityId => (typeof v === "number" ? v : (v as { "#": EntityId })["#"]);
 // Fixed "now" for deterministic overdue demos on the seeded data.
 const NOW_ISO = "2026-07-11T00:00:00Z";
 
-/** Todos matching the filter (AND-composed), projected app-shaped by Stardust. */
-export async function filteredTodos(ctx: WorkspaceCtx, f: Filter, mineActor?: string): Promise<Todo[]> {
+/** Todos VISIBLE to `viewerPersonaId` and matching the filter, projected by
+ *  Stardust. Row-level visibility (drafts) is enforced server-side here — hidden
+ *  rows never reach the client. */
+export async function filteredTodos(
+  ctx: WorkspaceCtx,
+  f: Filter,
+  viewerPersonaId: number,
+  mineActor?: string,
+): Promise<Todo[]> {
   const where: unknown[] = [
     ["?t", "app", APP],
     ["?t", "workspace", { "#": ctx.workspaceId }],
@@ -37,14 +57,21 @@ export async function filteredTodos(ctx: WorkspaceCtx, f: Filter, mineActor?: st
     ["?t", "priority", "?priority"],
     ["?t", "done", "?done"],
     ["?t", "lastActor", "?lastActor"],
+    ...visibleTo(viewerPersonaId), // draft/author binding + "published OR mine"
   ];
   // Multi-select membership: `contains {#set [...]} ?field` (an expression
-  // predicate — the correct Stardust idiom for "value in a set").
-  if (f.status.length) where.push(["contains", { "#set": f.status }, "?status"]);
+  // predicate — the correct Stardust idiom for "value in a set"). Priority is a
+  // stored field so it filters query-side; STATUS filters app-side below because
+  // "blocked" is derived (a projected $exists), not a stored value.
   if (f.priority.length) where.push(["contains", { "#set": f.priority }, "?priority"]);
   if (f.view === "mine" && mineActor) where.push(["?t", "lastActor", mineActor]); // "changed by me"
   if (f.tags.length) {
-    where.push(["?e", "kind", "tag"], ["?e", "todo", "?t"], ["?e", "label", "?l"], ["contains", { "#set": f.tags }, "?l"]);
+    where.push(
+      ["?e", "kind", "tag"],
+      ["?e", "todo", "?t"],
+      ["?e", "label", "?l"],
+      ["contains", { "#set": f.tags }, "?l"],
+    );
   }
 
   const rows = (await query({
@@ -59,6 +86,9 @@ export async function filteredTodos(ctx: WorkspaceCtx, f: Filter, mineActor?: st
         priority: "?priority",
         status: "?status",
         lastActor: "?lastActor",
+        draft: "?draft", // bound by visibleTo — drives the "draft" badge for the author
+        blocked: openBlockerExists("?t"), // DERIVED per row — no worker, no stored "blocked"
+        overdue: overdueExists("?t", NOW_ISO), // DERIVED per row — same $exists pattern as blocked
       },
     },
   })) as Todo[];
@@ -68,37 +98,62 @@ export async function filteredTodos(ctx: WorkspaceCtx, f: Filter, mineActor?: st
   for (const t of rows) seen.set(t.id, t);
   let todos = [...seen.values()];
 
+  // Status filter is on the DERIVED effective status, so it happens here.
+  if (f.status.length) todos = todos.filter((t) => f.status.includes(effectiveStatus(t)));
+
   if (f.view === "ready") {
     const ids = new Set((await ready(ctx)).map((r) => r.id));
     todos = todos.filter((t) => ids.has(t.id));
   } else if (f.view === "overdue") {
-    const ids = new Set((await overdue(ctx, NOW_ISO)).map((r) => r.id));
-    todos = todos.filter((t) => ids.has(t.id));
+    todos = todos.filter((t) => t.overdue); // derived per-row above — no separate query, no id-set intersection
+  } else if (f.view === "done") {
+    todos = todos.filter((t) => effectiveStatus(t) === "done");
   }
   return todos;
 }
 
-/** Count of todos per status in the workspace (groupBy aggregate).
- *  Written with the compile-time-checked `tquery`: field names (app / workspace
- *  / status) are validated against the generated schema map — a typo is a build
- *  error. (Dynamic filter-building, e.g. filteredTodos, stays on the raw query.) */
-export async function statusCounts(ctx: WorkspaceCtx): Promise<Record<string, number>> {
-  const rows = await tquery({
-    find: ["?status", ["count", "?t"]],
-    where: [["?t", "app", APP], ["?t", "workspace", { "#": ctx.workspaceId }], ["?t", "status", "?status"]],
-    groupBy: ["?status"],
-  } as const); // rows: ["todo"|"doing"|"blocked"|"done", number][] — inferred, no cast
-  return Object.fromEntries(rows);
+/**
+ * (The board's filtering used to be split — a session reactor for priority +
+ * visibility, then an app-side residual tail for status/tags/views. That tail is
+ * GONE: the session reactor now computes effectiveStatus via a bound `exists` and
+ * applies every filter server-side, so `renderBoard` just renders `readSnapshot`.
+ * The snapshot is the single source of truth. See session.ts.)
+ */
+
+export interface Counts {
+  status: Record<string, number>;
+  priority: Record<string, number>;
 }
 
-/** Count of todos per priority in the workspace. */
-export async function priorityCounts(ctx: WorkspaceCtx): Promise<Record<string, number>> {
-  const rows = await tquery({
-    find: ["?priority", ["count", "?t"]],
-    where: [["?t", "app", APP], ["?t", "workspace", { "#": ctx.workspaceId }], ["?t", "priority", "?priority"]],
-    groupBy: ["?priority"],
-  } as const); // rows: ["low"|"med"|"high", number][] — inferred, no cast
-  return Object.fromEntries(rows);
+/**
+ * Effective-status + priority counts for the filter chips — VIEWER-SCOPED.
+ *
+ * Once visibility is per-viewer (drafts), ws-wide counts would leak and mislead
+ * ("Blocked 3" when you can see 1), so counts must be tallied over the SAME
+ * visible set as the board. That can't be a shared per-workspace reactor (a
+ * reactor has no viewer parameter), so it's a viewer-scoped dry-run: project
+ * {status, priority, blocked} for the viewer's visible todos and tally here.
+ */
+export async function aggregateCounts(ctx: WorkspaceCtx, viewerPersonaId: number): Promise<Counts> {
+  const rows = (await query({
+    find: ["?t", "?status", "?priority"],
+    where: [
+      ["?t", "app", APP],
+      ["?t", "workspace", { "#": ctx.workspaceId }],
+      ["?t", "status", "?status"],
+      ["?t", "priority", "?priority"],
+      ...visibleTo(viewerPersonaId),
+    ],
+    then: { project: { status: "?status", priority: "?priority", blocked: openBlockerExists("?t") } },
+  })) as Array<Pick<Todo, "status" | "priority" | "blocked">>;
+  const status: Record<string, number> = {};
+  const priority: Record<string, number> = {};
+  for (const r of rows) {
+    const eff = effectiveStatus(r);
+    status[eff] = (status[eff] ?? 0) + 1;
+    priority[r.priority] = (priority[r.priority] ?? 0) + 1;
+  }
+  return { status, priority };
 }
 
 export interface Blocker {
@@ -107,7 +162,14 @@ export interface Blocker {
   status: Status;
 }
 
-/** Map of todo id -> its blockers (all dep edges in the workspace, one query). */
+/** Map of todo id -> its blockers (all dep edges in the workspace, one query).
+ *
+ *  NOTE: stays on raw `query` (not tquery) deliberately. `?t`/`?b` are the ids we
+ *  want, but they're bound through REF fields (`todo`/`blocker`), so Stardust
+ *  projects them as refs `{"#":n}` — while the typed-query checker models a
+ *  subject-position var as a bare `@id` number and its runtime validator then
+ *  rejects the ref. Typing this correctly needs the checker to understand
+ *  ref-bound projections (a typed-query enhancement), so `refId` normalizes here. */
 export async function blockerMap(ctx: WorkspaceCtx): Promise<Map<EntityId, Blocker[]>> {
   const rows = (await query({
     find: ["?t", "?b", "?bt", "?bs"],
@@ -122,16 +184,16 @@ export async function blockerMap(ctx: WorkspaceCtx): Promise<Map<EntityId, Block
   })) as [unknown, unknown, string, Status][];
   const map = new Map<EntityId, Blocker[]>();
   for (const [t, b, bt, bs] of rows) {
-    const id = asId(t);
+    const id = refId(t);
     if (!map.has(id)) map.set(id, []);
-    map.get(id)!.push({ id: asId(b), title: bt, status: bs });
+    map.get(id)!.push({ id: refId(b), title: bt, status: bs });
   }
   return map;
 }
 
 /** Distinct tag labels used in the workspace. */
 export async function availableTags(ctx: WorkspaceCtx): Promise<string[]> {
-  const rows = (await query({
+  const rows = await tquery({
     find: ["?label"],
     where: [
       ["?e", "kind", "tag"],
@@ -140,16 +202,27 @@ export async function availableTags(ctx: WorkspaceCtx): Promise<string[]> {
       ["?e", "label", "?label"],
     ],
     orderBy: ["?label"],
-  })) as [string][];
-  return [...new Set(rows.map((r) => r[0]))];
+    then: { project: { label: "?label" } }, // Stardust shapes+validates each row
+  } as const);
+  return [...new Set(rows.map((r) => r.label))];
 }
 
-/** All todos in the workspace as {id,title} — for the "add blocker" picker. */
-export async function todoOptions(ctx: WorkspaceCtx): Promise<{ id: EntityId; title: string }[]> {
+/** VISIBLE todos as {id,title} — the "add blocker" picker. Scoped to the viewer
+ *  so you can't pick (and thus depend on) a draft you can't see. */
+export async function todoOptions(
+  ctx: WorkspaceCtx,
+  viewerPersonaId: number,
+): Promise<{ id: EntityId; title: string }[]> {
   const rows = (await query({
     find: ["?t", "?title"],
-    where: [["?t", "app", APP], ["?t", "workspace", { "#": ctx.workspaceId }], ["?t", "title", "?title"]],
+    where: [
+      ["?t", "app", APP],
+      ["?t", "workspace", { "#": ctx.workspaceId }],
+      ["?t", "title", "?title"],
+      ...visibleTo(viewerPersonaId),
+    ],
     orderBy: ["?title"],
-  })) as [EntityId, string][];
-  return rows.map(([id, title]) => ({ id: asId(id), title }));
+    then: { project: { id: "?t", title: "?title" } },
+  })) as { id: EntityId; title: string }[];
+  return rows;
 }

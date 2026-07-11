@@ -12,9 +12,15 @@ the Datastar TS SDK (for the SSE wire format).
 
 ```sh
 npm install                       # installs @starfederation/datastar-sdk
+./scripts/vendor-assets.sh        # datastar + IBM Plex into public/ (once)
 # point at a throwaway Stardust DB:
 export STARDUST_URL=http://localhost:1981
 ```
+
+The browser assets are vendored rather than pulled from a CDN: the page's content
+arrives over the reactor stream, and a third-party script in front of that stream
+gates first paint. The web UI also server-renders the first board into the HTML,
+so nothing flashes in — Datastar morphs its first patch over identical markup.
 
 On first run the app creates a `Todo` JSON Schema and a list reactor in Stardust,
 then caches their ids in `.state.json` so later runs reuse them.

@@ -28,7 +28,8 @@ let pass = 0;
 let fail = 0;
 const ok = (cond: boolean, msg: string) => {
   console.log(`  ${cond ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${msg}`);
-  cond ? pass++ : fail++;
+  if (cond) pass++;
+  else fail++;
 };
 const h = (s: string) => console.log(`\n\x1b[1m\x1b[36m${s}\x1b[0m`);
 
@@ -72,7 +73,10 @@ async function main() {
   const disjoint = (a: Set<number>, b: Set<number>) => [...a].every((x) => !b.has(x));
   ok((await listTodos(houseCtx)).length === 2, "Household has exactly its 2 todos");
   ok((await listTodos(acmeCtx)).length === 2, "Acme has exactly its 2 todos");
-  ok(disjoint(houseIds, acmeIds) && disjoint(houseIds, bobIds) && disjoint(acmeIds, bobIds), "no todo id appears in two workspaces");
+  ok(
+    disjoint(houseIds, acmeIds) && disjoint(houseIds, bobIds) && disjoint(acmeIds, bobIds),
+    "no todo id appears in two workspaces",
+  );
 
   h("5. Access control: Bob cannot open Alice's Household");
   let denied = false;
@@ -86,7 +90,10 @@ async function main() {
   h("6. Sharing: Bob CAN open the shared Acme and sees its todos");
   const bobOnAcme = await openWorkspace(bob1, acme.id);
   const bobAcmeIds = new Set((await listTodos(bobOnAcme)).map((t) => t.id));
-  ok([...acmeIds].every((x) => bobAcmeIds.has(x)), "Bob sees the same todos in shared Acme as Alice/Work");
+  ok(
+    [...acmeIds].every((x) => bobAcmeIds.has(x)),
+    "Bob sees the same todos in shared Acme as Alice/Work",
+  );
   ok(disjoint(bobAcmeIds, houseIds), "shared Acme still does not expose Household");
 
   h("7. Write isolation: Bob cannot toggle a Household todo via his Acme ctx");
@@ -100,7 +107,9 @@ async function main() {
   }
   ok(writeBlocked, "toggling a Household todo through Acme ctx is rejected");
 
-  console.log(`\n\x1b[1m${fail === 0 ? "\x1b[32mALL PASS" : "\x1b[31mFAILURES"}\x1b[0m  ${pass} passed, ${fail} failed\n`);
+  console.log(
+    `\n\x1b[1m${fail === 0 ? "\x1b[32mALL PASS" : "\x1b[31mFAILURES"}\x1b[0m  ${pass} passed, ${fail} failed\n`,
+  );
   if (fail) process.exit(1);
 }
 

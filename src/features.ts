@@ -12,25 +12,25 @@
 
 import type { WorkspaceCtx } from "./workspace.ts";
 import type { EntityId } from "./stardust.ts";
-import type { Status } from "./todos.ts";
 import { APP } from "./tenancy.ts";
 import { deleteEntity, query, readEntity, transact } from "./stardust.ts";
+import { query as tquery } from "./typed-query.ts";
+import { openBlockerClause } from "./derive.ts";
 
 export interface TodoRow {
   id: EntityId;
   title: string;
 }
 
-/** The one scoping fragment every feature query prepends. */
-function scopedTodo(ctx: WorkspaceCtx): unknown[][] {
+/** The one scoping fragment every feature query prepends. Returned as a const
+ *  tuple so it can be spread into a tquery `where` and stay compile-checked. */
+function scopedTodo(ctx: WorkspaceCtx) {
   return [
     ["?t", "app", APP],
     ["?t", "workspace", { "#": ctx.workspaceId }],
     ["?t", "title", "?title"],
-  ];
+  ] as const;
 }
-
-const asId = (v: unknown): EntityId => (typeof v === "number" ? v : (v as { "#": EntityId })["#"]);
 
 /** Confirm a todo id belongs to this workspace before writing an edge to it. */
 async function assertOwned(ctx: WorkspaceCtx, id: EntityId): Promise<void> {
@@ -45,7 +45,7 @@ async function assertOwned(ctx: WorkspaceCtx, id: EntityId): Promise<void> {
 export async function addTag(ctx: WorkspaceCtx, todoId: EntityId, label: string): Promise<void> {
   await assertOwned(ctx, todoId);
   // idempotent: only create the edge if it doesn't already exist
-  const existing = await query({
+  const existing = await tquery({
     find: ["?e"],
     where: [
       ["?e", "kind", "tag"],
@@ -53,41 +53,39 @@ export async function addTag(ctx: WorkspaceCtx, todoId: EntityId, label: string)
       ["?e", "label", label],
     ],
     limit: 1,
-  });
+  } as const);
   if (existing.length) return;
   await transact({ "#_e": { kind: "tag", todo: { "#": todoId }, label } });
 }
 
 export async function removeTag(ctx: WorkspaceCtx, todoId: EntityId, label: string): Promise<void> {
   await assertOwned(ctx, todoId);
-  const rows = (await query({
+  const rows = await tquery({
     find: ["?e"],
     where: [
       ["?e", "kind", "tag"],
       ["?e", "todo", { "#": todoId }],
       ["?e", "label", label],
     ],
-  })) as [EntityId][];
+  } as const); // ?e subject-position → id; rows: [number][]
   await Promise.all(rows.map(([id]) => deleteEntity(id))); // retract the edge
 }
 
 /** Todos in this workspace carrying `label`. */
 export async function todosByTag(ctx: WorkspaceCtx, label: string): Promise<TodoRow[]> {
-  const rows = (await query({
+  // Stardust shapes the row: `then.project` returns {id, title} objects — no
+  // in-app tuple mapping — and normalizes ?t to a numeric id even though it sits
+  // in a ref position in the tag join. The boundary validator checks both fields.
+  return tquery({
     find: ["?t", "?title"],
-    where: [
-      ...scopedTodo(ctx),
-      ["?e", "kind", "tag"],
-      ["?e", "todo", "?t"],
-      ["?e", "label", label],
-    ],
+    where: [...scopedTodo(ctx), ["?e", "kind", "tag"], ["?e", "todo", "?t"], ["?e", "label", label]],
     orderBy: ["?title"],
-  })) as [EntityId, string][];
-  return rows.map(([id, title]) => ({ id: asId(id), title }));
+    then: { project: { id: "?t", title: "?title" } },
+  } as const);
 }
 
 export async function tagsOf(ctx: WorkspaceCtx, todoId: EntityId): Promise<string[]> {
-  const rows = (await query({
+  const rows = await tquery({
     find: ["?label"],
     where: [
       ["?e", "kind", "tag"],
@@ -95,32 +93,53 @@ export async function tagsOf(ctx: WorkspaceCtx, todoId: EntityId): Promise<strin
       ["?e", "label", "?label"],
     ],
     orderBy: ["?label"],
-  })) as [string][];
-  return rows.map(([l]) => l);
+    then: { project: { label: "?label" } }, // shaped + validated by Stardust
+  } as const);
+  return rows.map((r) => r.label);
 }
 
 // ---- Dependencies (edge entities) ----------------------------------------
 
-export async function addDependency(ctx: WorkspaceCtx, todoId: EntityId, blockerId: EntityId): Promise<void> {
+export async function addDependency(
+  ctx: WorkspaceCtx,
+  todoId: EntityId,
+  blockerId: EntityId,
+  actingPersonaId: EntityId = ctx.personaId,
+): Promise<void> {
   if (todoId === blockerId) return; // no self-dependency
   await assertOwned(ctx, todoId);
   await assertOwned(ctx, blockerId); // both ends must be in this workspace
+  // Invariant, enforced at the write boundary: you can't depend on a todo you
+  // can't SEE (someone else's draft). So the "blocked by a hidden draft" state
+  // is unrepresentable — no read-time repair needed. (Publish is one-way, so a
+  // linked todo can't later become private.)
+  const b = await readEntity(blockerId);
+  const visibleToActor = b.draft === false || (b.author as { "#": EntityId } | undefined)?.["#"] === actingPersonaId;
+  if (!visibleToActor) throw new Error(`todo ${blockerId} is a draft you don't own — cannot depend on it`);
   // idempotent
-  const existing = await query({
+  const existing = await tquery({
     find: ["?e"],
-    where: [["?e", "kind", "dep"], ["?e", "todo", { "#": todoId }], ["?e", "blocker", { "#": blockerId }]],
+    where: [
+      ["?e", "kind", "dep"],
+      ["?e", "todo", { "#": todoId }],
+      ["?e", "blocker", { "#": blockerId }],
+    ],
     limit: 1,
-  });
+  } as const);
   if (existing.length) return;
   await transact({ "#_e": { kind: "dep", todo: { "#": todoId }, blocker: { "#": blockerId } } });
 }
 
 export async function removeDependency(ctx: WorkspaceCtx, todoId: EntityId, blockerId: EntityId): Promise<void> {
   await assertOwned(ctx, todoId);
-  const rows = (await query({
+  const rows = await tquery({
     find: ["?e"],
-    where: [["?e", "kind", "dep"], ["?e", "todo", { "#": todoId }], ["?e", "blocker", { "#": blockerId }]],
-  })) as [EntityId][];
+    where: [
+      ["?e", "kind", "dep"],
+      ["?e", "todo", { "#": todoId }],
+      ["?e", "blocker", { "#": blockerId }],
+    ],
+  } as const); // ?e subject-position → id; rows: [number][]
   await Promise.all(rows.map(([id]) => deleteEntity(id)));
 }
 
@@ -128,7 +147,7 @@ export async function removeDependency(ctx: WorkspaceCtx, todoId: EntityId, bloc
 
 /** Todos with a due date strictly before `nowIso`, not yet done. */
 export async function overdue(ctx: WorkspaceCtx, nowIso: string): Promise<TodoRow[]> {
-  const rows = (await query({
+  return tquery({
     find: ["?t", "?title"],
     where: [
       ...scopedTodo(ctx),
@@ -138,41 +157,38 @@ export async function overdue(ctx: WorkspaceCtx, nowIso: string): Promise<TodoRo
       ["<", "?due", { "#utc": nowIso }],
     ],
     orderBy: ["?due"],
-  })) as [EntityId, string][];
-  return rows.map(([id, title]) => ({ id: asId(id), title }));
-}
-
-/** Todos blocked by a dependency whose blocker is not yet done. */
-export async function blocked(ctx: WorkspaceCtx): Promise<TodoRow[]> {
-  const rows = (await query({
-    find: ["?t", "?title"],
-    where: [
-      ...scopedTodo(ctx),
-      ["?d", "kind", "dep"],
-      ["?d", "todo", "?t"],
-      ["?d", "blocker", "?b"],
-      ["?b", "status", "?bs"],
-      ["!=", "?bs", "done"],
-    ],
-    orderBy: ["?title"],
-  })) as [EntityId, string][];
-  // a todo may have several incomplete blockers -> dedupe
-  const seen = new Map<EntityId, string>();
-  for (const [id, title] of rows) seen.set(asId(id), title);
-  return [...seen].map(([id, title]) => ({ id, title }));
+    then: { project: { id: "?t", title: "?title" } }, // predicates checked; row shaped by Stardust
+  } as const);
 }
 
 /**
- * Ready = status "todo" AND not blocked. Stardust's `not` doesn't compose over
- * a multi-clause join (and or/not was shown to leak), so we take the safe route:
- * two positive queries and a set difference. This is orchestration, not a guard.
+ * Todos blocked by a dependency whose blocker is not yet done — ONE query via
+ * the correlated `exists` subquery. `exists` yields one row per matching todo, so
+ * a todo with several incomplete blockers appears once: no JS dedupe needed.
+ * (Raw `query`, not tquery: the typed-query checker only models 3-tuple clauses,
+ * so `exists`/`notExists` verbs go through raw query — same reason board.ts does.)
+ */
+export async function blocked(ctx: WorkspaceCtx): Promise<TodoRow[]> {
+  return (await query({
+    find: ["?t", "?title"],
+    where: [...scopedTodo(ctx), openBlockerClause("?t", false)],
+    orderBy: ["?title"],
+    then: { project: { id: "?t", title: "?title" } }, // Stardust normalizes ?t to a numeric id
+  })) as TodoRow[];
+}
+
+/**
+ * Ready = status "todo" AND not blocked — ONE query via the correlated
+ * `notExists` subquery. The bare `not` verb can't express this (it needs its vars
+ * bound and doesn't compose over a multi-clause join — and an `or(owned, not …)`
+ * scope was verified to LEAK across tenants), but a captured `notExists` subquery
+ * correlates per-row correctly. This replaces the old two-query + JS set-difference.
  */
 export async function ready(ctx: WorkspaceCtx): Promise<TodoRow[]> {
-  const todoRows = (await query({
+  return (await query({
     find: ["?t", "?title"],
-    where: [...scopedTodo(ctx), ["?t", "status", "todo"]],
+    where: [...scopedTodo(ctx), ["?t", "status", "todo"], openBlockerClause("?t", true)],
     orderBy: ["?title"],
-  })) as [EntityId, string][];
-  const blockedIds = new Set((await blocked(ctx)).map((r) => r.id));
-  return todoRows.map(([id, title]) => ({ id: asId(id), title })).filter((r) => !blockedIds.has(r.id));
+    then: { project: { id: "?t", title: "?title" } },
+  })) as TodoRow[];
 }

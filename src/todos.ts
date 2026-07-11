@@ -13,8 +13,10 @@ import { readFile, writeFile } from "node:fs/promises";
 import type { WorkspaceCtx } from "./workspace.ts";
 import { APP } from "./tenancy.ts";
 import {
+  type CheckLast,
   type EntityId,
   type MergePatch,
+  TxConflictError,
   createSchema,
   createSchemaEntity,
   deleteEntity,
@@ -27,17 +29,30 @@ import {
   streamResults,
   transact,
 } from "./stardust.ts";
+import type { SchemaFieldTypes } from "./generated/schema-fields.ts";
 
-export type Priority = "low" | "med" | "high";
-export type Status = "todo" | "doing" | "blocked" | "done";
+// Domain enums come straight from the schema-generated FIELD registry
+// (src/generated/schema-fields.ts, `npm run gen:query`) — the honest primitive:
+// Stardust has no "Todo" type, only fields whose values a schema validates. So
+// these are "whatever the `status`/`priority` fields validate to", not a class.
+export type Priority = SchemaFieldTypes["priority"]; // "low" | "med" | "high"
+export type Status = SchemaFieldTypes["status"]; // "todo" | "doing" | "blocked" | "done"
 
+// A projected board ROW — NOT a Stardust entity type. It's the shape this app
+// reads together to render a row: the stored fields it needs (each typed from the
+// schema field registry, so they can't drift from what Stardust validates on
+// write), plus `id` and derived/visibility flags that are deliberately NOT schema
+// fields. Assembled from field-level guarantees, not an ontological "Todo".
 export interface Todo {
-  id: EntityId;
-  title: string;
-  done: boolean;
-  priority: Priority;
-  status: Status;
-  lastActor?: string;
+  id: EntityId; // Stardust entity id — not a schema field
+  title: SchemaFieldTypes["title"];
+  done: SchemaFieldTypes["done"];
+  priority: SchemaFieldTypes["priority"];
+  status: SchemaFieldTypes["status"]; // user intent: todo | doing | done (never stored as "blocked")
+  blocked?: boolean; // DERIVED on read (correlated $exists over the dep graph) — never stored, not in the schema
+  overdue?: boolean; // DERIVED on read (correlated $exists: not-done + due < now) — same pattern as blocked
+  draft?: boolean; // row-level visibility (a DECLARED field), not part of the Todo schema
+  lastActor?: SchemaFieldTypes["lastActor"];
 }
 
 interface TodoDoc {
@@ -50,6 +65,8 @@ interface TodoDoc {
   due?: { "#utc": string };
   project?: { "#": EntityId };
   lastActor?: string; // materialized: who last changed this todo (cheap per-row read)
+  author?: { "#": EntityId }; // the creating persona — row-level visibility principal
+  draft?: boolean; // draft = visible only to `author` until published
 }
 
 const STATE_FILE = new URL("../.state.json", import.meta.url);
@@ -73,6 +90,8 @@ const TODO_SCHEMA = {
     due: { type: "object" }, // Stardust instant {#utc ...}
     project: { type: "object" }, // ref to a project entity
     lastActor: { type: "string" },
+    author: { type: "object" }, // ref to the creating persona (row-level visibility)
+    draft: { type: "boolean" }, // author-only visible until published
   },
   additionalProperties: false,
 };
@@ -104,6 +123,8 @@ export async function ensureTodoSchema(): Promise<EntityId> {
         due: { type: "object" },
         project: { type: "object" },
         lastActor: { type: "string" },
+        author: { type: "object" },
+        draft: { type: "boolean" },
       },
       required: ["title", "done", "workspace", "app"],
     });
@@ -135,11 +156,14 @@ export async function addTodo(
   ctx: WorkspaceCtx,
   title: string,
   priority: Priority = "med",
-  extra: Partial<Pick<TodoDoc, "due" | "project">> = {},
+  extra: Partial<Pick<TodoDoc, "due" | "project" | "author" | "draft">> = {},
   actor?: string,
 ): Promise<EntityId> {
   const schemaId = await ensureTodoSchema();
   // ONE write: schema-validated todo, born with its workspace ref + app tag.
+  // Every todo carries an `author` (its creating persona) and `draft` flag so
+  // the row-level visibility predicate always binds. Defaults: authored by the
+  // workspace persona, not a draft.
   const created = await createSchemaEntity<TodoDoc>(
     schemaId,
     {
@@ -150,6 +174,8 @@ export async function addTodo(
       workspace: { "#": ctx.workspaceId },
       app: APP,
       lastActor: actor ?? "seed",
+      author: { "#": ctx.personaId },
+      draft: false,
       ...extra,
     },
     { actor },
@@ -161,19 +187,113 @@ export async function addTodo(
   return created.entityId;
 }
 
-async function patchTodo(ctx: WorkspaceCtx, id: EntityId, patch: MergePatch<TodoDoc>, actor?: string): Promise<void> {
+async function patchTodo(
+  ctx: WorkspaceCtx,
+  id: EntityId,
+  patch: MergePatch<TodoDoc>,
+  actor?: string,
+  checkLast?: CheckLast, // optimistic-concurrency guard: reject if the entity moved
+): Promise<void> {
   await authorizeWrite(ctx, id);
   const schemaId = await ensureTodoSchema();
   const full = actor ? { ...patch, lastActor: actor } : patch; // materialize who changed it
-  const r = await patchSchemaEntity<TodoDoc>(schemaId, id, full, { actor });
-  if (!r.ok) throw new Error(`could not update ${id}`);
+  const r = await patchSchemaEntity<TodoDoc>(schemaId, id, full, { actor }, { checkLast });
+  if (!r.ok) {
+    if (r.status === 409) throw new TxConflictError(id, r.error); // stale write — caller re-renders truth
+    throw new Error(`could not update ${id}`);
+  }
+}
+
+/**
+ * One-time: blocked-ness is now DERIVED on read, never stored. Revert any legacy
+ * rows the old worker overwrote to status "blocked" back to "todo" (their user
+ * intent). After this, `status` only ever holds todo | doing | done.
+ */
+export async function migrateBlockedStatus(): Promise<number> {
+  const rows = (await query({
+    find: ["?t"],
+    where: [
+      ["?t", "app", APP],
+      ["?t", "status", "blocked"],
+    ],
+  })) as [EntityId][];
+  if (!rows.length) return 0;
+  const patch: Record<string, Record<string, unknown>> = {};
+  for (const [id] of rows) patch[id] = { status: "todo", done: false };
+  await transact(patch);
+  return rows.length;
+}
+
+/**
+ * One-time: row-level visibility needs every todo to carry `author` + `draft`
+ * so the visibility predicate always binds. Give legacy rows an author (the
+ * workspace owner) and mark them published. Additive facts via generic transact.
+ */
+export async function migrateVisibilityFields(ownerPersonaId: EntityId): Promise<number> {
+  const rows = (await query({
+    find: ["?t"],
+    where: [
+      ["?t", "app", APP],
+      ["not", ["?t", "author", "?a"]],
+    ],
+  })) as [EntityId][];
+  if (!rows.length) return 0;
+  const patch: Record<string, Record<string, unknown>> = {};
+  for (const [id] of rows) patch[id] = { author: { "#": ownerPersonaId }, draft: false };
+  await transact(patch);
+  return rows.length;
+}
+
+/**
+ * Demo seed: one DRAFT per persona so the "view as" toggle visibly changes —
+ * each persona sees only their own draft (plus all published todos). Idempotent
+ * by title.
+ */
+export async function ensureDemoDrafts(ctx: WorkspaceCtx, ownerId: EntityId, memberId: EntityId): Promise<void> {
+  const titles = new Set(
+    (
+      (await query({
+        find: ["?title"],
+        where: [
+          ["?t", "app", APP],
+          ["?t", "workspace", { "#": ctx.workspaceId }],
+          ["?t", "title", "?title"],
+        ],
+      })) as [string][]
+    ).map((r) => r[0]),
+  );
+  const OWNER_DRAFT = "Draft — Q3 roadmap (owner only)";
+  const MEMBER_DRAFT = "Draft — my 1:1 notes (teammate only)";
+  if (!titles.has(OWNER_DRAFT)) {
+    await addTodo(ctx, OWNER_DRAFT, "high", { author: { "#": ownerId }, draft: true }, "Owner");
+  }
+  if (!titles.has(MEMBER_DRAFT)) {
+    await addTodo(ctx, MEMBER_DRAFT, "med", { author: { "#": memberId }, draft: true }, "Teammate");
+  }
+}
+
+/** Publish a draft (make it workspace-visible). Only its author may publish.
+ *  `expectTx` guards the transition the same way `setStatus` does. */
+export async function publishTodo(
+  ctx: WorkspaceCtx,
+  id: EntityId,
+  actingPersonaId: EntityId,
+  expectTx?: number,
+): Promise<void> {
+  const e = await authorizeWrite(ctx, id); // workspace boundary
+  const author = (e.author as { "#": EntityId } | undefined)?.["#"];
+  if (author !== actingPersonaId) throw new Error(`only the author (persona ${author}) can publish this draft`);
+  await patchTodo(ctx, id, { draft: false }, undefined, expectTx ? { [id]: expectTx } : undefined);
 }
 
 /** One-time backfill: give app todos without a lastActor a placeholder. */
 export async function backfillActor(): Promise<number> {
   const rows = (await query({
     find: ["?t"],
-    where: [["?t", "app", APP], ["not", ["?t", "lastActor", "?a"]]],
+    where: [
+      ["?t", "app", APP],
+      ["not", ["?t", "lastActor", "?a"]],
+    ],
   })) as [EntityId][];
   if (!rows.length) return 0;
   const patch: Record<string, Record<string, unknown>> = {};
@@ -188,8 +308,18 @@ export async function setDone(ctx: WorkspaceCtx, id: EntityId, done: boolean, ac
   await patchTodo(ctx, id, { done, status: done ? "done" : "todo" }, actor);
 }
 
-export async function setStatus(ctx: WorkspaceCtx, id: EntityId, status: Status, actor?: string): Promise<void> {
-  await patchTodo(ctx, id, { status, done: status === "done" }, actor);
+// A state-machine transition. Pass `expectTx` (the entity's last tx when the
+// caller rendered the control) to guard against a stale write: if the todo
+// changed since, the write is rejected with a TxConflictError instead of
+// silently clobbering the newer state.
+export async function setStatus(
+  ctx: WorkspaceCtx,
+  id: EntityId,
+  status: Status,
+  actor?: string,
+  expectTx?: number,
+): Promise<void> {
+  await patchTodo(ctx, id, { status, done: status === "done" }, actor, expectTx ? { [id]: expectTx } : undefined);
 }
 
 export async function setDue(ctx: WorkspaceCtx, id: EntityId, dueIso: string | null, actor?: string): Promise<void> {

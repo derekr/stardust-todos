@@ -4,16 +4,16 @@
 // to the new copies in ONE atomic transaction using temp-id references.
 
 import type { WorkspaceCtx } from "./workspace.ts";
-import { type EntityId, type MergePatch, query, readEntity, transact } from "./stardust.ts";
+import { type EntityId, type MergePatch, query, readEntity, refId, transact } from "./stardust.ts";
+import { query as tquery } from "./typed-query.ts";
 import { APP } from "./tenancy.ts";
+import { anyTodoExists, openTodoExists } from "./derive.ts";
 
 export interface Project {
   id: EntityId;
   name: string;
   status: string;
 }
-
-const asId = (v: unknown): EntityId => (typeof v === "number" ? v : (v as { "#": EntityId })["#"]);
 
 export async function createProject(ctx: WorkspaceCtx, name: string): Promise<EntityId> {
   const r = await transact({
@@ -24,20 +24,32 @@ export async function createProject(ctx: WorkspaceCtx, name: string): Promise<En
 
 export async function listProjects(ctx: WorkspaceCtx): Promise<Project[]> {
   const rows = (await query({
-    find: ["?p", "?name", "?status"],
+    find: ["?p", "?name"],
     where: [
       ["?p", "kind", "project"],
       ["?p", "workspace", { "#": ctx.workspaceId }],
       ["?p", "name", "?name"],
-      ["?p", "status", "?status"],
     ],
     orderBy: ["?name"],
-  })) as [{ "#": EntityId }, string, string][];
-  return rows.map(([id, name, status]) => ({ id: asId(id), name, status }));
+    then: {
+      project: {
+        id: "?p",
+        name: "?name",
+        hasOpen: openTodoExists("?p"), // ≥1 not-done todo
+        hasAny: anyTodoExists("?p"), // ≥1 todo at all
+      },
+    },
+  })) as { id: EntityId; name: string; hasOpen: boolean; hasAny: boolean }[];
+  // Project status is DERIVED (rollup), computed on read via correlated $exists:
+  // "done" only when the project has todos and none are open; else "active". No
+  // stored rollup, no worker — this replaces the old C/D workflow rules.
+  return rows.map((r) => ({ id: r.id, name: r.name, status: r.hasAny && !r.hasOpen ? "done" : "active" }));
 }
 
 export async function projectTodos(ctx: WorkspaceCtx, projectId: EntityId): Promise<{ id: EntityId; title: string }[]> {
-  const rows = (await query({
+  // Stardust projects the {id, title} shape directly (no in-app tuple mapping),
+  // and the boundary validator checks each field.
+  return tquery({
     find: ["?t", "?title"],
     where: [
       ["?t", "app", APP],
@@ -46,8 +58,8 @@ export async function projectTodos(ctx: WorkspaceCtx, projectId: EntityId): Prom
       ["?t", "title", "?title"],
     ],
     orderBy: ["?title"],
-  })) as [EntityId, string][];
-  return rows.map(([id, title]) => ({ id: asId(id), title }));
+    then: { project: { id: "?t", title: "?title" } },
+  } as const);
 }
 
 /**
@@ -111,8 +123,8 @@ export async function duplicateProject(ctx: WorkspaceCtx, projectId: EntityId, n
   // clone dependency edges, remapping BOTH ends to the new todos
   let i = 0;
   for (const [tt, bb] of deps) {
-    const a = asId(tt);
-    const b = asId(bb);
+    const a = refId(tt);
+    const b = refId(bb);
     if (!todoIds.has(a) || !todoIds.has(b)) continue; // only intra-project edges
     patch[`#_d${i++}`] = { kind: "dep", todo: { "#": tmp(a) }, blocker: { "#": tmp(b) } };
   }
@@ -120,7 +132,7 @@ export async function duplicateProject(ctx: WorkspaceCtx, projectId: EntityId, n
   // clone tag edges
   let j = 0;
   for (const [tt, label] of tags) {
-    const a = asId(tt);
+    const a = refId(tt);
     if (!todoIds.has(a)) continue;
     patch[`#_g${j++}`] = { kind: "tag", todo: { "#": tmp(a) }, label };
   }

@@ -24,15 +24,19 @@ function tsType(name: string, p: any): string {
 }
 function validator(name: string, p: any): string {
   if (p.enum) return `(v) => (${JSON.stringify(p.enum)} as unknown[]).includes(v)`;
-  if (p.type === "string") return p.minLength ? `(v) => typeof v === "string" && v.length >= ${p.minLength}` : `(v) => typeof v === "string"`;
+  if (p.type === "string")
+    return p.minLength ? `(v) => typeof v === "string" && v.length >= ${p.minLength}` : `(v) => typeof v === "string"`;
   if (p.type === "boolean") return `(v) => typeof v === "boolean"`;
   if (p.type === "number" || p.type === "integer") return `(v) => typeof v === "number"`;
-  if (p.type === "object") return INSTANT_FIELDS.has(name) ? `(v) => typeof (v as any)?.["#utc"] === "string"` : `(v) => typeof (v as any)?.["#"] === "number"`;
+  if (p.type === "object")
+    return INSTANT_FIELDS.has(name)
+      ? `(v) => typeof (v as any)?.["#utc"] === "string"`
+      : `(v) => typeof (v as any)?.["#"] === "number"`;
   return `() => true`;
 }
 
 async function main() {
-  const list = (await (await fetch(`${BASE}/schemas`, { headers: { Accept: "application/json" } })).json()) as {
+  const list = (await (await fetch(`${BASE}/schemas`, { headers: { Accept: "application/x-ndjson" } })).json()) as {
     schemas?: string[];
   };
 
@@ -57,7 +61,8 @@ async function main() {
     `export type Ref = { "#": number };\n` +
     `export type Instant = { "#utc": string };\n\n` +
     `export interface SchemaFieldTypes {\n`;
-  for (const n of names) out += `  ${n}: ${[...reg.get(n)!.types].join(" | ")};  // from ${[...reg.get(n)!.from].join(", ")}\n`;
+  for (const n of names)
+    out += `  ${n}: ${[...reg.get(n)!.types].join(" | ")};  // from ${[...reg.get(n)!.from].join(", ")}\n`;
   out += `}\n\nexport const schemaValidators = {\n`;
   for (const n of names) {
     const vs = [...reg.get(n)!.vals];
@@ -67,7 +72,9 @@ async function main() {
 
   await mkdir("src/generated", { recursive: true });
   await writeFile("src/generated/schema-fields.ts", out);
-  console.log(`wrote src/generated/schema-fields.ts (${names.length} fields from ${(list.schemas ?? []).length} schema(s))`);
+  console.log(
+    `wrote src/generated/schema-fields.ts (${names.length} fields from ${(list.schemas ?? []).length} schema(s))`,
+  );
 }
 
 main().catch((e) => {

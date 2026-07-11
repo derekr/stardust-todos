@@ -1,27 +1,52 @@
-// Stage 3 proof: durable workflows as event-driven dataflow.
-// Derivation rules materialize `status` from the dependency graph and close/
-// reopen projects. We drive runToFixpoint() explicitly for determinism; in
-// production startWorker() runs the same rules on every transaction event.
+// Stage 3 proof: derivation WITHOUT a worker.
+//
+// Blocked-ness and project rollup used to be materialized onto `status` by an
+// imperative worker (react to every commit, recompute to a fixpoint). The
+// un-transition ("no incomplete blocker → unblock") needed a correlated antijoin
+// + reactor retraction, neither of which Stardust has — hence the worker.
+//
+// Now they're DERIVED on read via correlated `$exists` projections. Completing a
+// blocker writes nothing to the dependent's status; the dependent simply derives
+// as ready on the next read. No worker, no fixpoint, no un-block write.
 //
 //   node src/demo-workflow.ts
 
 import { addDependency } from "./features.ts";
 import { addTodo, setStatus } from "./todos.ts";
-import { createProject, projectTodos } from "./projects.ts";
-import { runToFixpoint } from "./workflow.ts";
-import { createPersona, createWorkspace, ensureUser } from "./tenancy.ts";
-import { openWorkspace } from "./workspace.ts";
-import { readEntity } from "./stardust.ts";
+import { createProject, listProjects, projectTodos } from "./projects.ts";
+import { openBlockerExists } from "./derive.ts";
+import { APP, createPersona, createWorkspace, ensureUser } from "./tenancy.ts";
+import { type WorkspaceCtx, openWorkspace } from "./workspace.ts";
+import { query } from "./stardust.ts";
 
 const tag = `w${Date.now().toString().slice(-6)}`;
 let pass = 0;
 let fail = 0;
 const ok = (c: boolean, m: string) => {
   console.log(`  ${c ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${m}`);
-  c ? pass++ : fail++;
+  if (c) pass++;
+  else fail++;
 };
 const h = (s: string) => console.log(`\n\x1b[1m\x1b[36m${s}\x1b[0m`);
-const statusOf = async (id: number) => (await readEntity(id)).status as string;
+
+// The board's derivation, on demand: each todo's stored status + derived blocked,
+// computed by Stardust on read. No writes.
+async function derived(ctx: WorkspaceCtx): Promise<Map<number, { status: string; blocked: boolean }>> {
+  const rows = (await query({
+    find: ["?t", "?status"],
+    where: [
+      ["?t", "app", APP],
+      ["?t", "workspace", { "#": ctx.workspaceId }],
+      ["?t", "status", "?status"],
+    ],
+    then: { project: { id: "?t", status: "?status", blocked: openBlockerExists("?t") } },
+  })) as { id: number; status: string; blocked: boolean }[];
+  return new Map(rows.map((r) => [r.id, { status: r.status, blocked: r.blocked }]));
+}
+const eff = (d: Map<number, { status: string; blocked: boolean }>, id: number): string => {
+  const r = d.get(id)!;
+  return r.blocked && r.status !== "done" ? "blocked" : r.status;
+};
 
 async function main() {
   const user = await ensureUser(`wf.${tag}@example.test`);
@@ -37,39 +62,38 @@ async function main() {
   await addDependency(ctx, b, a);
   await addDependency(ctx, c, b);
 
-  h("Workflow materializes blocked status from the graph");
-  await runToFixpoint("demo");
-  ok((await statusOf(a)) === "todo", "A is ready (no blockers)");
-  ok((await statusOf(b)) === "blocked", "B auto-blocked (needs A)");
-  ok((await statusOf(c)) === "blocked", "C auto-blocked (needs B)");
+  h("Blocked-ness is DERIVED from the graph — nothing was written to status");
+  let d = await derived(ctx);
+  ok(eff(d, a) === "todo", "A is ready (no blockers)");
+  ok(eff(d, b) === "blocked", "B derives blocked (needs A)");
+  ok(eff(d, c) === "blocked", "C derives blocked (needs B)");
 
-  h("Complete A -> workflow auto-unblocks B (causation-linked write)");
+  h("Complete A -> B derives ready on the next read (no un-block write)");
   await setStatus(ctx, a, "done");
-  await runToFixpoint(`user-finished-A`);
-  ok((await statusOf(b)) === "todo", "B auto-unblocked");
-  ok((await statusOf(c)) === "blocked", "C still blocked (B not done)");
+  d = await derived(ctx);
+  ok(eff(d, b) === "todo", "B now derives ready");
+  ok(eff(d, c) === "blocked", "C still blocked (B not done)");
 
-  h("Complete B -> C unblocks");
+  h("Complete B -> C derives ready");
   await setStatus(ctx, b, "done");
-  await runToFixpoint("user-finished-B");
-  ok((await statusOf(c)) === "todo", "C auto-unblocked");
+  d = await derived(ctx);
+  ok(eff(d, c) === "todo", "C now derives ready");
 
-  h("Complete C -> project auto-closes");
+  h("Project rollup is derived too");
   await setStatus(ctx, c, "done");
-  await runToFixpoint("user-finished-C");
-  ok((await statusOf(sprint)) === "done", "Sprint project auto-closed (all todos done)");
+  ok((await listProjects(ctx)).find((p) => p.id === sprint)!.status === "done", "Sprint derives done (all todos done)");
 
-  h("Add a new todo -> project auto-reopens");
+  h("Add a new todo -> project derives active again");
   await addTodo(ctx, "Hotfix", "high", { project: { "#": sprint } });
-  await runToFixpoint("user-added-todo");
-  ok((await statusOf(sprint)) === "active", "Sprint project auto-reopened");
+  ok((await listProjects(ctx)).find((p) => p.id === sprint)!.status === "active", "Sprint derives active");
   ok((await projectTodos(ctx, sprint)).length === 4, "project now has 4 todos");
 
-  h("Idempotence / convergence");
-  const applied = await runToFixpoint("noop");
-  ok(applied === 0, "re-running the workflow applies 0 changes (fixpoint reached)");
+  h("No worker, no fixpoint");
+  ok(true, "every transition above was recomputed on read — nothing to converge, nothing to undo");
 
-  console.log(`\n\x1b[1m${fail === 0 ? "\x1b[32mALL PASS" : "\x1b[31mFAILURES"}\x1b[0m  ${pass} passed, ${fail} failed\n`);
+  console.log(
+    `\n\x1b[1m${fail === 0 ? "\x1b[32mALL PASS" : "\x1b[31mFAILURES"}\x1b[0m  ${pass} passed, ${fail} failed\n`,
+  );
   if (fail) process.exit(1);
 }
 

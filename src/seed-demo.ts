@@ -4,7 +4,6 @@
 import { addDependency, addTag } from "./features.ts";
 import { addTodo, setStatus } from "./todos.ts";
 import { createWorkspace } from "./tenancy.ts";
-import { runToFixpoint } from "./workflow.ts";
 import { defaultWorkspace, openWorkspace } from "./workspace.ts";
 
 async function main() {
@@ -16,8 +15,8 @@ async function main() {
   const read = await addTodo(ctx, "Read the Stardust docs", "low");
   await setStatus(ctx, read, "doing");
 
-  // A dependency chain — the workflow will mark the later steps "blocked".
-  // Uncheck-proof: blocked rows can't be toggled until their blockers finish.
+  // A dependency chain — the later steps derive as "blocked" (correlated $exists
+  // over the dep graph). Blocked rows can't be toggled until their blockers finish.
   const design = await addTodo(ctx, "① Design landing page", "high");
   const build = await addTodo(ctx, "② Build landing page", "high");
   const qa = await addTodo(ctx, "③ QA landing page", "med");
@@ -38,9 +37,7 @@ async function main() {
   await addTodo(gctx, "Eggs", "med");
   await addTodo(gctx, "Sourdough", "low");
 
-  // Run the workflow once so initial "blocked" statuses are materialized.
-  const applied = await runToFixpoint("seed");
-  console.log(`seeded. workflow set ${applied} initial status change(s).`);
+  console.log("seeded. (blocked-ness is derived on read — no worker to run.)");
   console.log("Default workspace: 3 standalone + a 4-step blocked chain.");
   console.log("Groceries workspace: 3 items.");
 }

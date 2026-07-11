@@ -14,7 +14,8 @@ let pass = 0;
 let fail = 0;
 const ok = (c: boolean, m: string) => {
   console.log(`  ${c ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${m}`);
-  c ? pass++ : fail++;
+  if (c) pass++;
+  else fail++;
 };
 const h = (s: string) => console.log(`\n\x1b[1m\x1b[36m${s}\x1b[0m`);
 
@@ -43,13 +44,19 @@ async function main() {
 
   const copyIds = new Set(copyTodos.map((t) => t.id));
   const origIds = new Set([design, build, test]);
-  ok([...copyIds].every((id) => !origIds.has(id)), "copy todos are brand-new entities (not shared)");
+  ok(
+    [...copyIds].every((id) => !origIds.has(id)),
+    "copy todos are brand-new entities (not shared)",
+  );
 
   h("Dependencies were rewired to the COPY, not left pointing at the original");
   // In the copy: Design done? No — progress was reset. So Build & Test are blocked,
   // and every blocked todo in the copy must be a COPY todo, never an original.
   const bl = await blocked(ctx);
-  const copyBlocked = bl.filter((r) => copyIds.has(r.id)).map((r) => r.title).sort();
+  const copyBlocked = bl
+    .filter((r) => copyIds.has(r.id))
+    .map((r) => r.title)
+    .sort();
   ok(copyBlocked.join(",") === "Build,Test", "copy's Build+Test are blocked by copy's own todos");
   const leak = bl.some((r) => copyIds.has(r.id) === false && r.title === "Build" && !origIds.has(r.id));
   ok(!leak, "no dependency in the copy points back at an original todo");
@@ -60,7 +67,9 @@ async function main() {
   // original Design stays done; copy Design is fresh todo -> copy has 3 open, blocked shows 2
   ok(copyBlocked.length === 2, "copy starts fresh: Build+Test blocked because copy-Design is not done");
 
-  console.log(`\n\x1b[1m${fail === 0 ? "\x1b[32mALL PASS" : "\x1b[31mFAILURES"}\x1b[0m  ${pass} passed, ${fail} failed\n`);
+  console.log(
+    `\n\x1b[1m${fail === 0 ? "\x1b[32mALL PASS" : "\x1b[31mFAILURES"}\x1b[0m  ${pass} passed, ${fail} failed\n`,
+  );
   if (fail) process.exit(1);
 }
 

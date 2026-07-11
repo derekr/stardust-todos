@@ -16,14 +16,19 @@ export type { Ref, Instant } from "./generated/schema-fields.ts";
 
 /** Open-world fields — declared by convention, not enforced by a schema. */
 export interface DeclaredFields {
-  kind: "user" | "persona" | "workspace" | "grant" | "command" | "tag" | "dep";
-  name: string; // workspace / persona name
+  kind: "user" | "persona" | "workspace" | "grant" | "command" | "tag" | "dep" | "project";
+  name: string; // workspace / persona / project name
+  email: string; // user login identity
+  user: Ref; // persona → user
   role: "owner" | "member";
   label: string; // tag label
   todo: Ref; // edge → todo
   blocker: Ref; // dep edge → blocker
   persona: Ref; // grant → persona
-  reactor: Ref; // workspace → its reactor
+  reactor: Ref; // workspace → its board reactor
+  countsReactor: Ref; // workspace → its aggregate (counts) reactor
+  author: Ref; // todo → creating persona (row-level visibility)
+  draft: boolean; // todo visible only to its author until published
   adopts: boolean;
   cmdId: string;
   minRank: number;
@@ -44,12 +49,17 @@ export const validators: Record<string, (v: unknown) => boolean> = {
   ...schemaValidators,
   kind: (v) => typeof v === "string",
   name: (v) => typeof v === "string",
+  email: (v) => typeof v === "string",
+  user: isRef,
   role: (v) => v === "owner" || v === "member",
   label: (v) => typeof v === "string",
   todo: isRef,
   blocker: isRef,
   persona: isRef,
   reactor: isRef,
+  countsReactor: isRef,
+  author: isRef,
+  draft: (v) => typeof v === "boolean",
   adopts: (v) => typeof v === "boolean",
   cmdId: (v) => typeof v === "string",
   minRank: (v) => typeof v === "number",

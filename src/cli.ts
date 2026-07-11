@@ -38,7 +38,7 @@ const prioTag: Record<Priority, string> = {
 };
 
 function render(todos: Todo[]): string {
-  if (!todos.length) return c.dim("  (no todos yet — add one with: cli add \"...\")");
+  if (!todos.length) return c.dim('  (no todos yet — add one with: cli add "...")');
   return todos
     .map((t) => {
       const box = t.done ? c.green("[x]") : "[ ]";
@@ -62,7 +62,8 @@ async function main() {
     case "add": {
       const words: string[] = [];
       for (let i = 0; i < rest.length; i++) {
-        if (rest[i] === "--priority" || rest[i] === "-p") i++; // skip flag + its value
+        if (rest[i] === "--priority" || rest[i] === "-p")
+          i++; // skip flag + its value
         else words.push(rest[i]);
       }
       const title = words.join(" ").trim();
@@ -103,13 +104,17 @@ async function main() {
         ac.abort();
         process.exit(0);
       });
-      await watchTodos(ctx, (todos) => {
-        // redraw
-        process.stdout.write("\x1b[2J\x1b[H");
-        console.log(c.bold("TODOS") + c.dim("  (live via Stardust reactor)\n"));
-        console.log(render(todos));
-        console.log(c.dim(`\n  ${todos.filter((t) => !t.done).length} open / ${todos.length} total`));
-      }, ac.signal);
+      await watchTodos(
+        ctx,
+        (todos) => {
+          // redraw
+          process.stdout.write("\x1b[2J\x1b[H");
+          console.log(c.bold("TODOS") + c.dim("  (live via Stardust reactor)\n"));
+          console.log(render(todos));
+          console.log(c.dim(`\n  ${todos.filter((t) => !t.done).length} open / ${todos.length} total`));
+        },
+        ac.signal,
+      );
       break;
     }
     case "migrate": {

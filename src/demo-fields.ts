@@ -13,7 +13,8 @@ let pass = 0;
 let fail = 0;
 const ok = (c: boolean, m: string) => {
   console.log(`  ${c ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${m}`);
-  c ? pass++ : fail++;
+  if (c) pass++;
+  else fail++;
 };
 const h = (s: string) => console.log(`\n\x1b[1m\x1b[36m${s}\x1b[0m`);
 const iso = (daysFromNow: number) => new Date(Date.parse("2026-07-11T00:00:00Z") + daysFromNow * 864e5).toISOString();
@@ -65,7 +66,9 @@ async function main() {
   rd = (await ready(ctx)).map((r) => r.title).sort();
   ok(rd.includes("Build"), "Build becomes ready once its blockers are done");
 
-  console.log(`\n\x1b[1m${fail === 0 ? "\x1b[32mALL PASS" : "\x1b[31mFAILURES"}\x1b[0m  ${pass} passed, ${fail} failed\n`);
+  console.log(
+    `\n\x1b[1m${fail === 0 ? "\x1b[32mALL PASS" : "\x1b[31mFAILURES"}\x1b[0m  ${pass} passed, ${fail} failed\n`,
+  );
   if (fail) process.exit(1);
 }
 

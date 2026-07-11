@@ -1,8 +1,36 @@
-// Minimal, dependency-free Stardust client. Speaks only JSON over fetch + SSE.
+// Minimal, dependency-free Stardust 0.0.6 client.
+//
+// 0.0.6 unified every machine route on ONE shape: a *record stream* in a
+// negotiated profile. The `.json` route aliases, the `?format=json` switches and
+// the `text/event-stream` machine feeds this app used to speak are all gone.
+// We negotiate NDJSON — `application/x-ndjson`, one compact JSON value per
+// LF-terminated line — because it is the cheapest profile to parse from JS, and
+// finite reads and live subscriptions then share a single line reader.
+//
+// Three consequences show up all over the rest of the app:
+//   * ids come back as refs (`{"#": 12}`), so everything goes through `refId()`
+//   * a live route is made finite with `?max=1` rather than "read the first frame
+//     and hang up" — reaching `max` is clean completion, not an error
+//   * failures arrive as a terminal `{"stardust/error": true, code, message}`
+//     record, which this module surfaces as `StardustError` (or, for writes, as
+//     the `ok: false` arm of `WriteResult`)
 
 export type EntityId = number;
 export type Ref = { "#": EntityId | string };
+
+/**
+ * Normalize a value to an entity id. 0.0.6 returns ids in ref position as
+ * `{"#": id}` — including `schemaId`, `entityId`, `reactorId`, and the `tx` on a
+ * fact row — while a subject-position query var still comes back bare.
+ * One helper, imported everywhere, instead of a per-file `asId` copy.
+ */
+export const refId = (v: unknown): EntityId => (typeof v === "number" ? v : Number((v as { "#": EntityId })["#"]));
 export type MergePatch<T> = { [K in keyof T]?: T[K] | null };
+
+export const BASE = process.env.STARDUST_URL ?? "http://localhost:1981";
+
+/** The record profile we negotiate on every machine route. */
+const NDJSON = "application/x-ndjson";
 
 export interface TxResult {
   transaction: Ref | number;
@@ -12,34 +40,178 @@ export interface TxResult {
   unchanged: number;
 }
 
-export interface ValidationDetail {
-  instanceLocation: string;
-  errors: Record<string, string>;
-}
-export interface ValidationError {
-  valid: false;
-  details: ValidationDetail[];
-}
-export type WriteResult<T> =
-  | { ok: true; entityId: EntityId; result: TxResult }
-  | { ok: false; status: number; error: ValidationError };
+// ---- Record streams ---------------------------------------------------------
 
-export const BASE = process.env.STARDUST_URL ?? "http://localhost:1981";
+/** The terminal item of a failed record stream. */
+export interface ErrorRecord {
+  "stardust/error": true;
+  code: string;
+  message: string;
+  details?: unknown;
+}
 
+export const isErrorRecord = (r: unknown): r is ErrorRecord =>
+  !!r && typeof r === "object" && (r as Record<string, unknown>)["stardust/error"] === true;
+
+/** A record stream that ended in `stardust/error`. */
+export class StardustError extends Error {
+  readonly code: string;
+  readonly status: number;
+  readonly details: unknown;
+  constructor(rec: ErrorRecord, status: number) {
+    super(rec.message);
+    this.name = "StardustError";
+    this.code = rec.code;
+    this.status = status;
+    this.details = rec.details;
+  }
+}
+
+/** Split an NDJSON body into records. Profile guarantees one compact value per line. */
+function parseRecords(text: string): unknown[] {
+  const out: unknown[] = [];
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      out.push(JSON.parse(t));
+    } catch {
+      /* truncated tail — the caller sees the records that did arrive */
+    }
+  }
+  return out;
+}
+
+interface ReqOpts {
+  body?: unknown;
+  contentType?: string;
+  headers?: Record<string, string>;
+}
+
+/** One finite machine call: send a document, read the whole record stream back. */
 async function req(
   method: string,
   path: string,
-  opts: { body?: unknown; contentType?: string; headers?: Record<string, string> } = {},
-): Promise<{ status: number; json: any }> {
-  const headers: Record<string, string> = { Accept: "application/json", ...opts.headers };
+  opts: ReqOpts = {},
+): Promise<{ status: number; records: any[]; error?: ErrorRecord }> {
+  const headers: Record<string, string> = { Accept: NDJSON, ...opts.headers };
   let body: string | undefined;
   if (opts.body !== undefined) {
     headers["Content-Type"] = opts.contentType ?? "application/json";
     body = JSON.stringify(opts.body);
   }
   const res = await fetch(BASE + path, { method, headers, body });
-  const text = await res.text();
-  return { status: res.status, json: text ? JSON.parse(text) : null };
+  const records = parseRecords(await res.text());
+  const last = records[records.length - 1];
+  return { status: res.status, records, error: isErrorRecord(last) ? last : undefined };
+}
+
+/** The single record a finite route is documented to return; throws on error. */
+async function one<T>(method: string, path: string, opts: ReqOpts = {}): Promise<T> {
+  const { status, records, error } = await req(method, path, opts);
+  if (error) throw new StardustError(error, status);
+  return records[0] as T;
+}
+
+/**
+ * Read a live record stream, calling `onRecord` per item. Returning `false` from
+ * `onRecord` closes the stream. An async handler is awaited before the next
+ * record is read, so a slow consumer applies backpressure instead of interleaving.
+ *
+ * One connection attempt: returns (does not throw) when the stream drops — Node's
+ * fetch has a ~5-min idle body timeout — so the caller can reconnect. Only a real
+ * abort propagates via `signal`.
+ */
+export async function streamRecords(
+  path: string,
+  onRecord: (rec: any) => boolean | void | Promise<boolean | void>,
+  signal: AbortSignal,
+  headers: Record<string, string> = {},
+): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(BASE + path, { headers: { Accept: NDJSON, ...headers }, signal });
+  } catch {
+    return; // aborted or connection failed — caller inspects signal.aborted
+  }
+  if (!res.body) return;
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let rec: unknown;
+        try {
+          rec = JSON.parse(line);
+        } catch {
+          continue; // partial or non-JSON line
+        }
+        if (isErrorRecord(rec)) return; // terminal item — the stream is over
+        if ((await onRecord(rec)) === false) {
+          await reader.cancel().catch(() => {});
+          return;
+        }
+      }
+    }
+  } catch {
+    // abort, body timeout, or network drop — return; caller reconnects unless aborted
+  }
+}
+
+// ---- Writes -----------------------------------------------------------------
+
+export interface ValidationDetail {
+  instanceLocation: string;
+  errors: Record<string, string>;
+}
+/** A rejected write, flattened from the terminal `stardust/error` record. */
+export interface ValidationError {
+  valid: false;
+  code: string;
+  message: string;
+  details: ValidationDetail[];
+}
+export type WriteResult =
+  | { ok: true; entityId: EntityId; result: TxResult }
+  | { ok: false; status: number; error: ValidationError };
+
+/** 0.0.6 nests the per-location failures one level under the error item's `details`. */
+function toValidationError(rec: ErrorRecord): ValidationError {
+  const d = rec.details as { details?: ValidationDetail[] } | undefined;
+  return { valid: false, code: rec.code, message: rec.message, details: d?.details ?? [] };
+}
+
+/**
+ * A write guarded by `Tx-Check-Last` was rejected (409) because the entity
+ * changed since the caller last saw it — optimistic-concurrency conflict.
+ * `info` is Stardust's error record: code `transaction_conflict`, with
+ * `details.expectedTx` / `details.actualTx` naming both versions.
+ */
+export class TxConflictError extends Error {
+  readonly entity: EntityId;
+  readonly info: unknown;
+  constructor(entity: EntityId, info: unknown) {
+    super(`transaction precondition failed for entity ${entity}`);
+    this.name = "TxConflictError";
+    this.entity = entity;
+    this.info = info;
+  }
+}
+
+/** `Tx-Check-Last` map (entity id → the tx it must have last changed in). */
+export type CheckLast = Record<EntityId, number>;
+
+function checkLastHeaders(checkLast?: CheckLast): Record<string, string> {
+  if (!checkLast || !Object.keys(checkLast).length) return {};
+  return { "Tx-Check-Last-Type": "json", "Tx-Check-Last": JSON.stringify(checkLast) };
 }
 
 export interface TxMeta {
@@ -62,82 +234,102 @@ export async function transact(
   map: Record<string, MergePatch<Record<string, unknown>>>,
   meta: TxMeta = {},
 ): Promise<TxResult> {
-  return (await req("POST", "/commands/transact.json", { body: map, headers: metaHeaders(meta) })).json as TxResult;
+  return one<TxResult>("POST", "/commands/transact", { body: map, headers: metaHeaders(meta) });
+}
+
+/** One current fact row. `tx` and `entity` are refs; `component` is the value. */
+export interface FactRow {
+  entity: Ref | number;
+  field: number | string;
+  tx: Ref | number;
+  component: unknown;
+}
+
+/**
+ * Current fact rows, newest-first. `GET /facts` returns ONE record holding the
+ * whole collection — not a record per fact.
+ */
+export async function readFacts(params: Record<string, string | number>): Promise<FactRow[]> {
+  const qs = new URLSearchParams(Object.entries(params).map(([k, v]) => [k, String(v)])).toString();
+  return (await one<FactRow[]>("GET", `/facts?${qs}`)) ?? [];
+}
+
+/**
+ * The transaction that last touched `id` (its entity-level "version"), read from
+ * the fact log newest-first. Feed this back as `Tx-Check-Last` to make a later
+ * write conditional on "the entity is still exactly as I saw it". 0 = no facts.
+ */
+export async function lastTx(id: EntityId): Promise<number> {
+  const rows = await readFacts({ entityId: id, limit: 1 });
+  return rows[0] ? refId(rows[0].tx) : 0;
+}
+
+// ---- Entities ---------------------------------------------------------------
+
+/** `GET /entities/{id}` is a live route in 0.0.6; `max=1` takes just the current snapshot. */
+export async function readEntity(id: EntityId): Promise<Record<string, unknown>> {
+  return (await one<Record<string, unknown>>("GET", `/entities/${id}?max=1`)) ?? {};
+}
+
+export async function deleteEntity(id: EntityId): Promise<void> {
+  await fetch(`${BASE}/entities/${id}`, { method: "DELETE", headers: { Accept: NDJSON } });
 }
 
 /**
  * Subscribe to the committed-transaction event bus. Fires `onTx(id)` for each
- * transaction event (the id is the transaction id text). This is Stardust's
- * durable change feed — the trigger for event-driven dataflow.
+ * transaction record (the id is the transaction id text). This is Stardust's
+ * durable change feed — the trigger for event-driven dataflow. The record is the
+ * bare transaction result: there is no event/id/data wrapper any more, and the
+ * `transaction` field doubles as the replay position.
  */
 export async function subscribeTransactions(onTx: (txId: string) => void, signal: AbortSignal): Promise<void> {
-  // One connection attempt. Returns (does not throw) when the stream drops —
-  // Node's fetch has a ~5-min idle body timeout — so the caller can reconnect.
-  // Only a real abort propagates.
-  let res: Response;
-  try {
-    res = await fetch(`${BASE}/events/bus/stardust/transactions`, {
-      headers: { Accept: "text/event-stream" },
-      signal,
-    });
-  } catch {
-    return; // aborted or connection failed — caller inspects signal.aborted
-  }
-  const reader = res.body!.getReader();
-  const dec = new TextDecoder();
-  let buf = "";
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let idx: number;
-      while ((idx = buf.indexOf("\n\n")) >= 0) {
-        const frame = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        const idLine = frame.split("\n").find((l) => l.startsWith("id:"));
-        if (idLine && frame.includes("event: stardust-transaction")) onTx(idLine.slice(3).trim());
-      }
-    }
-  } catch {
-    // abort, body timeout, or network drop — return; caller reconnects unless aborted
-  }
+  await streamRecords(
+    "/events/bus/stardust/transactions",
+    (rec: { transaction?: Ref | number }) => {
+      if (rec.transaction !== undefined) onTx(String(refId(rec.transaction)));
+    },
+    signal,
+  );
 }
 
-export async function readEntity(id: EntityId): Promise<Record<string, unknown>> {
-  return (await fetch(`${BASE}/entities/${id}.json`)).json();
-}
-
-export async function deleteEntity(id: EntityId): Promise<void> {
-  await fetch(`${BASE}/entities/${id}`, { method: "DELETE" });
-}
+// ---- Schemas ----------------------------------------------------------------
 
 export async function createSchema(doc: unknown): Promise<{ schemaId: EntityId }> {
-  return (await req("POST", "/schemas.json", { body: doc, contentType: "application/schema+json" })).json;
+  const rec = await one<{ schemaId: Ref | number }>("POST", "/schemas", {
+    body: doc,
+    contentType: "application/schema+json",
+  });
+  return { schemaId: refId(rec.schemaId) };
 }
 
 export async function readSchema(id: EntityId): Promise<{ status: number }> {
+  // Schema documents stay `application/schema+json` — an external media contract,
+  // not a record stream.
   const res = await fetch(`${BASE}/schemas/${id}`, { headers: { Accept: "application/schema+json" } });
   return { status: res.status };
 }
 
 /** Grow/patch a schema document in place (merge-patch semantics; no migration). */
 export async function patchSchema(id: EntityId, mergePatch: unknown): Promise<void> {
-  const { status } = await req("PATCH", `/schemas/${id}.json`, { body: mergePatch, contentType: "application/json" });
-  if (status !== 200) throw new Error(`schema grow failed: ${status}`);
+  const { status, error } = await req("PATCH", `/schemas/${id}`, {
+    body: mergePatch,
+    contentType: "application/merge-patch+json",
+  });
+  if (error) throw new StardustError(error, status);
 }
 
 export async function createSchemaEntity<T>(
   schemaId: EntityId,
   body: MergePatch<T>,
   meta: TxMeta = {},
-): Promise<WriteResult<T>> {
-  const { status, json } = await req("POST", `/schemas/${schemaId}/entities.json`, {
+): Promise<WriteResult> {
+  const { status, records, error } = await req("POST", `/schemas/${schemaId}/entities`, {
     body,
     headers: metaHeaders(meta),
   });
-  if (status === 200 || status === 201) return { ok: true, entityId: json.entityId, result: json.result };
-  return { ok: false, status, error: json as ValidationError };
+  if (error) return { ok: false, status, error: toValidationError(error) };
+  const rec = records[0] as { entityId: Ref | number; result: TxResult };
+  return { ok: true, entityId: refId(rec.entityId), result: rec.result };
 }
 
 export async function patchSchemaEntity<T>(
@@ -145,77 +337,68 @@ export async function patchSchemaEntity<T>(
   entityId: EntityId,
   patch: MergePatch<T>,
   meta: TxMeta = {},
-): Promise<WriteResult<T>> {
-  const { status, json } = await req("PATCH", `/schemas/${schemaId}/entities/${entityId}.json`, {
+  opts: { checkLast?: CheckLast } = {},
+): Promise<WriteResult> {
+  const { status, records, error } = await req("PATCH", `/schemas/${schemaId}/entities/${entityId}`, {
     body: patch,
-    headers: metaHeaders(meta),
+    contentType: "application/merge-patch+json",
+    headers: { ...metaHeaders(meta), ...checkLastHeaders(opts.checkLast) },
   });
-  if (status === 200 || status === 201) return { ok: true, entityId: json.entityId, result: json.result };
-  return { ok: false, status, error: json as ValidationError };
+  if (error) return { ok: false, status, error: toValidationError(error) };
+  const rec = records[0] as { entityId?: Ref | number; result?: TxResult } & TxResult;
+  return {
+    ok: true,
+    entityId: rec.entityId !== undefined ? refId(rec.entityId) : entityId,
+    result: rec.result ?? rec,
+  };
 }
 
+// ---- Reactors ---------------------------------------------------------------
+
 export async function createReactor(body: unknown): Promise<EntityId> {
-  return (await req("POST", "/reactors.json", { body })).json.reactorId["#"];
+  const rec = await one<{ reactorId: Ref | number }>("POST", "/reactors", { body });
+  return refId(rec.reactorId);
 }
 
 /**
  * Run a one-shot datalog query (find/where/...) without storing a reactor.
  * `Row` types the result: `query<[EntityId, string]>(...)` for find-tuples, or
  * `query<Pick<Todo, "title" | "status">>(...)` for a `then.project` shape.
+ *
+ * The dry run is finite and returns ONE record holding the whole row collection.
  */
 export async function query<Row = unknown>(body: unknown): Promise<Row[]> {
-  return (await req("POST", "/reactors/dry-run.json", { body })).json as Row[];
+  return (await one<Row[]>("POST", "/reactors/dry-run", { body })) ?? [];
 }
 
-export async function readResults(id: EntityId): Promise<unknown[]> {
-  return (await fetch(`${BASE}/reactors/${id}/results.json`)).json();
+/** Render a bind override as a RON object for the `?bind=` results param:
+ *  `{ sid: 42 }` → `{sid 42}`, `{ v: "x" }` → `{v 'x'}`. Per-subscription bind
+ *  lets ONE stored reactor serve many parameterizations (e.g. one canonical board
+ *  reactor read per search session). */
+function ronBind(bind: Record<string, string | number>): string {
+  const parts = Object.entries(bind).map(([k, v]) => `${k} ${typeof v === "number" ? v : `'${v}'`}`);
+  return `{${parts.join(" ")}}`;
 }
 
-/** Stream a reactor's live JSON results. Calls onRows on every recompute. */
+function bindQuery(bind?: Record<string, string | number>): string {
+  return bind ? `&bind=${encodeURIComponent(ronBind(bind))}` : "";
+}
+
+/** The reactor's current result. Stored results are a live route, so `max=1`
+ *  takes the current nested result and completes. */
+export async function readResults(id: EntityId, bind?: Record<string, string | number>): Promise<unknown[]> {
+  return (await one<unknown[]>("GET", `/reactors/${id}/results?max=1${bindQuery(bind)}`)) ?? [];
+}
+
+/** Stream a reactor's live results. Calls onRows on every recompute — each record
+ *  is the complete new result, not a delta.
+ *  `bind` overrides the reactor's bind values for THIS stream (per-subscription). */
 export async function streamResults(
   id: EntityId,
   onRows: (rows: unknown[]) => void,
   signal: AbortSignal,
+  bind?: Record<string, string | number>,
 ): Promise<void> {
-  // One connection attempt. Returns (does not throw) when the stream drops —
-  // Node's fetch has a ~5-min idle body timeout — so the caller can reconnect.
-  // Only a real abort propagates.
-  let res: Response;
-  try {
-    res = await fetch(`${BASE}/reactors/${id}/results?format=json`, {
-      headers: { Accept: "text/event-stream" },
-      signal,
-    });
-  } catch {
-    return; // aborted or connection failed — caller inspects signal.aborted
-  }
-  const reader = res.body!.getReader();
-  const dec = new TextDecoder();
-  let buf = "";
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let idx: number;
-      while ((idx = buf.indexOf("\n\n")) >= 0) {
-        const frame = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        const data = frame
-          .split("\n")
-          .filter((l) => l.startsWith("data:"))
-          .map((l) => l.slice(5).trimStart())
-          .join("\n");
-        if (data) {
-          try {
-            onRows(JSON.parse(data));
-          } catch {
-            /* keep-alive / non-JSON */
-          }
-        }
-      }
-    }
-  } catch {
-    // abort, body timeout, or network drop — return; caller reconnects unless aborted
-  }
+  const q = bindQuery(bind).replace(/^&/, "?");
+  await streamRecords(`/reactors/${id}/results${q}`, (rows) => void onRows(rows as unknown[]), signal);
 }

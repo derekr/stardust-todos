@@ -99,7 +99,13 @@ async function _wontCompile() {
   // @ts-expect-error — role only allows "owner" | "member"
   await query({ find: ["?g"], where: [["?g", "role", "admin"]] } as const);
   // valid:
-  await query({ find: ["?g"], where: [["?g", "kind", "grant"], ["?g", "role", "owner"]] } as const);
+  await query({
+    find: ["?g"],
+    where: [
+      ["?g", "kind", "grant"],
+      ["?g", "role", "owner"],
+    ],
+  } as const);
 }
 void _wontCompile;
 

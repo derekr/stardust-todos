@@ -25,7 +25,7 @@ function refine(schema: any): any {
 }
 
 async function main() {
-  const list = (await (await fetch(`${BASE}/schemas`, { headers: { Accept: "application/json" } })).json()) as {
+  const list = (await (await fetch(`${BASE}/schemas`, { headers: { Accept: "application/x-ndjson" } })).json()) as {
     schemas?: string[];
   };
   const urls = list.schemas ?? [];
@@ -37,7 +37,9 @@ async function main() {
     `export type Instant = { "#utc": string };\n\n`;
 
   for (const u of urls) {
-    const schema = refine(await (await fetch(`${BASE}${u}`, { headers: { Accept: "application/schema+json" } })).json());
+    const schema = refine(
+      await (await fetch(`${BASE}${u}`, { headers: { Accept: "application/schema+json" } })).json(),
+    );
     if (!schema?.title) continue;
     const ts = await compile(schema, schema.title, {
       bannerComment: "",
