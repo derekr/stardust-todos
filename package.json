@@ -6,7 +6,8 @@
   "description": "A todo app backed by Stardust — with a CLI and a Datastar web UI, both live via reactor SSE.",
   "scripts": {
     "web": "node src/server.ts",
-    "cli": "node src/cli.ts"
+    "cli": "node src/cli.ts",
+    "demo:tenancy": "node src/demo-tenancy.ts"
   },
   "dependencies": {
     "@starfederation/datastar-sdk": "^1.0.0"

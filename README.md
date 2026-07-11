@@ -43,10 +43,63 @@ Run `node src/cli.ts add "..."` in a terminal and watch the browser update too.
 
 | Todo action        | Stardust operation                                            |
 |--------------------|--------------------------------------------------------------|
-| create             | `POST /schemas/{id}/entities` (validated) + open-world `app` tag |
+| create             | `POST /schemas/{id}/entities` — one validated write carrying `workspace` + `app` |
 | complete / reopen  | `PATCH /schemas/{id}/entities/{id}` with `{ done: true|false }` |
 | delete             | `DELETE /entities/{id}` (retracts every field)               |
-| the live list      | one **reactor** (`find`/`where`) whose results stream over SSE |
+| the live list      | a per-workspace **reactor** (`find`/`where`/`then.project`) streamed over SSE |
+
+## Multi-tenancy: user → persona → workspace
+
+The app started single-tenant and grew data-isolated multi-tenancy **without a
+rewrite** — see the jj history (`jj log`). The model is plain facts:
+
+- **user** — a login (email). Has one or more **personas**.
+- **persona** — a "hat" (Work / Personal); the principal that owns/joins workspaces.
+- **workspace** — the **data-isolation boundary**; todos live in exactly one.
+- **grant** — an edge fact `(persona, workspace, role)`. Access = a grant exists.
+
+Run the isolation proof (12 assertions):
+
+```sh
+node src/demo-tenancy.ts        # npm run demo:tenancy
+```
+
+### Leak-safe by construction — three independent layers
+
+1. **Types.** Every todo read/write requires a `WorkspaceCtx`, and the only way to
+   get one is `openWorkspace(persona, workspace)`, which runs the grant check first.
+   "Forgot to scope by tenant" is unrepresentable — it won't compile.
+2. **Reads.** Each workspace gets its **own reactor**, pinned to a single clause
+   `[?t workspace {# id}]`, created server-side at workspace creation. The client
+   only ever holds the reactor **id** — never the filter — so it cannot widen the
+   scope. Stardust also does the ordering and shapes the output (`then.project`
+   returns `{id,title,done,priority}`), so there's no positional mapping to get wrong.
+3. **Writes.** `authorizeWrite` re-checks ownership before every mutation, so a
+   stray cross-tenant id can't be toggled or deleted even if it reached the server.
+
+### Did we need to migrate legacy data? (a verified finding)
+
+Tempting answer: no — make the default workspace's reactor *adopt* legacy
+single-tenant todos (those with no `workspace`) at read time via
+`or(owned, not-workspace)`, rewriting nothing. **We tested it and it LEAKS:** `or`
+combined with `not` over-matches and pulls another workspace's todos into the
+result. So for a security boundary the scope stays a **single pinned clause**.
+
+The honest conclusion: to bring legacy data into a workspace you *do* assign it a
+`workspace` — but in Stardust that "migration" is just **asserting one fact per
+row** (`migrateOrphanTodos`): additive, non-destructive, history-preserving, and
+reversible — never an `ALTER TABLE`. The default workspace backfills once at
+first boot; isolated workspaces never touch it.
+
+### Pushing work into Stardust (not over-guarding)
+
+- Filtering, ordering, and **shaping** happen in the reactor (`where` + `orderBy`
+  + `then.project`), not in TS.
+- One schema write creates a reactor-ready todo (`workspace` + `app` are schema
+  fields) instead of a create-then-tag pair.
+- Stardust's expression engine is **bounded and fails closed** (AST depth, macro
+  depth, higher-order fuel, output-list size — see docs `expressions/limits`), so
+  it's safe to push aggregation/projection server-side without app-side guards.
 
 ## Why it's a clean fit (TS + Datastar + Stardust)
 
@@ -62,8 +115,11 @@ Run `node src/cli.ts add "..."` in a terminal and watch the browser update too.
 
 ## Files
 
-- `src/stardust.ts` — tiny JSON-only Stardust client (fetch + SSE).
-- `src/todos.ts`    — domain layer: schema + reactor setup, commands, live `watchTodos`.
-- `src/cli.ts`      — the CLI.
-- `src/server.ts`   — Node HTTP + Datastar web server (CQRS).
-- `src/view.ts`     — server-rendered HTML + the morph-friendly `#list` fragment.
+- `src/stardust.ts`      — tiny JSON-only Stardust client (fetch + SSE).
+- `src/tenancy.ts`       — users, personas, workspaces, grants; per-workspace reactors.
+- `src/workspace.ts`     — `WorkspaceCtx` capability, `openWorkspace` (access gate), default tenant.
+- `src/todos.ts`         — workspace-scoped schema + commands + projected reads.
+- `src/cli.ts`           — the CLI (operates in the default workspace).
+- `src/server.ts`        — Node HTTP + Datastar web server (CQRS).
+- `src/view.ts`          — server-rendered HTML + the morph-friendly `#list` fragment.
+- `src/demo-tenancy.ts`  — end-to-end isolation proof (12 assertions).
