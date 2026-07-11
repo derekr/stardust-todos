@@ -1,9 +1,27 @@
 // Server-rendered HTML. Datastar patches the #list fragment over SSE.
 
 import type { Todo } from "./todos.ts";
+import type { Workspace } from "./tenancy.ts";
 
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+/** Workspace switcher. Patched by /stream so every client stays in sync. */
+export function wsBar(workspaces: Workspace[], activeId: number): string {
+  const tabs = workspaces
+    .map(
+      (w) =>
+        `<button class="wstab ${w.id === activeId ? "active" : ""}" data-on:click="@post('/switch/${w.id}')">${esc(w.name)}</button>`,
+    )
+    .join("");
+  return `<div id="wsbar">
+    <span class="wslabel">workspace</span>
+    ${tabs}
+    <form class="wsnew" data-on:submit__prevent="@post('/new-workspace')">
+      <input type="text" data-bind:newWs placeholder="+ new workspace" />
+    </form>
+  </div>`;
+}
 
 const DATASTAR = "https://cdn.jsdelivr.net/gh/starfederation/datastar@1.0.0/bundles/datastar.js";
 
@@ -67,15 +85,23 @@ export function page(todos: Todo[]): string {
     .empty { padding:22px 14px; color:var(--mut); text-align:center; border-top:0; }
     .count { padding:9px 14px; border-top:1px solid var(--line); color:var(--mut); font-size:12px; }
     .err { color:#e5484d; font-size:13px; min-height:18px; margin:-8px 0 12px; }
+    #wsbar { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:14px; }
+    .wslabel { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); margin-right:2px; }
+    .wstab { border:1px solid var(--line); background:var(--card); color:var(--fg); padding:5px 11px; border-radius:20px; cursor:pointer; font-size:13px; }
+    .wstab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+    .wsnew input { border:1px dashed var(--line); background:transparent; color:var(--fg); padding:5px 10px; border-radius:20px; font-size:13px; width:130px; }
     .live { display:inline-flex; align-items:center; gap:6px; }
     .dot { width:7px; height:7px; border-radius:50%; background:#30c46f; box-shadow:0 0 0 0 #30c46f88; animation:pulse 2s infinite; }
     @keyframes pulse { 0%{box-shadow:0 0 0 0 #30c46f88} 70%{box-shadow:0 0 0 6px #30c46f00} 100%{box-shadow:0 0 0 0 #30c46f00} }
   </style>
 </head>
-<body data-signals="{newTitle: '', newPriority: 'med', error: ''}">
+<body data-signals="{newTitle: '', newPriority: 'med', newWs: '', error: ''}">
   <div class="wrap">
     <h1>Todos</h1>
     <p class="sub"><span class="live"><span class="dot"></span>live</span> · backed by Stardust facts, streamed through a reactor, rendered by Datastar</p>
+
+    <!-- Workspace switcher; filled + kept in sync by /stream. -->
+    <div id="wsbar"></div>
 
     <form data-on:submit__prevent="@post('/add')">
       <input type="text" data-bind:newTitle placeholder="What needs doing?" autofocus />
@@ -88,8 +114,10 @@ export function page(todos: Todo[]): string {
     </form>
     <div class="err" data-text="$error"></div>
 
-    <!-- Long-lived read stream (CQRS): the reactor drives every client's list. -->
-    <div data-on-load="@get('/stream')">
+    <!-- Long-lived read stream (CQRS): the active workspace's reactor drives
+         every client's list. Switching workspaces closes streams; Datastar
+         auto-reconnects here and re-renders against the new workspace. -->
+    <div data-on-load="@get('/stream', {retryInterval: 300, retryMaxCount: 100000})">
       ${listFragment(todos)}
     </div>
   </div>

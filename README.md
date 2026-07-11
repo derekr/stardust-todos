@@ -91,7 +91,44 @@ row** (`migrateOrphanTodos`): additive, non-destructive, history-preserving, and
 reversible — never an `ALTER TABLE`. The default workspace backfills once at
 first boot; isolated workspaces never touch it.
 
-### Pushing work into Stardust (not over-guarding)
+## Evolution stages (see `jj log`)
+
+The app grew far past its original design without a rewrite. Each stage is a
+commit and a runnable proof:
+
+| Stage | What was added | Stardust idiom | Proof |
+|-------|----------------|----------------|-------|
+| 1 | single-tenant todos | schema + reactor + SSE | `npm run web` / `cli` |
+| 2 | multi-tenancy | per-workspace pinned reactors, capability types | `npm run demo:tenancy` |
+| 3 | status, due dates, tags, dependencies | instant field predicates; tags/deps as **edge entities**; graph joins | `npm run demo:fields` |
+| 4 | projects + duplicate | atomic **temp-id ref remapping** in one transaction | `npm run demo:projects` |
+| 5 | durable workflows | event-bus dataflow: derive facts, apply across the write boundary, causation-linked | `npm run demo:workflow` + `npm run worker` |
+
+Highlights of the later stages:
+
+- **Rich fields nobody planned up front** (`src/features.ts`). Due dates are
+  Stardust instants queried with a field predicate (`[< ?due {#utc now}]`).
+  Tags and dependencies are **edge entities** (like `grant`), so membership and
+  graph questions ("what's blocked?", "what's ready?") are plain datalog joins
+  rather than array gymnastics. `ready` is a set-diff of two positive queries
+  because Stardust's `not`/`or-not` don't compose safely (verified).
+- **Projects + duplication** (`src/projects.ts`). `duplicateProject` clones a
+  project, its todos, and the dependency/tag edges among them in **one
+  transaction**, using temp-id references (`{"#":"_t<id>"}`) so Stardust rewires
+  every dependency to the new copies atomically — no dangling cross-project refs.
+- **Durable workflows** (`src/workflow.ts`, `src/worker.ts`). Per the theory —
+  *reactors define and observe; writes still cross the write boundary* — a
+  workflow is derivation rules (queries) + an applier that reacts to the
+  transaction event bus. It auto-blocks/unblocks todos from the dependency graph
+  and auto-closes/reopens projects, tagging each derived write with the causing
+  transaction id (`Tx-Causation-Id`). It's idempotent, so it converges to a
+  fixpoint and stops. Verified live: adding a dependency auto-blocks the
+  dependent with no explicit call.
+- **Workspace switching in the web UI** (`src/server.ts`, `#wsbar`). One active
+  workspace at a time; switching updates the server context and closes streams,
+  and Datastar auto-reconnects to re-render against the new workspace.
+
+## Pushing work into Stardust (not over-guarding)
 
 - Filtering, ordering, and **shaping** happen in the reactor (`where` + `orderBy`
   + `then.project`), not in TS.
@@ -115,11 +152,15 @@ first boot; isolated workspaces never touch it.
 
 ## Files
 
-- `src/stardust.ts`      — tiny JSON-only Stardust client (fetch + SSE).
+- `src/stardust.ts`      — tiny JSON-only Stardust client (fetch, SSE, tx bus, causation).
 - `src/tenancy.ts`       — users, personas, workspaces, grants; per-workspace reactors.
 - `src/workspace.ts`     — `WorkspaceCtx` capability, `openWorkspace` (access gate), default tenant.
-- `src/todos.ts`         — workspace-scoped schema + commands + projected reads.
+- `src/todos.ts`         — workspace-scoped schema (evolved 3×) + commands + projected reads.
+- `src/features.ts`      — tags & dependencies (edges); overdue/blocked/ready queries.
+- `src/projects.ts`      — projects + `duplicateProject` (atomic ref remapping).
+- `src/workflow.ts`      — durable-workflow derivation rules + event-bus worker.
+- `src/worker.ts`        — runnable workflow worker (`npm run worker`).
 - `src/cli.ts`           — the CLI (operates in the default workspace).
-- `src/server.ts`        — Node HTTP + Datastar web server (CQRS).
-- `src/view.ts`          — server-rendered HTML + the morph-friendly `#list` fragment.
-- `src/demo-tenancy.ts`  — end-to-end isolation proof (12 assertions).
+- `src/server.ts`        — Node HTTP + Datastar web server (CQRS + workspace switching).
+- `src/view.ts`          — server-rendered HTML: `#wsbar` switcher + morph-friendly `#list`.
+- `src/demo-*.ts`        — runnable proofs: tenancy (12), fields (9), projects (8), workflow (10).
