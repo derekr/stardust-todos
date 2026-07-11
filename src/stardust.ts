@@ -73,9 +73,8 @@ export async function subscribeTransactions(onTx: (txId: string) => void, signal
       headers: { Accept: "text/event-stream" },
       signal,
     });
-  } catch (e) {
-    if ((e as Error).name === "AbortError") throw e;
-    return; // connection failed — let the caller retry
+  } catch {
+    return; // aborted or connection failed — caller inspects signal.aborted
   }
   const reader = res.body!.getReader();
   const dec = new TextDecoder();
@@ -93,9 +92,8 @@ export async function subscribeTransactions(onTx: (txId: string) => void, signal
         if (idLine && frame.includes("event: stardust-transaction")) onTx(idLine.slice(3).trim());
       }
     }
-  } catch (e) {
-    if ((e as Error).name === "AbortError") throw e;
-    // body timeout / network drop — return so the worker reconnects
+  } catch {
+    // abort, body timeout, or network drop — return; caller reconnects unless aborted
   }
 }
 
@@ -166,9 +164,8 @@ export async function streamResults(
       headers: { Accept: "text/event-stream" },
       signal,
     });
-  } catch (e) {
-    if ((e as Error).name === "AbortError") throw e;
-    return;
+  } catch {
+    return; // aborted or connection failed — caller inspects signal.aborted
   }
   const reader = res.body!.getReader();
   const dec = new TextDecoder();
@@ -196,8 +193,7 @@ export async function streamResults(
         }
       }
     }
-  } catch (e) {
-    if ((e as Error).name === "AbortError") throw e;
-    // body timeout / network drop — return so the caller reconnects
+  } catch {
+    // abort, body timeout, or network drop — return; caller reconnects unless aborted
   }
 }

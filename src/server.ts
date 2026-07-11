@@ -30,6 +30,7 @@ import {
 } from "./board.ts";
 import { readEntity } from "./stardust.ts";
 import { statusHistory } from "./history.ts";
+import { startWorker } from "./workflow.ts";
 import { boardFragment, filterBar, menuFragment, page, palette, toolbar, wsBar } from "./view.ts";
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -51,6 +52,17 @@ const MEMBER_PERSONA = (await listPersonas(demoUser)).find((p) => p.name === "Te
 const personaId = ctx.personaId; // owner — used for wsbar + workspace ops
 let viewPersona = OWNER_PERSONA; // "view as" — drives command projection + enforcement
 const curRole = () => roleOf(viewPersona, ctx.workspaceId);
+
+// A long-running server hosts many long-lived streams; a stray rejection from
+// any of them must never take the process down. Log and keep serving.
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
+
+// Run the durable-workflow worker IN THIS PROCESS (no separate node worker).
+const workerAbort = new AbortController();
+startWorker(workerAbort.signal, (txId, applied) => {
+  if (applied) console.log(`workflow: tx ${txId} -> applied ${applied}`);
+}).catch((e) => console.error("worker stopped:", e));
 
 // One inner controller per stream iteration; aborted to force a re-render.
 const switchControllers = new Set<AbortController>();
@@ -123,7 +135,7 @@ const server = http.createServer(async (req, res) => {
           inner = new AbortController();
           switchControllers.add(inner);
           stream.patchElements(wsBar(await listWorkspaces(personaId), ctx.workspaceId));
-          await watchTodos(ctx, () => void renderBoard(stream), inner.signal);
+          await watchTodos(ctx, () => renderBoard(stream).catch((e) => console.error("render:", e)), inner.signal);
           switchControllers.delete(inner);
           // Deliberate switch/close aborts inner → re-render instantly.
           // A dropped upstream stream (idle timeout) did NOT abort → back off.

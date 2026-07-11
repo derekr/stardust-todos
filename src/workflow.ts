@@ -168,11 +168,8 @@ export async function startWorker(
   // up on anything missed while disconnected, then resume listening.
   while (!signal.aborted) {
     await pump("catch-up");
-    try {
-      await subscribeTransactions((txId) => void pump(txId), signal);
-    } catch {
-      break; // aborted
-    }
+    await subscribeTransactions((txId) => void pump(txId), signal); // returns on drop
     if (signal.aborted) break;
+    await new Promise((r) => setTimeout(r, 500)); // backoff before reconnecting
   }
 }
