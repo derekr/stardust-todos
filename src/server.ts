@@ -31,7 +31,7 @@ import {
 import { readEntity } from "./stardust.ts";
 import { statusHistory } from "./history.ts";
 import { startWorker } from "./workflow.ts";
-import { boardFragment, filterBar, menuFragment, page, palette, toolbar, wsBar } from "./view.ts";
+import { boardFragment, filterBar, historySection, menuFragment, page, palette, toolbar, wsBar } from "./view.ts";
 
 const PORT = Number(process.env.PORT ?? 3000);
 
@@ -102,10 +102,15 @@ async function menuElements(id: number): Promise<string> {
   const blockers = (await blockerMap(ctx)).get(id) ?? [];
   const blockerIds = new Set(blockers.map((b) => b.id));
   const candidates = (await todoOptions(ctx)).filter((o) => o.id !== id && !blockerIds.has(o.id));
-  const history = await statusHistory(id);
   const role = await curRole();
   const todoCmds = project(await catalog("todo"), role);
-  return menuFragment(todo, blockers, candidates, history, todoCmds);
+  return menuFragment(todo, blockers, candidates, "loading", todoCmds); // history streams in after
+}
+
+// Render the menu instantly, then stream the (slower) status history into it.
+async function sendMenu(stream: any, id: number) {
+  stream.patchElements(await menuElements(id));
+  if (id) stream.patchElements(historySection(await statusHistory(id)));
 }
 
 const server = http.createServer(async (req, res) => {
@@ -163,7 +168,7 @@ const server = http.createServer(async (req, res) => {
     if (seg[0] === "menu" && method === "GET") {
       const id = Number(seg[1] ?? 0);
       ServerSentEventGenerator.stream(req, res, async (stream) => {
-        stream.patchElements(await menuElements(id));
+        await sendMenu(stream, id);
       });
       return;
     }
@@ -232,7 +237,7 @@ const server = http.createServer(async (req, res) => {
       else if (action === "unblock") await removeDependency(ctx, id, Number(arg));
       rerenderAll(); // refresh boards
       ServerSentEventGenerator.stream(req, res, async (stream) => {
-        stream.patchElements(await menuElements(id)); // refresh the open menu
+        await sendMenu(stream, id); // refresh the open menu (history streams in)
       });
       return;
     }

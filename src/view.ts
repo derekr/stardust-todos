@@ -164,6 +164,11 @@ export function boardFragment(todos: Todo[], blockers: Map<number, Blocker[]>, f
 
 // ---- Action menu (Datastar-driven overlay) -------------------------------
 
+/** Patchable history container — streamed in after the menu appears. */
+export function historySection(history: { status: string; at: string }[]): string {
+  return `<div id="menuhistory">${historyTimeline(history)}</div>`;
+}
+
 function historyTimeline(history: { status: string; at: string }[]): string {
   if (!history.length) return `<div class="mnote">no changes yet</div>`;
   const fmt = (iso: string) => iso.replace("T", " ").replace(/\..*/, "").slice(5, 16); // MM-DD HH:MM
@@ -185,10 +190,14 @@ export function menuFragment(
   todo: Todo | null,
   blockers: Blocker[],
   candidates: { id: number; title: string }[],
-  history: { status: string; at: string }[] = [],
+  history: { status: string; at: string }[] | "loading" = "loading",
   todoCommands: ProjectedCommand[] = [],
 ): string {
   if (!todo) return `<div id="menu"></div>`;
+  const historyBlock =
+    history === "loading"
+      ? `<div id="menuhistory"><div class="mnote">loading…</div></div>`
+      : historySection(history);
   const cmdItems = todoCommands
     .map((c) =>
       c.enabled
@@ -231,7 +240,7 @@ export function menuFragment(
       <div class="msec"><div class="mlabel">Priority</div><div class="mrow">${prioBtns}</div></div>
       <div class="msec"><div class="mlabel">Blocked by</div>${current}</div>
       <div class="msec"><div class="mlabel">Add blocker</div><div class="mcol">${addOpts}</div></div>
-      <div class="msec"><div class="mlabel">Activity — status history</div>${historyTimeline(history)}</div>
+      <div class="msec"><div class="mlabel">Activity — status history</div>${historyBlock}</div>
       <div class="msec"><div class="mlabel">Commands (role-gated, same catalog)</div><div class="mcol">${cmdItems}</div></div>
       <button class="mclose" data-on:click="@get('/menu/0')">Close</button>
     </div>

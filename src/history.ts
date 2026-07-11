@@ -13,11 +13,22 @@ export interface HistoryEntry {
   tx: number;
 }
 
-/** The status timeline for one todo, oldest → newest. */
+/**
+ * The status timeline for one todo, oldest → newest.
+ *
+ * The replay arrives as a burst, then the stream goes quiet (live mode). We
+ * can't be told when the replay ends, so we stop at the first IDLE GAP after
+ * the first event (with a hard cap), instead of always waiting a fixed window.
+ */
 export async function statusHistory(id: EntityId): Promise<HistoryEntry[]> {
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 700); // replay arrives at once, then quiet
   const out: HistoryEntry[] = [];
+  let idle: ReturnType<typeof setTimeout> | undefined;
+  const cap = setTimeout(() => ac.abort(), 900); // fallback if events never arrive
+  const bumpIdle = () => {
+    clearTimeout(idle);
+    idle = setTimeout(() => ac.abort(), 120); // 120ms quiet after the last event = replay done
+  };
   try {
     const res = await fetch(
       `${BASE}/events/bus/stardust/transactions?entityId=${id}&field=status&format=json`,
@@ -45,16 +56,18 @@ export async function statusHistory(id: EntityId): Promise<HistoryEntry[]> {
           const after = ev.patched?.[String(id)]?.after;
           if (after && typeof after.status === "string") {
             out.push({ status: after.status, at: ev.committed, tx: ev.transaction?.["#"] ?? 0 });
+            bumpIdle();
           }
         } catch {
           /* keep-alive frame */
         }
       }
     }
-  } catch (e) {
-    if ((e as Error).name !== "AbortError") throw e;
+  } catch {
+    // abort (idle/cap) or drop — return what we collected
   } finally {
-    clearTimeout(timer);
+    clearTimeout(idle);
+    clearTimeout(cap);
   }
   return out;
 }
