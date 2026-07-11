@@ -98,16 +98,17 @@ export async function createWorkspace(personaId: EntityId, name: string): Promis
 
   const reactorId = await createReactor({
     enabled: true,
-    find: ["?t", "?title", "?done", "?priority"],
+    find: ["?t", "?title", "?done", "?priority", "?status"],
     where: [
       ["?t", "app", APP],
       ["?t", "workspace", { "#": id }], // <-- tenant boundary, single pinned clause
       ["?t", "title", "?title"],
       ["?t", "done", "?done"],
       ["?t", "priority", "?priority"],
+      ["?t", "status", "?status"],
     ],
     orderBy: ["?done", "?priority", "?title"],
-    then: { project: { id: "?t", title: "?title", done: "?done", priority: "?priority" } },
+    then: { project: { id: "?t", title: "?title", done: "?done", priority: "?priority", status: "?status" } },
   });
 
   await transact({ [id]: { reactor: { "#": reactorId } } });

@@ -32,12 +32,13 @@ export function listFragment(todos: Todo[]): string {
     ? todos
         .map(
           (t) => `
-      <li class="row ${t.done ? "done" : ""}">
+      <li class="row ${t.done ? "done" : ""} ${t.status === "blocked" ? "blockedrow" : ""}">
         <input type="checkbox" ${t.done ? "checked" : ""}
                aria-label="toggle ${esc(t.title)}"
                data-on:change="@post('/toggle/${t.id}')" />
         <span class="prio prio-${t.priority}">${t.priority}</span>
         <span class="title">${esc(t.title)}</span>
+        ${t.status && t.status !== "todo" ? `<span class="status status-${t.status}">${t.status}</span>` : ""}
         <button class="del" aria-label="delete ${esc(t.title)}"
                 data-on:click="@delete('/remove/${t.id}')">×</button>
       </li>`,
@@ -80,6 +81,12 @@ export function page(todos: Todo[]): string {
     .prio { font-size:11px; text-transform:uppercase; letter-spacing:.04em; padding:2px 7px; border-radius:20px; border:1px solid var(--line); color:var(--mut); }
     .prio-high { color:#e5484d; border-color:#e5484d55; }
     .prio-med { color:#f5a623; border-color:#f5a62355; }
+    .status { font-size:11px; text-transform:uppercase; letter-spacing:.04em; padding:2px 8px; border-radius:20px; font-weight:600; }
+    .status-blocked { color:#e5484d; background:#e5484d1a; }
+    .status-doing { color:#4f6bed; background:#4f6bed1a; }
+    .status-done { color:#30a46c; background:#30a46c1a; }
+    .blockedrow { opacity:.65; }
+    .blockedrow input[type=checkbox] { pointer-events:none; opacity:.5; }
     .del { border:0; background:transparent; color:var(--mut); font-size:20px; line-height:1; cursor:pointer; padding:0 4px; }
     .del:hover { color:#e5484d; }
     .empty { padding:22px 14px; color:var(--mut); text-align:center; border-top:0; }

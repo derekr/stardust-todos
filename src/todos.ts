@@ -36,6 +36,7 @@ export interface Todo {
   title: string;
   done: boolean;
   priority: Priority;
+  status: Status;
 }
 
 interface TodoDoc {

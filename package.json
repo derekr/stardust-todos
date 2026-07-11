@@ -11,7 +11,8 @@
     "demo:fields": "node src/demo-fields.ts",
     "demo:projects": "node src/demo-projects.ts",
     "demo:workflow": "node src/demo-workflow.ts",
-    "worker": "node src/worker.ts"
+    "worker": "node src/worker.ts",
+    "seed": "node src/seed-demo.ts"
   },
   "dependencies": {
     "@starfederation/datastar-sdk": "^1.0.0"
