@@ -43,19 +43,26 @@ async function req(
 }
 
 export interface TxMeta {
+  /** Who performed the write — stored on the transaction as `actor`. */
+  actor?: string;
   /** Links a derived write to the transaction that caused it (dataflow chains). */
   causationId?: string;
   correlationId?: string;
+}
+
+function metaHeaders(meta: TxMeta): Record<string, string> {
+  const h: Record<string, string> = {};
+  if (meta.actor) h["Tx-Meta-Actor"] = meta.actor;
+  if (meta.causationId) h["Tx-Causation-Id"] = meta.causationId;
+  if (meta.correlationId) h["Tx-Correlation-Id"] = meta.correlationId;
+  return h;
 }
 
 export async function transact(
   map: Record<string, MergePatch<Record<string, unknown>>>,
   meta: TxMeta = {},
 ): Promise<TxResult> {
-  const headers: Record<string, string> = {};
-  if (meta.causationId) headers["Tx-Causation-Id"] = meta.causationId;
-  if (meta.correlationId) headers["Tx-Correlation-Id"] = meta.correlationId;
-  return (await req("POST", "/commands/transact.json", { body: map, headers })).json as TxResult;
+  return (await req("POST", "/commands/transact.json", { body: map, headers: metaHeaders(meta) })).json as TxResult;
 }
 
 /**
@@ -120,8 +127,15 @@ export async function patchSchema(id: EntityId, mergePatch: unknown): Promise<vo
   if (status !== 200) throw new Error(`schema grow failed: ${status}`);
 }
 
-export async function createSchemaEntity<T>(schemaId: EntityId, body: MergePatch<T>): Promise<WriteResult<T>> {
-  const { status, json } = await req("POST", `/schemas/${schemaId}/entities.json`, { body });
+export async function createSchemaEntity<T>(
+  schemaId: EntityId,
+  body: MergePatch<T>,
+  meta: TxMeta = {},
+): Promise<WriteResult<T>> {
+  const { status, json } = await req("POST", `/schemas/${schemaId}/entities.json`, {
+    body,
+    headers: metaHeaders(meta),
+  });
   if (status === 200 || status === 201) return { ok: true, entityId: json.entityId, result: json.result };
   return { ok: false, status, error: json as ValidationError };
 }
@@ -130,8 +144,12 @@ export async function patchSchemaEntity<T>(
   schemaId: EntityId,
   entityId: EntityId,
   patch: MergePatch<T>,
+  meta: TxMeta = {},
 ): Promise<WriteResult<T>> {
-  const { status, json } = await req("PATCH", `/schemas/${schemaId}/entities/${entityId}.json`, { body: patch });
+  const { status, json } = await req("PATCH", `/schemas/${schemaId}/entities/${entityId}.json`, {
+    body: patch,
+    headers: metaHeaders(meta),
+  });
   if (status === 200 || status === 201) return { ok: true, entityId: json.entityId, result: json.result };
   return { ok: false, status, error: json as ValidationError };
 }

@@ -5,12 +5,13 @@
 // one entity + field and replayed from the start (Last-Event-ID: 1), hands back
 // exactly that field's change history with commit timestamps, then goes live.
 
-import { type EntityId, BASE } from "./stardust.ts";
+import { type EntityId, BASE, readEntity } from "./stardust.ts";
 
 export interface HistoryEntry {
   status: string;
   at: string; // ISO commit time
   tx: number;
+  actor?: string; // who committed the change (from Tx-Meta-Actor / causation)
 }
 
 /**
@@ -69,5 +70,19 @@ export async function statusHistory(id: EntityId): Promise<HistoryEntry[]> {
     clearTimeout(idle);
     clearTimeout(cap);
   }
+  // Attribute each change: read its transaction's stored actor (or causation).
+  await Promise.all(
+    out.map(async (e) => {
+      if (!e.tx) return;
+      try {
+        const txe = await readEntity(e.tx);
+        const actor = txe.actor as string | undefined;
+        const causedByWorkflow = String(txe.causationId ?? "").startsWith("workflow");
+        e.actor = actor ?? (causedByWorkflow ? "workflow" : undefined);
+      } catch {
+        /* tx entity unreadable — leave unattributed */
+      }
+    }),
+  );
   return out;
 }

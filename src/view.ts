@@ -164,23 +164,27 @@ export function boardFragment(todos: Todo[], blockers: Map<number, Blocker[]>, f
 
 // ---- Action menu (Datastar-driven overlay) -------------------------------
 
+type HistEntry = { status: string; at: string; actor?: string };
+
 /** Patchable history container — streamed in after the menu appears. */
-export function historySection(history: { status: string; at: string }[]): string {
+export function historySection(history: HistEntry[]): string {
   return `<div id="menuhistory">${historyTimeline(history)}</div>`;
 }
 
-function historyTimeline(history: { status: string; at: string }[]): string {
+function historyTimeline(history: HistEntry[]): string {
   if (!history.length) return `<div class="mnote">no changes yet</div>`;
   const fmt = (iso: string) => iso.replace("T", " ").replace(/\..*/, "").slice(5, 16); // MM-DD HH:MM
   return (
     `<div class="timeline">` +
     history
-      .map(
-        (h) =>
-          `<div class="tl"><span class="tldot status-${h.status}"></span><span class="tlstatus">${
-            STATUS_LABEL[h.status as Status] ?? h.status
-          }</span><span class="tltime">${fmt(h.at)}</span></div>`,
-      )
+      .map((h) => {
+        const who = h.actor
+          ? `<span class="tlactor ${h.actor === "workflow" ? "sys" : ""}">${esc(h.actor)}</span>`
+          : "";
+        return `<div class="tl"><span class="tldot status-${h.status}"></span><span class="tlstatus">${
+          STATUS_LABEL[h.status as Status] ?? h.status
+        }</span>${who}<span class="tltime">${fmt(h.at)}</span></div>`;
+      })
       .join("") +
     `</div>`
   );
@@ -190,7 +194,7 @@ export function menuFragment(
   todo: Todo | null,
   blockers: Blocker[],
   candidates: { id: number; title: string }[],
-  history: { status: string; at: string }[] | "loading" = "loading",
+  history: HistEntry[] | "loading" = "loading",
   todoCommands: ProjectedCommand[] = [],
 ): string {
   if (!todo) return `<div id="menu"></div>`;
@@ -316,7 +320,7 @@ export function page(): string {
     .dot { width:7px; height:7px; border-radius:50%; background:#35b37e; }
     /* menu overlay */
     .backdrop { position:fixed; inset:0; background:rgba(0,0,0,.5); }
-    .menucard { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); width:340px; max-width:92vw; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; box-shadow:0 20px 60px rgba(0,0,0,.5); }
+    .menucard { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); width:480px; max-width:94vw; max-height:86vh; overflow:auto; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px 20px; box-shadow:0 20px 60px rgba(0,0,0,.5); }
     .mtitle { font-weight:600; margin-bottom:12px; font-size:15px; }
     .msec { margin-bottom:11px; }
     .mlabel { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--mut); margin-bottom:5px; }
@@ -333,6 +337,8 @@ export function page(): string {
     .tldot { width:9px; height:9px; border-radius:50%; position:absolute; left:-17px; background:var(--mut); }
     .tldot.status-blocked { background:#f2555a; } .tldot.status-doing { background:#6c7bff; } .tldot.status-done { background:#35b37e; } .tldot.status-todo { background:var(--mut); }
     .tlstatus { font-size:12.5px; }
+    .tlactor { font-size:11px; color:var(--mut); margin-left:8px; }
+    .tlactor.sys { color:var(--accent-ink); font-family:var(--mono); font-size:10.5px; }
     .tltime { font-size:11px; color:var(--faint); font-family:var(--mono); margin-left:auto; }
     /* command surfaces */
     #toolbar { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:12px; }

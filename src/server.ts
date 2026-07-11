@@ -52,6 +52,7 @@ const MEMBER_PERSONA = (await listPersonas(demoUser)).find((p) => p.name === "Te
 const personaId = ctx.personaId; // owner — used for wsbar + workspace ops
 let viewPersona = OWNER_PERSONA; // "view as" — drives command projection + enforcement
 const curRole = () => roleOf(viewPersona, ctx.workspaceId);
+const actorName = () => (viewPersona === MEMBER_PERSONA ? "Teammate" : "Owner"); // stamped on writes
 
 // A long-running server hosts many long-lived streams; a stray rejection from
 // any of them must never take the process down. Log and keep serving.
@@ -208,14 +209,14 @@ const server = http.createServer(async (req, res) => {
         }
         let msg = "";
         if (cmdId === "todo.complete" && target) {
-          await setStatus(ctx, target, "done");
+          await setStatus(ctx, target, "done", actorName());
           msg = "Marked complete.";
         } else if (cmdId === "todo.delete" && target) {
           await removeTodo(ctx, target);
           msg = "Todo deleted.";
         } else if (cmdId === "todo.duplicate" && target) {
           const e = await readEntity(target);
-          await addTodo(ctx, `${String(e.title ?? "todo")} (copy)`, (e.priority as Priority) ?? "med");
+          await addTodo(ctx, `${String(e.title ?? "todo")} (copy)`, (e.priority as Priority) ?? "med", {}, actorName());
           msg = "Todo duplicated.";
         } else {
           msg = `${allowed.label} — done (demo).`;
@@ -231,8 +232,8 @@ const server = http.createServer(async (req, res) => {
       const id = Number(seg[1]);
       const action = seg[2];
       const arg = seg[3];
-      if (action === "status") await setStatus(ctx, id, arg as Status);
-      else if (action === "priority") await setPriority(ctx, id, arg as Priority);
+      if (action === "status") await setStatus(ctx, id, arg as Status, actorName());
+      else if (action === "priority") await setPriority(ctx, id, arg as Priority, actorName());
       else if (action === "block") await addDependency(ctx, id, Number(arg));
       else if (action === "unblock") await removeDependency(ctx, id, Number(arg));
       rerenderAll(); // refresh boards
@@ -274,7 +275,7 @@ const server = http.createServer(async (req, res) => {
           stream.patchSignals(JSON.stringify({ error: "Title can't be empty." }));
           return;
         }
-        await addTodo(ctx, title, s.newPriority ?? "med");
+        await addTodo(ctx, title, s.newPriority ?? "med", {}, actorName());
         stream.patchSignals(JSON.stringify({ newTitle: "", error: "" }));
         rerenderAll();
       });
@@ -283,7 +284,7 @@ const server = http.createServer(async (req, res) => {
 
     const toggleMatch = url.match(/^\/toggle\/(\d+)$/);
     if (toggleMatch && method === "POST") {
-      await toggleTodo(ctx, Number(toggleMatch[1]));
+      await toggleTodo(ctx, Number(toggleMatch[1]), actorName());
       rerenderAll();
       noopStream(req, res);
       return;

@@ -121,7 +121,7 @@ export async function runWorkflows(causationId?: string): Promise<WorkflowRun> {
   for (const id of closed) patch[id] = { status: "done" };
   for (const id of reopened) patch[id] = { status: "active" };
   const applied = Object.keys(patch).length;
-  if (applied) await transact(patch, { causationId });
+  if (applied) await transact(patch, { causationId, actor: "workflow" });
   return { applied, blocked, unblocked, closed, reopened };
 }
 

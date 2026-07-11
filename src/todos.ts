@@ -132,18 +132,15 @@ export async function addTodo(
   title: string,
   priority: Priority = "med",
   extra: Partial<Pick<TodoDoc, "due" | "project">> = {},
+  actor?: string,
 ): Promise<EntityId> {
   const schemaId = await ensureTodoSchema();
   // ONE write: schema-validated todo, born with its workspace ref + app tag.
-  const created = await createSchemaEntity<TodoDoc>(schemaId, {
-    title,
-    done: false,
-    status: "todo",
-    priority,
-    workspace: { "#": ctx.workspaceId },
-    app: APP,
-    ...extra,
-  });
+  const created = await createSchemaEntity<TodoDoc>(
+    schemaId,
+    { title, done: false, status: "todo", priority, workspace: { "#": ctx.workspaceId }, app: APP, ...extra },
+    { actor },
+  );
   if (!created.ok) {
     const why = created.error.details.map((d) => `${d.instanceLocation} ${JSON.stringify(d.errors)}`).join(", ");
     throw new Error(`rejected by schema: ${why}`);
@@ -151,35 +148,35 @@ export async function addTodo(
   return created.entityId;
 }
 
-async function patchTodo(ctx: WorkspaceCtx, id: EntityId, patch: MergePatch<TodoDoc>): Promise<void> {
+async function patchTodo(ctx: WorkspaceCtx, id: EntityId, patch: MergePatch<TodoDoc>, actor?: string): Promise<void> {
   await authorizeWrite(ctx, id);
   const schemaId = await ensureTodoSchema();
-  const r = await patchSchemaEntity<TodoDoc>(schemaId, id, patch);
+  const r = await patchSchemaEntity<TodoDoc>(schemaId, id, patch, { actor });
   if (!r.ok) throw new Error(`could not update ${id}`);
 }
 
 // `done` (used by the web checkbox) and `status` are kept consistent: whichever
-// you set, the other follows.
-export async function setDone(ctx: WorkspaceCtx, id: EntityId, done: boolean): Promise<void> {
-  await patchTodo(ctx, id, { done, status: done ? "done" : "todo" });
+// you set, the other follows. `actor` is stamped on the transaction (attribution).
+export async function setDone(ctx: WorkspaceCtx, id: EntityId, done: boolean, actor?: string): Promise<void> {
+  await patchTodo(ctx, id, { done, status: done ? "done" : "todo" }, actor);
 }
 
-export async function setStatus(ctx: WorkspaceCtx, id: EntityId, status: Status): Promise<void> {
-  await patchTodo(ctx, id, { status, done: status === "done" });
+export async function setStatus(ctx: WorkspaceCtx, id: EntityId, status: Status, actor?: string): Promise<void> {
+  await patchTodo(ctx, id, { status, done: status === "done" }, actor);
 }
 
-export async function setDue(ctx: WorkspaceCtx, id: EntityId, dueIso: string | null): Promise<void> {
-  await patchTodo(ctx, id, { due: dueIso ? { "#utc": dueIso } : null });
+export async function setDue(ctx: WorkspaceCtx, id: EntityId, dueIso: string | null, actor?: string): Promise<void> {
+  await patchTodo(ctx, id, { due: dueIso ? { "#utc": dueIso } : null }, actor);
 }
 
-export async function setPriority(ctx: WorkspaceCtx, id: EntityId, priority: Priority): Promise<void> {
-  await patchTodo(ctx, id, { priority });
+export async function setPriority(ctx: WorkspaceCtx, id: EntityId, priority: Priority, actor?: string): Promise<void> {
+  await patchTodo(ctx, id, { priority }, actor);
 }
 
-export async function toggleTodo(ctx: WorkspaceCtx, id: EntityId): Promise<boolean> {
+export async function toggleTodo(ctx: WorkspaceCtx, id: EntityId, actor?: string): Promise<boolean> {
   const e = await authorizeWrite(ctx, id); // reuse the read — no second fetch
   const next = !(e.done === true);
-  await patchTodo(ctx, id, { done: next, status: next ? "done" : "todo" });
+  await patchTodo(ctx, id, { done: next, status: next ? "done" : "todo" }, actor);
   return next;
 }
 
