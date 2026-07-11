@@ -33,7 +33,9 @@ export class AccessDenied extends Error {
   }
 }
 
-const refId = (v: unknown): EntityId => (v as { "#": EntityId })["#"];
+// A find column bound in a ref position comes back as {"#": id}; in a subject
+// position it comes back as a bare number. Normalize either to a number.
+const asId = (v: unknown): EntityId => (typeof v === "number" ? v : (v as { "#": EntityId })["#"]);
 const tempId = async (patch: Record<string, unknown>): Promise<EntityId> => {
   const r = await transact({ "#_x": patch });
   return r.tempIds!.x;
@@ -79,11 +81,17 @@ export async function listPersonas(userId: EntityId): Promise<Persona[]> {
 // ---- Workspaces + grants -------------------------------------------------
 
 /**
- * Create a workspace owned by `personaId`. This also mints a PER-WORKSPACE
- * reactor whose `where` pins `workspace = {# thisWorkspace}`. That pinned,
- * server-stored query is the isolation boundary: it is physically incapable
- * of returning another workspace's todos. The reactor id is stored back onto
- * the workspace fact so callers retrieve it, never construct the filter.
+ * Create a workspace owned by `personaId`. This mints a PER-WORKSPACE reactor
+ * whose `where` PINS a single clause — `workspace = {# id}` — and whose
+ * `then.project` returns app-shaped {id,title,done,priority} objects. Stardust
+ * does the filtering, ordering AND shaping.
+ *
+ * The single pinned clause is the isolation boundary and is verified airtight.
+ * (A cleverer `or(owned, "has no workspace")` scope was tried to avoid
+ * migrating legacy data, but testing showed `or` + `not` OVER-matches and
+ * leaks another workspace's todos — so the boundary stays a single clause.)
+ * Callers only ever hold the reactor id, never the filter, so they cannot
+ * widen it.
  */
 export async function createWorkspace(personaId: EntityId, name: string): Promise<Workspace> {
   const id = await tempId({ kind: "workspace", name });
@@ -93,12 +101,13 @@ export async function createWorkspace(personaId: EntityId, name: string): Promis
     find: ["?t", "?title", "?done", "?priority"],
     where: [
       ["?t", "app", APP],
-      ["?t", "workspace", { "#": id }], // <-- tenant boundary, baked in
+      ["?t", "workspace", { "#": id }], // <-- tenant boundary, single pinned clause
       ["?t", "title", "?title"],
       ["?t", "done", "?done"],
       ["?t", "priority", "?priority"],
     ],
     orderBy: ["?done", "?priority", "?title"],
+    then: { project: { id: "?t", title: "?title", done: "?done", priority: "?priority" } },
   });
 
   await transact({ [id]: { reactor: { "#": reactorId } } });
@@ -127,8 +136,8 @@ export async function listWorkspaces(personaId: EntityId): Promise<Workspace[]> 
       ["?ws", "reactor", "?reactor"],
     ],
     orderBy: ["?name"],
-  })) as [EntityId, string, { "#": EntityId }][];
-  return rows.map(([id, name, reactor]) => ({ id, name, reactorId: refId(reactor) }));
+  })) as [{ "#": EntityId }, string, { "#": EntityId }][];
+  return rows.map(([id, name, reactor]) => ({ id: asId(id), name, reactorId: asId(reactor) }));
 }
 
 /** Throws AccessDenied unless a grant links persona -> workspace. */
@@ -147,5 +156,5 @@ export async function assertAccess(personaId: EntityId, workspaceId: EntityId): 
 
 export async function workspaceReactor(workspaceId: EntityId): Promise<EntityId> {
   const ws = await readEntity(workspaceId);
-  return refId(ws.reactor);
+  return asId(ws.reactor);
 }

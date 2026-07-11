@@ -15,9 +15,13 @@
 import http from "node:http";
 import { ServerSentEventGenerator } from "@starfederation/datastar-sdk/node";
 import { type Priority, addTodo, listTodos, removeTodo, toggleTodo, watchTodos } from "./todos.ts";
+import { type WorkspaceCtx, defaultWorkspace } from "./workspace.ts";
 import { listFragment, page } from "./view.ts";
 
 const PORT = Number(process.env.PORT ?? 3000);
+
+// Single default tenant for the web UI (persona switching would swap this ctx).
+const ctx: WorkspaceCtx = await defaultWorkspace();
 
 function noopStream(req: http.IncomingMessage, res: http.ServerResponse) {
   ServerSentEventGenerator.stream(req, res, () => {});
@@ -31,7 +35,7 @@ const server = http.createServer(async (req, res) => {
     // --- Page ---
     if (url === "/" && method === "GET") {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      res.end(page(await listTodos()));
+      res.end(page(await listTodos(ctx)));
       return;
     }
 
@@ -41,7 +45,7 @@ const server = http.createServer(async (req, res) => {
       req.on("close", () => ac.abort());
       ServerSentEventGenerator.stream(req, res, async (stream) => {
         // watchTodos fires immediately with the current list, then on every change.
-        await watchTodos((todos) => {
+        await watchTodos(ctx, (todos) => {
           stream.patchElements(listFragment(todos));
         }, ac.signal);
       });
@@ -58,7 +62,7 @@ const server = http.createServer(async (req, res) => {
           stream.patchSignals(JSON.stringify({ error: "Title can't be empty." }));
           return;
         }
-        await addTodo(title, s.newPriority ?? "med");
+        await addTodo(ctx, title, s.newPriority ?? "med");
         stream.patchSignals(JSON.stringify({ newTitle: "", error: "" })); // clear input
       });
       return;
@@ -67,7 +71,7 @@ const server = http.createServer(async (req, res) => {
     // --- Command: toggle ---
     const toggleMatch = url.match(/^\/toggle\/(\d+)$/);
     if (toggleMatch && method === "POST") {
-      await toggleTodo(Number(toggleMatch[1]));
+      await toggleTodo(ctx, Number(toggleMatch[1]));
       noopStream(req, res);
       return;
     }
@@ -75,7 +79,7 @@ const server = http.createServer(async (req, res) => {
     // --- Command: remove ---
     const removeMatch = url.match(/^\/remove\/(\d+)$/);
     if (removeMatch && method === "DELETE") {
-      await removeTodo(Number(removeMatch[1]));
+      await removeTodo(ctx, Number(removeMatch[1]));
       noopStream(req, res);
       return;
     }

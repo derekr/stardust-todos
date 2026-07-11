@@ -1,17 +1,25 @@
-// Todo domain layer over Stardust — shared by the CLI and the web server.
+// Todo domain layer — now WORKSPACE-SCOPED.
 //
-// A "todo" is a schema-validated entity, tagged with an open-world `app` fact
-// so one reactor can watch exactly this app's todos. The reactor's live SSE
-// results are what both frontends render — so every client stays in sync.
+// Every read and write takes a WorkspaceCtx (a capability you can only get by
+// passing an access check in workspace.ts). Reads go through the workspace's
+// pinned reactor; writes stamp the workspace ref and are guarded so you can
+// never mutate a todo in a workspace you don't hold. Isolation is enforced in
+// THREE independent layers:
+//   1. types  — no todo call compiles without a WorkspaceCtx.
+//   2. reads  — the reactor's where-clause is pinned to the workspace server-side.
+//   3. writes — belongsTo() re-checks the fact before every mutation.
 
 import { readFile, writeFile } from "node:fs/promises";
+import type { WorkspaceCtx } from "./workspace.ts";
+import { APP } from "./tenancy.ts";
 import {
   type EntityId,
-  createReactor,
   createSchema,
   createSchemaEntity,
   deleteEntity,
+  patchSchema,
   patchSchemaEntity,
+  query,
   readEntity,
   readResults,
   readSchema,
@@ -28,123 +36,141 @@ export interface Todo {
   priority: Priority;
 }
 
-/** Fields the schema validates. `app` is written open-world, beside the schema. */
 interface TodoDoc {
   title: string;
   done: boolean;
   priority: Priority;
+  workspace: { "#": EntityId };
+  app: string;
 }
 
-const APP = "todo-app";
 const STATE_FILE = new URL("../.state.json", import.meta.url);
 
+// Evolved schema: a schema-written todo is born reactor-ready — it carries its
+// own `workspace` ref and `app` tag, so ONE write produces the exact shape the
+// reactor expects (no follow-up transact to tag it).
 const TODO_SCHEMA = {
   title: "Todo",
   type: "object",
-  required: ["title", "done"],
+  required: ["title", "done", "workspace", "app"],
   properties: {
     title: { type: "string", minLength: 1 },
     done: { type: "boolean" },
     priority: { type: "string", enum: ["low", "med", "high"] },
+    workspace: { type: "object" },
+    app: { type: "string" },
   },
   additionalProperties: false,
 };
 
-interface State {
-  schemaId: EntityId;
-  reactorId: EntityId;
-}
-let state: State | null = null;
+let schemaIdCache: EntityId | null = null;
 
-async function loadState(): Promise<State | null> {
+async function readState(): Promise<{ schemaId?: EntityId }> {
   try {
-    return JSON.parse(await readFile(STATE_FILE, "utf8")) as State;
+    return JSON.parse(await readFile(STATE_FILE, "utf8"));
   } catch {
-    return null;
+    return {};
   }
 }
 
-/** Ensure the schema + list reactor exist; cache their ids to `.state.json`. */
-export async function setup(): Promise<State> {
-  if (state) return state;
+/** Create-or-reuse the Todo schema and GROW it in place to include `workspace`. */
+export async function ensureTodoSchema(): Promise<EntityId> {
+  if (schemaIdCache) return schemaIdCache;
+  const state = await readState();
 
-  const cached = await loadState();
-  if (cached && (await readSchema(cached.schemaId)).status === 200) {
-    try {
-      await readResults(cached.reactorId); // reactor still there?
-      state = cached;
-      return state;
-    } catch {
-      /* fall through and rebuild the reactor */
-    }
+  let schemaId = state.schemaId;
+  if (schemaId && (await readSchema(schemaId)).status === 200) {
+    // In-place evolution of an existing single-tenant schema: add `workspace`,
+    // replace `required`. Merge-patch — existing todos are not migrated.
+    await patchSchema(schemaId, {
+      properties: { workspace: { type: "object" }, app: { type: "string" } },
+      required: ["title", "done", "workspace", "app"],
+    });
+  } else {
+    schemaId = (await createSchema(TODO_SCHEMA)).schemaId;
   }
 
-  const schemaId = cached?.schemaId ?? (await createSchema(TODO_SCHEMA)).schemaId;
-  const reactorId = await createReactor({
-    enabled: true,
-    find: ["?t", "?title", "?done", "?priority"],
-    where: [
-      ["?t", "app", APP],
-      ["?t", "title", "?title"],
-      ["?t", "done", "?done"],
-      ["?t", "priority", "?priority"],
-    ],
-    orderBy: ["?done", "?priority", "?title"],
-  });
-
-  state = { schemaId, reactorId };
-  await writeFile(STATE_FILE, JSON.stringify(state, null, 2));
-  return state;
+  await writeFile(STATE_FILE, JSON.stringify({ schemaId }, null, 2));
+  schemaIdCache = schemaId;
+  return schemaId;
 }
 
-function toTodos(rows: unknown[]): Todo[] {
-  return (rows as [EntityId, string, boolean, Priority][]).map(([id, title, done, priority]) => ({
-    id,
+/**
+ * Authorize a mutation and return the current entity (read once, reused).
+ * A todo is writable only if it is owned by this workspace — the same boundary
+ * the reactor enforces for reads, checked here as a field compare so a stray
+ * cross-tenant id can never be mutated.
+ */
+async function authorizeWrite(ctx: WorkspaceCtx, id: EntityId): Promise<Record<string, unknown>> {
+  const e = await readEntity(id);
+  const ws = (e.workspace as { "#": EntityId } | undefined)?.["#"];
+  if (ws !== ctx.workspaceId) throw new Error(`todo ${id} is not in workspace ${ctx.workspaceId}`);
+  return e;
+}
+
+// ---- Commands (all scoped to ctx) ----------------------------------------
+
+export async function addTodo(ctx: WorkspaceCtx, title: string, priority: Priority = "med"): Promise<EntityId> {
+  const schemaId = await ensureTodoSchema();
+  // ONE write: schema-validated todo, born with its workspace ref + app tag.
+  const created = await createSchemaEntity<TodoDoc>(schemaId, {
     title,
-    done,
+    done: false,
     priority,
-  }));
-}
-
-// ---- Commands -------------------------------------------------------------
-
-export async function addTodo(title: string, priority: Priority = "med"): Promise<EntityId> {
-  const { schemaId } = await setup();
-  const created = await createSchemaEntity<TodoDoc>(schemaId, { title, done: false, priority });
+    workspace: { "#": ctx.workspaceId },
+    app: APP,
+  });
   if (!created.ok) {
     const why = created.error.details.map((d) => `${d.instanceLocation} ${JSON.stringify(d.errors)}`).join(", ");
     throw new Error(`rejected by schema: ${why}`);
   }
-  await transact({ [created.entityId]: { app: APP } }); // open-world tag
   return created.entityId;
 }
 
-export async function setDone(id: EntityId, done: boolean): Promise<void> {
-  const { schemaId } = await setup();
+export async function setDone(ctx: WorkspaceCtx, id: EntityId, done: boolean): Promise<void> {
+  await authorizeWrite(ctx, id);
+  const schemaId = await ensureTodoSchema();
   const r = await patchSchemaEntity<TodoDoc>(schemaId, id, { done });
   if (!r.ok) throw new Error(`could not update ${id}`);
 }
 
-export async function toggleTodo(id: EntityId): Promise<boolean> {
-  const cur = await readEntity(id);
-  const next = !(cur.done === true);
-  await setDone(id, next);
+export async function toggleTodo(ctx: WorkspaceCtx, id: EntityId): Promise<boolean> {
+  const e = await authorizeWrite(ctx, id); // reuse the read — no second fetch
+  const next = !(e.done === true);
+  const schemaId = await ensureTodoSchema();
+  await patchSchemaEntity<TodoDoc>(schemaId, id, { done: next });
   return next;
 }
 
-export async function removeTodo(id: EntityId): Promise<void> {
-  await deleteEntity(id); // retracts every current field, incl. the app tag
+export async function removeTodo(ctx: WorkspaceCtx, id: EntityId): Promise<void> {
+  await authorizeWrite(ctx, id);
+  await deleteEntity(id);
 }
 
-// ---- Reads ----------------------------------------------------------------
+// ---- Reads: Stardust projects the exact shape; no positional mapping -----
 
-export async function listTodos(): Promise<Todo[]> {
-  const { reactorId } = await setup();
-  return toTodos(await readResults(reactorId));
+export async function listTodos(ctx: WorkspaceCtx): Promise<Todo[]> {
+  return (await readResults(ctx.reactorId)) as Todo[];
 }
 
-/** Subscribe to live todo lists. Fires cb on every change until aborted. */
-export async function watchTodos(cb: (todos: Todo[]) => void, signal: AbortSignal): Promise<void> {
-  const { reactorId } = await setup();
-  await streamResults(reactorId, (rows) => cb(toTodos(rows)), signal);
+export async function watchTodos(ctx: WorkspaceCtx, cb: (todos: Todo[]) => void, signal: AbortSignal): Promise<void> {
+  await streamResults(ctx.reactorId, (rows) => cb(rows as unknown as Todo[]), signal);
+}
+
+// ---- Migration: pull legacy single-tenant todos into a workspace ---------
+
+/** Assign app-tagged todos that have NO workspace to `ctx`'s workspace. */
+export async function migrateOrphanTodos(ctx: WorkspaceCtx): Promise<number> {
+  const rows = (await query({
+    find: ["?t"],
+    where: [
+      ["?t", "app", APP],
+      ["not", ["?t", "workspace", "?w"]],
+    ],
+  })) as [EntityId][];
+  if (!rows.length) return 0;
+  const patch: Record<string, Record<string, unknown>> = {};
+  for (const [id] of rows) patch[id] = { workspace: { "#": ctx.workspaceId } };
+  await transact(patch);
+  return rows.length;
 }

@@ -9,7 +9,18 @@
 //
 // Env: STARDUST_URL (default http://localhost:1981)
 
-import { type Priority, type Todo, addTodo, listTodos, removeTodo, setDone, toggleTodo, watchTodos } from "./todos.ts";
+import {
+  type Priority,
+  type Todo,
+  addTodo,
+  listTodos,
+  migrateOrphanTodos,
+  removeTodo,
+  setDone,
+  toggleTodo,
+  watchTodos,
+} from "./todos.ts";
+import { defaultWorkspace } from "./workspace.ts";
 
 const c = {
   dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
@@ -45,6 +56,7 @@ function parsePriority(args: string[]): Priority {
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
+  const ctx = await defaultWorkspace(); // single default tenant for the CLI
 
   switch (cmd) {
     case "add": {
@@ -55,33 +67,33 @@ async function main() {
       }
       const title = words.join(" ").trim();
       if (!title) throw new Error('usage: add "title" [--priority low|med|high]');
-      const id = await addTodo(title, parsePriority(rest));
+      const id = await addTodo(ctx, title, parsePriority(rest));
       console.log(c.green(`added #${id}`), title);
-      console.log(render(await listTodos()));
+      console.log(render(await listTodos(ctx)));
       break;
     }
     case "done":
     case "undone": {
       const id = Number(rest[0]);
       if (!id) throw new Error(`usage: ${cmd} <id>`);
-      await setDone(id, cmd === "done");
-      console.log(render(await listTodos()));
+      await setDone(ctx, id, cmd === "done");
+      console.log(render(await listTodos(ctx)));
       break;
     }
     case "toggle": {
       const id = Number(rest[0]);
       if (!id) throw new Error("usage: toggle <id>");
-      const now = await toggleTodo(id);
+      const now = await toggleTodo(ctx, id);
       console.log(c.cyan(`#${id} -> ${now ? "done" : "open"}`));
-      console.log(render(await listTodos()));
+      console.log(render(await listTodos(ctx)));
       break;
     }
     case "rm": {
       const id = Number(rest[0]);
       if (!id) throw new Error("usage: rm <id>");
-      await removeTodo(id);
+      await removeTodo(ctx, id);
       console.log(c.red(`removed #${id}`));
-      console.log(render(await listTodos()));
+      console.log(render(await listTodos(ctx)));
       break;
     }
     case "watch": {
@@ -91,7 +103,7 @@ async function main() {
         ac.abort();
         process.exit(0);
       });
-      await watchTodos((todos) => {
+      await watchTodos(ctx, (todos) => {
         // redraw
         process.stdout.write("\x1b[2J\x1b[H");
         console.log(c.bold("TODOS") + c.dim("  (live via Stardust reactor)\n"));
@@ -100,14 +112,22 @@ async function main() {
       }, ac.signal);
       break;
     }
+    case "migrate": {
+      // OPTIONAL. The default workspace already adopts legacy todos at read
+      // time (or/not), so this is never required — it just stamps a permanent
+      // workspace ref onto orphan todos if you prefer that.
+      const n = await migrateOrphanTodos(ctx);
+      console.log(n ? c.green(`stamped ${n} legacy todo(s) into the default workspace`) : c.dim("no orphan todos"));
+      break;
+    }
     case "ls":
     case undefined: {
       console.log(c.bold("TODOS\n"));
-      console.log(render(await listTodos()));
+      console.log(render(await listTodos(ctx)));
       break;
     }
     default:
-      console.log(`unknown command: ${cmd}\n\ncommands: ls | add | done | undone | toggle | rm | watch`);
+      console.log(`unknown command: ${cmd}\n\ncommands: ls | add | done | undone | toggle | rm | watch | migrate`);
       process.exit(1);
   }
 }

@@ -63,6 +63,12 @@ export async function readSchema(id: EntityId): Promise<{ status: number }> {
   return { status: res.status };
 }
 
+/** Grow/patch a schema document in place (merge-patch semantics; no migration). */
+export async function patchSchema(id: EntityId, mergePatch: unknown): Promise<void> {
+  const { status } = await req("PATCH", `/schemas/${id}.json`, { body: mergePatch, contentType: "application/json" });
+  if (status !== 200) throw new Error(`schema grow failed: ${status}`);
+}
+
 export async function createSchemaEntity<T>(schemaId: EntityId, body: MergePatch<T>): Promise<WriteResult<T>> {
   const { status, json } = await req("POST", `/schemas/${schemaId}/entities.json`, { body });
   if (status === 200 || status === 201) return { ok: true, entityId: json.entityId, result: json.result };
