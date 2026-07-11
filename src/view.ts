@@ -1,12 +1,23 @@
-// Server-rendered HTML. Datastar patches the #list fragment over SSE.
+// Server-rendered HTML. Datastar patches #board, #filterbar, #menu, #wsbar.
+// Styling is Linear/shadcn-inspired but self-contained; all interactivity is
+// driven by Datastar (server-authoritative), no competing client JS.
 
-import type { Todo } from "./todos.ts";
+import type { Todo, Priority, Status } from "./todos.ts";
 import type { Workspace } from "./tenancy.ts";
+import type { Filter } from "./board.ts";
+import type { Blocker } from "./board.ts";
 
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-/** Workspace switcher. Patched by /stream so every client stays in sync. */
+const DATASTAR = "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.2/bundles/datastar.js";
+
+const STATUS_ORDER: Status[] = ["todo", "doing", "blocked", "done"];
+const STATUS_LABEL: Record<Status, string> = { todo: "Todo", doing: "In Progress", blocked: "Blocked", done: "Done" };
+const PRIOS: Priority[] = ["high", "med", "low"];
+
+// ---- Workspace switcher --------------------------------------------------
+
 export function wsBar(workspaces: Workspace[], activeId: number): string {
   const tabs = workspaces
     .map(
@@ -23,36 +34,143 @@ export function wsBar(workspaces: Workspace[], activeId: number): string {
   </div>`;
 }
 
-const DATASTAR = "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.2/bundles/datastar.js";
+// ---- Filter bar (Linear-style) -------------------------------------------
 
-/** The live-updated list. Stable id (#list) so Datastar can morph it. */
-export function listFragment(todos: Todo[]): string {
-  const open = todos.filter((t) => !t.done).length;
-  const rows = todos.length
-    ? todos
-        .map(
-          (t) => `
-      <li id="todo-${t.id}" class="row ${t.done ? "done" : ""} ${t.status === "blocked" ? "blockedrow" : ""}">
-        <button class="check ${t.done ? "checked" : ""}" role="checkbox" aria-checked="${t.done}"
-                aria-label="toggle ${esc(t.title)}" ${t.status === "blocked" ? "disabled" : ""}
-                data-on:click="@post('/toggle/${t.id}')">${t.done ? "✓" : ""}</button>
-        <span class="prio prio-${t.priority}">${t.priority}</span>
-        <span class="title">${esc(t.title)}</span>
-        ${t.status && t.status !== "todo" ? `<span class="status status-${t.status}">${t.status}</span>` : ""}
-        <button class="del" aria-label="delete ${esc(t.title)}"
-                data-on:click="@delete('/remove/${t.id}')">×</button>
-      </li>`,
-        )
-        .join("")
-    : `<li class="empty">Nothing yet. Add your first todo above.</li>`;
+const chip = (label: string, active: boolean, action: string, count?: number) =>
+  `<button class="chip ${active ? "active" : ""}" data-on:click="@post('${action}')">${esc(label)}${
+    count !== undefined ? `<span class="cnt">${count}</span>` : ""
+  }</button>`;
 
-  return `<ul id="list">
-    ${rows}
-    <li class="count">${open} open · ${todos.length} total</li>
-  </ul>`;
+export function filterBar(
+  f: Filter,
+  statusCounts: Record<string, number>,
+  priorityCounts: Record<string, number>,
+  tags: string[],
+): string {
+  const views = (["all", "ready", "overdue"] as const)
+    .map((v) => chip(v[0].toUpperCase() + v.slice(1), f.view === v, `/filter/view/${v}`))
+    .join("");
+  const statuses = STATUS_ORDER.map((s) =>
+    chip(STATUS_LABEL[s], f.status.includes(s), `/filter/status/${s}`, statusCounts[s] ?? 0),
+  ).join("");
+  const prios = PRIOS.map((p) => chip(p, f.priority.includes(p), `/filter/priority/${p}`, priorityCounts[p] ?? 0)).join("");
+  const tagChips = tags.length
+    ? `<span class="fsep"></span><span class="flabel">tag</span>` +
+      tags.map((t) => chip(t, f.tags.includes(t), `/filter/tag/${encodeURIComponent(t)}`)).join("")
+    : "";
+  const groups = (["status", "priority", "none"] as const)
+    .map((g) => chip(g, f.group === g, `/filter/group/${g}`))
+    .join("");
+
+  return `<div id="filterbar">
+    <div class="frow">
+      <span class="flabel">view</span>${views}
+      <span class="fsep"></span><span class="flabel">status</span>${statuses}
+      <span class="fsep"></span><span class="flabel">priority</span>${prios}
+      ${tagChips}
+    </div>
+    <div class="frow frow2">
+      <span class="flabel">group by</span>${groups}
+    </div>
+  </div>`;
 }
 
-export function page(todos: Todo[]): string {
+// ---- Board (grouped, filtered) -------------------------------------------
+
+function row(t: Todo, blockers: Blocker[]): string {
+  const open = blockers.filter((b) => b.status !== "done");
+  const blockedBy = open.length
+    ? `<span class="blockedby">⛔ ${open.map((b) => `<span class="bchip">${esc(b.title)}</span>`).join("")}</span>`
+    : "";
+  return `<li id="todo-${t.id}" class="row ${t.done ? "done" : ""} ${t.status === "blocked" ? "blockedrow" : ""}">
+    <button class="check ${t.done ? "checked" : ""}" role="checkbox" aria-checked="${t.done}"
+            aria-label="toggle ${esc(t.title)}" ${t.status === "blocked" ? "disabled" : ""}
+            data-on:click="@post('/toggle/${t.id}')">${t.done ? "✓" : ""}</button>
+    <span class="prio prio-${t.priority}">${t.priority}</span>
+    <span class="title">${esc(t.title)}</span>
+    ${blockedBy}
+    ${t.status && t.status !== "todo" ? `<span class="status status-${t.status}">${STATUS_LABEL[t.status]}</span>` : ""}
+    <button class="iconbtn" aria-label="actions for ${esc(t.title)}" data-on:click="@get('/menu/${t.id}')">⋯</button>
+    <button class="iconbtn del" aria-label="delete ${esc(t.title)}" data-on:click="@delete('/remove/${t.id}')">×</button>
+  </li>`;
+}
+
+export function boardFragment(todos: Todo[], blockers: Map<number, Blocker[]>, f: Filter): string {
+  const bl = (id: number) => blockers.get(id) ?? [];
+  const section = (label: string, items: Todo[]) =>
+    items.length
+      ? `<div class="group"><div class="ghead">${esc(label)}<span class="gcount">${items.length}</span></div>
+         <ul class="glist">${items.map((t) => row(t, bl(t.id))).join("")}</ul></div>`
+      : "";
+
+  let body = "";
+  if (f.group === "status") {
+    body = STATUS_ORDER.map((s) => section(STATUS_LABEL[s], todos.filter((t) => t.status === s))).join("");
+  } else if (f.group === "priority") {
+    body = PRIOS.map((p) => section(p.toUpperCase(), todos.filter((t) => t.priority === p))).join("");
+  } else {
+    body = `<ul class="glist">${todos.map((t) => row(t, bl(t.id))).join("")}</ul>`;
+  }
+  if (!todos.length) body = `<div class="empty">No todos match this filter.</div>`;
+
+  return `<div id="board">
+    ${body}
+    <div class="boardfoot">${todos.length} shown</div>
+  </div>`;
+}
+
+// ---- Action menu (Datastar-driven overlay) -------------------------------
+
+export function menuFragment(
+  todo: Todo | null,
+  blockers: Blocker[],
+  candidates: { id: number; title: string }[],
+): string {
+  if (!todo) return `<div id="menu"></div>`;
+  const statusBtns = (["todo", "doing", "done"] as const)
+    .map(
+      (s) =>
+        `<button class="mitem ${todo.status === s ? "on" : ""}" data-on:click="@post('/todo/${todo.id}/status/${s}')">${STATUS_LABEL[s]}</button>`,
+    )
+    .join("");
+  const prioBtns = PRIOS.map(
+    (p) =>
+      `<button class="mitem ${todo.priority === p ? "on" : ""}" data-on:click="@post('/todo/${todo.id}/priority/${p}')">${p}</button>`,
+  ).join("");
+  const current = blockers.length
+    ? blockers
+        .map(
+          (b) =>
+            `<div class="brow"><span>${esc(b.title)}</span><button class="xmini" data-on:click="@post('/todo/${todo.id}/unblock/${b.id}')">×</button></div>`,
+        )
+        .join("")
+    : `<div class="mnote">none</div>`;
+  const addOpts = candidates.length
+    ? candidates
+        .map(
+          (c) =>
+            `<button class="mitem" data-on:click="@post('/todo/${todo.id}/block/${c.id}')">+ ${esc(c.title)}</button>`,
+        )
+        .join("")
+    : `<div class="mnote">no other todos</div>`;
+
+  return `<div id="menu">
+    <div class="backdrop" data-on:click="@get('/menu/0')"></div>
+    <div class="menucard">
+      <div class="mtitle">${esc(todo.title)}</div>
+      <div class="msec"><div class="mlabel">Status</div><div class="mrow">${statusBtns}</div></div>
+      <div class="msec"><div class="mlabel">Priority</div><div class="mrow">${prioBtns}</div></div>
+      <div class="msec"><div class="mlabel">Blocked by</div>${current}</div>
+      <div class="msec"><div class="mlabel">Add blocker</div><div class="mcol">${addOpts}</div></div>
+      <div class="msec"><button class="mdanger" data-on:click="@delete('/remove/${todo.id}'); @get('/menu/0')">Delete todo</button></div>
+      <button class="mclose" data-on:click="@get('/menu/0')">Close</button>
+    </div>
+  </div>`;
+}
+
+// ---- Page shell ----------------------------------------------------------
+
+export function page(): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -61,59 +179,87 @@ export function page(todos: Todo[]): string {
   <title>Todos · Stardust + Datastar</title>
   <script type="module" src="${DATASTAR}"></script>
   <style>
-    :root { color-scheme: light dark; --bg:#fafafa; --card:#fff; --fg:#1a1a1a; --mut:#888; --line:#e6e6e6; --accent:#4f46e5; }
-    @media (prefers-color-scheme: dark) { :root { --bg:#0f1115; --card:#171a21; --fg:#e8e8ea; --mut:#7c8391; --line:#262a33; --accent:#7c83ff; } }
+    :root { color-scheme: light dark; --bg:#0b0d10; --card:#14171c; --card2:#1a1e25; --fg:#e8e8ea; --mut:#8b93a1; --line:#242a33; --accent:#6c7bff; }
     * { box-sizing: border-box; }
-    body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-    .wrap { max-width:560px; margin:6vh auto; padding:0 20px; }
-    h1 { font-size:22px; margin:0 0 4px; }
-    .sub { color:var(--mut); margin:0 0 22px; font-size:13px; }
-    form { display:flex; gap:8px; margin-bottom:18px; }
-    input[type=text] { flex:1; padding:10px 12px; border:1px solid var(--line); border-radius:9px; background:var(--card); color:var(--fg); font-size:15px; }
+    body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+    .wrap { max-width:760px; margin:5vh auto; padding:0 20px; }
+    h1 { font-size:20px; margin:0 0 2px; }
+    .sub { color:var(--mut); margin:0 0 18px; font-size:12px; }
+    #wsbar { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:14px; }
+    .wslabel,.flabel { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); }
+    .wstab { border:1px solid var(--line); background:var(--card); color:var(--fg); padding:4px 11px; border-radius:20px; cursor:pointer; font-size:13px; }
+    .wstab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+    .wsnew input { border:1px dashed var(--line); background:transparent; color:var(--fg); padding:4px 10px; border-radius:20px; font-size:13px; width:130px; }
+    form.add { display:flex; gap:8px; margin-bottom:14px; }
+    input[type=text].maintext { flex:1; padding:9px 12px; border:1px solid var(--line); border-radius:9px; background:var(--card); color:var(--fg); font-size:14px; }
     select { padding:0 10px; border:1px solid var(--line); border-radius:9px; background:var(--card); color:var(--fg); }
-    button.add { padding:10px 16px; border:0; border-radius:9px; background:var(--accent); color:#fff; font-weight:600; cursor:pointer; }
-    ul { list-style:none; margin:0; padding:0; background:var(--card); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
-    .row { display:flex; align-items:center; gap:10px; padding:11px 14px; border-top:1px solid var(--line); }
+    button.add { padding:9px 16px; border:0; border-radius:9px; background:var(--accent); color:#fff; font-weight:600; cursor:pointer; }
+    /* filter bar */
+    #filterbar { border:1px solid var(--line); border-radius:11px; padding:9px 11px; margin-bottom:12px; background:var(--card); }
+    .frow { display:flex; align-items:center; gap:5px; flex-wrap:wrap; }
+    .frow2 { margin-top:8px; padding-top:8px; border-top:1px solid var(--line); }
+    .fsep { width:1px; height:16px; background:var(--line); margin:0 5px; }
+    .chip { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line); background:var(--card2); color:var(--mut); padding:3px 9px; border-radius:7px; cursor:pointer; font-size:12.5px; }
+    .chip:hover { color:var(--fg); }
+    .chip.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+    .chip .cnt { font-size:11px; opacity:.75; }
+    .chip.active .cnt { opacity:.9; }
+    /* board */
+    .group { margin-bottom:12px; }
+    .ghead { display:flex; align-items:center; gap:8px; font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--mut); padding:2px 4px 6px; }
+    .gcount { background:var(--card2); border-radius:20px; padding:0 7px; font-size:11px; }
+    .glist { list-style:none; margin:0; padding:0; background:var(--card); border:1px solid var(--line); border-radius:11px; overflow:hidden; }
+    .row { display:flex; align-items:center; gap:9px; padding:9px 12px; border-top:1px solid var(--line); }
     .row:first-child { border-top:0; }
-    .check { width:20px; height:20px; flex:0 0 auto; border:1.5px solid var(--mut); border-radius:6px; background:transparent; color:#fff; cursor:pointer; font-size:13px; line-height:1; display:flex; align-items:center; justify-content:center; padding:0; }
+    .check { width:19px; height:19px; flex:0 0 auto; border:1.5px solid var(--mut); border-radius:6px; background:transparent; color:#fff; cursor:pointer; font-size:12px; display:flex; align-items:center; justify-content:center; padding:0; }
     .check.checked { background:var(--accent); border-color:var(--accent); }
     .check:disabled { cursor:not-allowed; opacity:.4; }
     .title { flex:1; }
     .done .title { text-decoration:line-through; color:var(--mut); }
-    .prio { font-size:11px; text-transform:uppercase; letter-spacing:.04em; padding:2px 7px; border-radius:20px; border:1px solid var(--line); color:var(--mut); }
-    .prio-high { color:#e5484d; border-color:#e5484d55; }
+    .prio { font-size:10.5px; text-transform:uppercase; letter-spacing:.04em; padding:2px 7px; border-radius:20px; border:1px solid var(--line); color:var(--mut); flex:0 0 auto; }
+    .prio-high { color:#f2555a; border-color:#f2555a55; }
     .prio-med { color:#f5a623; border-color:#f5a62355; }
-    .status { font-size:11px; text-transform:uppercase; letter-spacing:.04em; padding:2px 8px; border-radius:20px; font-weight:600; }
-    .status-blocked { color:#e5484d; background:#e5484d1a; }
-    .status-doing { color:#4f6bed; background:#4f6bed1a; }
-    .status-done { color:#30a46c; background:#30a46c1a; }
-    .blockedrow { opacity:.65; }
-    .blockedrow input[type=checkbox] { pointer-events:none; opacity:.5; }
-    .del { border:0; background:transparent; color:var(--mut); font-size:20px; line-height:1; cursor:pointer; padding:0 4px; }
-    .del:hover { color:#e5484d; }
-    .empty { padding:22px 14px; color:var(--mut); text-align:center; border-top:0; }
-    .count { padding:9px 14px; border-top:1px solid var(--line); color:var(--mut); font-size:12px; }
-    .err { color:#e5484d; font-size:13px; min-height:18px; margin:-8px 0 12px; }
-    #wsbar { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:14px; }
-    .wslabel { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); margin-right:2px; }
-    .wstab { border:1px solid var(--line); background:var(--card); color:var(--fg); padding:5px 11px; border-radius:20px; cursor:pointer; font-size:13px; }
-    .wstab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
-    .wsnew input { border:1px dashed var(--line); background:transparent; color:var(--fg); padding:5px 10px; border-radius:20px; font-size:13px; width:130px; }
+    .status { font-size:10.5px; text-transform:uppercase; letter-spacing:.04em; padding:2px 8px; border-radius:20px; font-weight:600; flex:0 0 auto; }
+    .status-blocked { color:#f2555a; background:#f2555a1a; }
+    .status-doing { color:#6c7bff; background:#6c7bff1a; }
+    .status-done { color:#35b37e; background:#35b37e1a; }
+    .blockedrow { opacity:.7; }
+    .blockedby { display:inline-flex; align-items:center; gap:5px; font-size:11px; color:#f2555a; }
+    .bchip { background:#f2555a1a; border-radius:5px; padding:1px 6px; }
+    .iconbtn { border:0; background:transparent; color:var(--mut); font-size:17px; line-height:1; cursor:pointer; padding:0 4px; flex:0 0 auto; }
+    .iconbtn:hover { color:var(--fg); }
+    .iconbtn.del:hover { color:#f2555a; }
+    .empty,.mnote { padding:18px 14px; color:var(--mut); text-align:center; font-size:13px; }
+    .mnote { padding:4px; text-align:left; }
+    .boardfoot { color:var(--mut); font-size:11px; padding:8px 4px 0; }
+    .err { color:#f2555a; font-size:13px; min-height:18px; margin:-6px 0 10px; }
     .live { display:inline-flex; align-items:center; gap:6px; }
-    .dot { width:7px; height:7px; border-radius:50%; background:#30c46f; box-shadow:0 0 0 0 #30c46f88; animation:pulse 2s infinite; }
-    @keyframes pulse { 0%{box-shadow:0 0 0 0 #30c46f88} 70%{box-shadow:0 0 0 6px #30c46f00} 100%{box-shadow:0 0 0 0 #30c46f00} }
+    .dot { width:7px; height:7px; border-radius:50%; background:#35b37e; }
+    /* menu overlay */
+    .backdrop { position:fixed; inset:0; background:rgba(0,0,0,.5); }
+    .menucard { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); width:340px; max-width:92vw; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; box-shadow:0 20px 60px rgba(0,0,0,.5); }
+    .mtitle { font-weight:600; margin-bottom:12px; font-size:15px; }
+    .msec { margin-bottom:11px; }
+    .mlabel { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--mut); margin-bottom:5px; }
+    .mrow { display:flex; gap:6px; flex-wrap:wrap; }
+    .mcol { display:flex; flex-direction:column; gap:4px; max-height:160px; overflow:auto; }
+    .mitem { text-align:left; border:1px solid var(--line); background:var(--card2); color:var(--fg); padding:5px 10px; border-radius:7px; cursor:pointer; font-size:13px; }
+    .mitem.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+    .brow { display:flex; align-items:center; justify-content:space-between; padding:3px 0; }
+    .xmini { border:0; background:transparent; color:#f2555a; cursor:pointer; font-size:16px; }
+    .mdanger { width:100%; border:1px solid #f2555a55; background:transparent; color:#f2555a; padding:7px; border-radius:8px; cursor:pointer; }
+    .mclose { width:100%; margin-top:6px; border:1px solid var(--line); background:var(--card2); color:var(--fg); padding:7px; border-radius:8px; cursor:pointer; }
   </style>
 </head>
 <body data-signals="{newTitle: '', newPriority: 'med', newWs: '', error: ''}">
   <div class="wrap">
     <h1>Todos</h1>
-    <p class="sub"><span class="live"><span class="dot"></span>live</span> · backed by Stardust facts, streamed through a reactor, rendered by Datastar</p>
+    <p class="sub"><span class="live"><span class="dot"></span>live</span> · Stardust facts · reactor stream · Datastar · filtered & aggregated by query</p>
 
-    <!-- Workspace switcher; filled + kept in sync by /stream. -->
     <div id="wsbar"></div>
 
-    <form data-on:submit__prevent="@post('/add')">
-      <input type="text" name="newTitle" data-bind:new-title placeholder="What needs doing?" autofocus />
+    <form class="add" data-on:submit__prevent="@post('/add')">
+      <input type="text" class="maintext" name="newTitle" data-bind:new-title placeholder="What needs doing?" autofocus />
       <select name="newPriority" data-bind:new-priority>
         <option value="high">high</option>
         <option value="med">med</option>
@@ -123,12 +269,15 @@ export function page(todos: Todo[]): string {
     </form>
     <div class="err" data-text="$error"></div>
 
-    <!-- Long-lived read stream (CQRS): the active workspace's reactor drives
-         every client's list. Switching workspaces closes streams; Datastar
-         auto-reconnects here and re-renders against the new workspace. -->
+    <div id="filterbar"></div>
+
+    <!-- Long-lived read stream drives #filterbar + #board for the active
+         workspace + filter; re-subscribes in place on switch/filter change. -->
     <div data-init="@get('/stream', {retryInterval: 300, retryMaxCount: 100000})">
-      ${listFragment(todos)}
+      <div id="board"></div>
     </div>
+
+    <div id="menu"></div>
   </div>
 </body>
 </html>`;

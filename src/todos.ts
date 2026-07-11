@@ -172,6 +172,10 @@ export async function setDue(ctx: WorkspaceCtx, id: EntityId, dueIso: string | n
   await patchTodo(ctx, id, { due: dueIso ? { "#utc": dueIso } : null });
 }
 
+export async function setPriority(ctx: WorkspaceCtx, id: EntityId, priority: Priority): Promise<void> {
+  await patchTodo(ctx, id, { priority });
+}
+
 export async function toggleTodo(ctx: WorkspaceCtx, id: EntityId): Promise<boolean> {
   const e = await authorizeWrite(ctx, id); // reuse the read — no second fetch
   const next = !(e.done === true);

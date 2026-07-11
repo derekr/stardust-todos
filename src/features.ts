@@ -102,9 +102,26 @@ export async function tagsOf(ctx: WorkspaceCtx, todoId: EntityId): Promise<strin
 // ---- Dependencies (edge entities) ----------------------------------------
 
 export async function addDependency(ctx: WorkspaceCtx, todoId: EntityId, blockerId: EntityId): Promise<void> {
+  if (todoId === blockerId) return; // no self-dependency
   await assertOwned(ctx, todoId);
   await assertOwned(ctx, blockerId); // both ends must be in this workspace
+  // idempotent
+  const existing = await query({
+    find: ["?e"],
+    where: [["?e", "kind", "dep"], ["?e", "todo", { "#": todoId }], ["?e", "blocker", { "#": blockerId }]],
+    limit: 1,
+  });
+  if (existing.length) return;
   await transact({ "#_e": { kind: "dep", todo: { "#": todoId }, blocker: { "#": blockerId } } });
+}
+
+export async function removeDependency(ctx: WorkspaceCtx, todoId: EntityId, blockerId: EntityId): Promise<void> {
+  await assertOwned(ctx, todoId);
+  const rows = (await query({
+    find: ["?e"],
+    where: [["?e", "kind", "dep"], ["?e", "todo", { "#": todoId }], ["?e", "blocker", { "#": blockerId }]],
+  })) as [EntityId][];
+  await Promise.all(rows.map(([id]) => deleteEntity(id)));
 }
 
 // ---- Derived views (all workspace-scoped) --------------------------------

@@ -1,7 +1,7 @@
 // Seed a clean database with an interactive dataset for the web UI.
 //   node src/seed-demo.ts     (point STARDUST_URL at the fresh DB)
 
-import { addDependency } from "./features.ts";
+import { addDependency, addTag } from "./features.ts";
 import { addTodo, setStatus } from "./todos.ts";
 import { createWorkspace } from "./tenancy.ts";
 import { runToFixpoint } from "./workflow.ts";
@@ -25,6 +25,11 @@ async function main() {
   await addDependency(ctx, build, design);
   await addDependency(ctx, qa, build);
   await addDependency(ctx, launch, qa);
+
+  // Tags so the tag facet + tag filter are demonstrable.
+  for (const id of [design, build, qa, launch]) await addTag(ctx, id, "launch");
+  await addTag(ctx, read, "learning");
+  await addTag(ctx, design, "design");
 
   // A second workspace so the switcher has somewhere to go.
   const groceries = await createWorkspace(ctx.personaId, "Groceries");
