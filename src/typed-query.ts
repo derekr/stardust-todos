@@ -163,9 +163,16 @@ type CheckQuery<Q extends QueryLiteral> = {
 // Result row inference (secondary — "too loose is ok").
 // ---------------------------------------------------------------------------
 type Prettify<T> = { [K in keyof T]: T[K] } & {};
+
+// A `find` element → its result type: a ?var resolves through the env, an
+// aggregate ([count ?t], [sum ?x], …) is a number.
+type FindElType<X, E> = X extends Var ? VarType<X, E> : X extends readonly [AggOp, Var] ? number : unknown;
+// Recursive tuple map (mapping over `keyof tuple` would pull in array methods).
+type FindTuple<F, E> = F extends readonly [infer H, ...infer T] ? [FindElType<H, E>, ...FindTuple<T, E>] : [];
+
 export type ResultOf<Q extends QueryLiteral> = Q extends { then: { project: infer P } }
-  ? Prettify<{ -readonly [K in keyof P]: VarType<P[K], Env<Q>> }>
-  : readonly unknown[];
+  ? Prettify<{ -readonly [K in keyof P]: VarType<P[K], Env<Q>> }> // projection → object
+  : FindTuple<Q["find"], Env<Q>>; // bare find → tuple
 
 // ===========================================================================
 // Runtime — boundary validation from the SAME generated validators.

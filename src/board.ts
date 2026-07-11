@@ -83,21 +83,21 @@ export async function filteredTodos(ctx: WorkspaceCtx, f: Filter, mineActor?: st
  *  / status) are validated against the generated schema map — a typo is a build
  *  error. (Dynamic filter-building, e.g. filteredTodos, stays on the raw query.) */
 export async function statusCounts(ctx: WorkspaceCtx): Promise<Record<string, number>> {
-  const rows = (await tquery({
+  const rows = await tquery({
     find: ["?status", ["count", "?t"]],
     where: [["?t", "app", APP], ["?t", "workspace", { "#": ctx.workspaceId }], ["?t", "status", "?status"]],
     groupBy: ["?status"],
-  } as const)) as unknown as [string, number][];
+  } as const); // rows: ["todo"|"doing"|"blocked"|"done", number][] — inferred, no cast
   return Object.fromEntries(rows);
 }
 
 /** Count of todos per priority in the workspace. */
 export async function priorityCounts(ctx: WorkspaceCtx): Promise<Record<string, number>> {
-  const rows = (await query({
+  const rows = await tquery({
     find: ["?priority", ["count", "?t"]],
     where: [["?t", "app", APP], ["?t", "workspace", { "#": ctx.workspaceId }], ["?t", "priority", "?priority"]],
     groupBy: ["?priority"],
-  })) as [string, number][];
+  } as const); // rows: ["low"|"med"|"high", number][] — inferred, no cast
   return Object.fromEntries(rows);
 }
 
