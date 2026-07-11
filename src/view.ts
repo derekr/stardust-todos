@@ -3,9 +3,10 @@
 // driven by Datastar (server-authoritative), no competing client JS.
 
 import type { Todo, Priority, Status } from "./todos.ts";
-import type { Workspace } from "./tenancy.ts";
+import type { Role, Workspace } from "./tenancy.ts";
 import type { Filter } from "./board.ts";
 import type { Blocker } from "./board.ts";
+import type { ProjectedCommand } from "./commands.ts";
 
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -31,6 +32,48 @@ export function wsBar(workspaces: Workspace[], activeId: number): string {
     <form class="wsnew" data-on:submit__prevent="@post('/new-workspace')">
       <input type="text" name="newWs" data-bind:new-ws placeholder="+ new workspace" />
     </form>
+  </div>`;
+}
+
+// ---- Command surfaces (all fed by ONE projected catalog) -----------------
+
+// A global command as a toolbar/palette control. Denied → disabled + reason.
+function cmdControl(c: ProjectedCommand, cls: string, extraOnClick = ""): string {
+  if (!c.enabled) {
+    return `<button class="${cls} denied" disabled title="${esc(c.reason)}">${esc(c.label)}<span class="creason">${esc(c.reason)}</span></button>`;
+  }
+  return `<button class="${cls} ${c.danger ? "cdanger" : ""}" data-on:click="@post('/command/${c.cmdId}')${extraOnClick}">${esc(c.label)}</button>`;
+}
+
+/** Toolbar: role switcher + global commands (surface #1) + palette opener. */
+export function toolbar(role: Role | null, globalCmds: ProjectedCommand[]): string {
+  const controls = globalCmds.map((c) => cmdControl(c, "cmdbtn")).join("");
+  return `<div id="toolbar">
+    <span class="flabel">view as</span>
+    <button class="rtab ${role === "owner" ? "active" : ""}" data-on:click="@post('/viewas/owner')">Owner</button>
+    <button class="rtab ${role === "member" ? "active" : ""}" data-on:click="@post('/viewas/member')">Teammate</button>
+    <span class="fsep"></span>
+    ${controls}
+    <button class="cmdbtn palette" data-on:click="@get('/palette')">⌘ Commands</button>
+  </div>`;
+}
+
+/** Command palette overlay (surface #2) — the same global commands, listed. */
+export function palette(globalCmds: ProjectedCommand[]): string {
+  const items = globalCmds
+    .map((c) =>
+      c.enabled
+        ? `<button class="palitem ${c.danger ? "cdanger" : ""}" data-on:click="@post('/command/${c.cmdId}'); @get('/palette/0')">${esc(c.label)}</button>`
+        : `<button class="palitem denied" disabled>${esc(c.label)}<span class="creason">${esc(c.reason)}</span></button>`,
+    )
+    .join("");
+  return `<div id="palette">
+    <div class="backdrop" data-on:click="@get('/palette/0')"></div>
+    <div class="palcard">
+      <div class="paltitle">Commands</div>
+      <div class="palnote">Same catalog as the toolbar. Denied commands are grayed with a reason.</div>
+      ${items}
+    </div>
   </div>`;
 }
 
@@ -143,8 +186,16 @@ export function menuFragment(
   blockers: Blocker[],
   candidates: { id: number; title: string }[],
   history: { status: string; at: string }[] = [],
+  todoCommands: ProjectedCommand[] = [],
 ): string {
   if (!todo) return `<div id="menu"></div>`;
+  const cmdItems = todoCommands
+    .map((c) =>
+      c.enabled
+        ? `<button class="mitem ${c.danger ? "cdanger" : ""}" data-on:click="@post('/command/${c.cmdId}/${todo.id}'); @get('/menu/0')">${esc(c.label)}</button>`
+        : `<button class="mitem denied" disabled>${esc(c.label)}<span class="creason">${esc(c.reason)}</span></button>`,
+    )
+    .join("");
   const statusBtns = (["todo", "doing", "done"] as const)
     .map(
       (s) =>
@@ -181,7 +232,7 @@ export function menuFragment(
       <div class="msec"><div class="mlabel">Blocked by</div>${current}</div>
       <div class="msec"><div class="mlabel">Add blocker</div><div class="mcol">${addOpts}</div></div>
       <div class="msec"><div class="mlabel">Activity — status history</div>${historyTimeline(history)}</div>
-      <div class="msec"><button class="mdanger" data-on:click="@delete('/remove/${todo.id}'); @get('/menu/0')">Delete todo</button></div>
+      <div class="msec"><div class="mlabel">Commands (role-gated, same catalog)</div><div class="mcol">${cmdItems}</div></div>
       <button class="mclose" data-on:click="@get('/menu/0')">Close</button>
     </div>
   </div>`;
@@ -274,14 +325,33 @@ export function page(): string {
     .tldot.status-blocked { background:#f2555a; } .tldot.status-doing { background:#6c7bff; } .tldot.status-done { background:#35b37e; } .tldot.status-todo { background:var(--mut); }
     .tlstatus { font-size:12.5px; }
     .tltime { font-size:11px; color:var(--faint); font-family:var(--mono); margin-left:auto; }
+    /* command surfaces */
+    #toolbar { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
+    .rtab { border:1px solid var(--line); background:var(--card2); color:var(--mut); padding:3px 11px; border-radius:7px; cursor:pointer; font-size:12.5px; }
+    .rtab.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+    .cmdbtn { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line); background:var(--card); color:var(--fg); padding:4px 11px; border-radius:8px; cursor:pointer; font-size:12.5px; }
+    .cmdbtn:hover:not(:disabled) { border-color:var(--accent); }
+    .cmdbtn.palette { margin-left:auto; color:var(--mut); }
+    .cmdbtn.cdanger:hover:not(:disabled), .mitem.cdanger:hover:not(:disabled), .palitem.cdanger:hover:not(:disabled) { border-color:#f2555a; color:#f2555a; }
+    .denied { opacity:.5; cursor:not-allowed; }
+    .creason { font-size:10px; color:var(--faint); margin-left:6px; text-transform:uppercase; letter-spacing:.03em; }
+    #palette:empty { display:none; }
+    .palcard { position:fixed; top:14vh; left:50%; transform:translateX(-50%); width:420px; max-width:92vw; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; box-shadow:0 20px 60px rgba(0,0,0,.5); display:flex; flex-direction:column; gap:5px; z-index:10; }
+    .paltitle { font-weight:600; font-size:15px; }
+    .palnote { color:var(--mut); font-size:12px; margin-bottom:6px; }
+    .palitem { text-align:left; border:1px solid var(--line); background:var(--card2); color:var(--fg); padding:9px 12px; border-radius:9px; cursor:pointer; font-size:14px; display:flex; align-items:center; }
+    .palitem:hover:not(:disabled) { border-color:var(--accent); }
+    .mitem.denied, .palitem.denied { justify-content:space-between; }
   </style>
 </head>
-<body data-signals="{newTitle: '', newPriority: 'med', newWs: '', error: ''}">
+<body data-signals="{newTitle: '', newPriority: 'med', newWs: '', error: '', toast: ''}">
   <div class="wrap">
     <h1>Todos</h1>
     <p class="sub"><span class="live"><span class="dot"></span>live</span> · Stardust facts · reactor stream · Datastar · filtered & aggregated by query</p>
 
     <div id="wsbar"></div>
+    <div id="toolbar"></div>
+    <div class="err" data-text="$toast"></div>
 
     <form class="add" data-on:submit__prevent="@post('/add')">
       <input type="text" class="maintext" name="newTitle" data-bind:new-title placeholder="What needs doing?" autofocus />
@@ -303,6 +373,7 @@ export function page(): string {
     </div>
 
     <div id="menu"></div>
+    <div id="palette"></div>
   </div>
 </body>
 </html>`;

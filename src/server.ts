@@ -7,7 +7,16 @@ import http from "node:http";
 import { ServerSentEventGenerator } from "@starfederation/datastar-sdk/node";
 import { type Priority, type Status, addTodo, removeTodo, setPriority, setStatus, toggleTodo } from "./todos.ts";
 import { type WorkspaceCtx, defaultWorkspace, openWorkspace } from "./workspace.ts";
-import { createWorkspace, listWorkspaces } from "./tenancy.ts";
+import {
+  createPersona,
+  createWorkspace,
+  ensureUser,
+  grantAccess,
+  listPersonas,
+  listWorkspaces,
+  roleOf,
+} from "./tenancy.ts";
+import { authorizeCommand, catalog, ensureCommandCatalog, project } from "./commands.ts";
 import { addDependency, removeDependency } from "./features.ts";
 import {
   type Filter,
@@ -21,13 +30,27 @@ import {
 } from "./board.ts";
 import { readEntity } from "./stardust.ts";
 import { statusHistory } from "./history.ts";
-import { boardFragment, filterBar, menuFragment, page, wsBar } from "./view.ts";
+import { boardFragment, filterBar, menuFragment, page, palette, toolbar, wsBar } from "./view.ts";
 
 const PORT = Number(process.env.PORT ?? 3000);
 
 let ctx: WorkspaceCtx = await defaultWorkspace();
-const personaId = ctx.personaId;
 let filter: Filter = { ...emptyFilter };
+
+// Demo roles: the default persona owns the workspace; add a "Teammate" persona
+// with a member grant so "view as" can switch role and drive the command
+// projection. Commands themselves are seeded as data.
+await ensureCommandCatalog();
+const OWNER_PERSONA = ctx.personaId;
+const demoUser = await ensureUser("default@local");
+if (!(await listPersonas(demoUser)).some((p) => p.name === "Teammate")) {
+  const mid = await createPersona(demoUser, "Teammate");
+  await grantAccess(ctx.workspaceId, mid, "member");
+}
+const MEMBER_PERSONA = (await listPersonas(demoUser)).find((p) => p.name === "Teammate")!.id;
+const personaId = ctx.personaId; // owner — used for wsbar + workspace ops
+let viewPersona = OWNER_PERSONA; // "view as" — drives command projection + enforcement
+const curRole = () => roleOf(viewPersona, ctx.workspaceId);
 
 // One inner controller per stream iteration; aborted to force a re-render.
 const switchControllers = new Set<AbortController>();
@@ -50,6 +73,8 @@ async function renderBoard(stream: any) {
   ]);
   stream.patchElements(filterBar(filter, sc, pc, tags));
   stream.patchElements(boardFragment(todos, blockers, filter));
+  const role = await curRole();
+  stream.patchElements(toolbar(role, project(await catalog("global"), role)));
 }
 
 async function menuElements(id: number): Promise<string> {
@@ -66,7 +91,9 @@ async function menuElements(id: number): Promise<string> {
   const blockerIds = new Set(blockers.map((b) => b.id));
   const candidates = (await todoOptions(ctx)).filter((o) => o.id !== id && !blockerIds.has(o.id));
   const history = await statusHistory(id);
-  return menuFragment(todo, blockers, candidates, history);
+  const role = await curRole();
+  const todoCmds = project(await catalog("todo"), role);
+  return menuFragment(todo, blockers, candidates, history, todoCmds);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -122,6 +149,59 @@ const server = http.createServer(async (req, res) => {
       const id = Number(seg[1] ?? 0);
       ServerSentEventGenerator.stream(req, res, async (stream) => {
         stream.patchElements(await menuElements(id));
+      });
+      return;
+    }
+
+    // "View as" role switch — drives the command projection everywhere.
+    if (seg[0] === "viewas" && method === "POST") {
+      viewPersona = seg[1] === "member" ? MEMBER_PERSONA : OWNER_PERSONA;
+      rerenderAll();
+      noopStream(req, res);
+      return;
+    }
+
+    // Command palette overlay (0 = close).
+    if (seg[0] === "palette" && method === "GET") {
+      ServerSentEventGenerator.stream(req, res, async (stream) => {
+        if (seg[1] === "0") {
+          stream.patchElements('<div id="palette"></div>');
+          return;
+        }
+        const role = await curRole();
+        stream.patchElements(palette(project(await catalog("global"), role)));
+      });
+      return;
+    }
+
+    // Execute a command: /command/<cmdId>[/<targetTodoId>]. The write boundary
+    // re-checks the SAME catalog + role, so a denied command can't slip through.
+    if (seg[0] === "command" && method === "POST") {
+      const cmdId = seg[1];
+      const target = seg[2] ? Number(seg[2]) : null;
+      const role = await curRole();
+      const allowed = await authorizeCommand(cmdId, role);
+      ServerSentEventGenerator.stream(req, res, async (stream) => {
+        if (!allowed) {
+          stream.patchSignals(JSON.stringify({ toast: `Denied: your role cannot run "${cmdId}".` }));
+          return;
+        }
+        let msg = "";
+        if (cmdId === "todo.complete" && target) {
+          await setStatus(ctx, target, "done");
+          msg = "Marked complete.";
+        } else if (cmdId === "todo.delete" && target) {
+          await removeTodo(ctx, target);
+          msg = "Todo deleted.";
+        } else if (cmdId === "todo.duplicate" && target) {
+          const e = await readEntity(target);
+          await addTodo(ctx, `${String(e.title ?? "todo")} (copy)`, (e.priority as Priority) ?? "med");
+          msg = "Todo duplicated.";
+        } else {
+          msg = `${allowed.label} — done (demo).`;
+        }
+        stream.patchSignals(JSON.stringify({ toast: msg }));
+        rerenderAll();
       });
       return;
     }

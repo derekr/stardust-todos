@@ -159,3 +159,18 @@ export async function workspaceReactor(workspaceId: EntityId): Promise<EntityId>
   const ws = await readEntity(workspaceId);
   return asId(ws.reactor);
 }
+
+/** The persona's role on a workspace, read from the grant fact. */
+export async function roleOf(personaId: EntityId, workspaceId: EntityId): Promise<Role | null> {
+  const rows = (await query({
+    find: ["?role"],
+    where: [
+      ["?g", "kind", "grant"],
+      ["?g", "persona", { "#": personaId }],
+      ["?g", "workspace", { "#": workspaceId }],
+      ["?g", "role", "?role"],
+    ],
+    limit: 1,
+  })) as [Role][];
+  return rows.length ? rows[0][0] : null;
+}
