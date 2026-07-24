@@ -11,7 +11,7 @@ import type { Role } from "./tenancy.ts";
 import { query as tquery } from "./typed-query.ts";
 
 // role hierarchy: any(0) < member(1) < owner(2)
-export const roleRank = (role: Role | null): number => (role === "owner" ? 2 : role === "member" ? 1 : 0);
+const roleRank = (role: Role | null): number => (role === "owner" ? 2 : role === "member" ? 1 : 0);
 
 export type Scope = "global" | "todo";
 

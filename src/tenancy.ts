@@ -27,6 +27,7 @@ export interface Workspace {
   reactorId: EntityId;
 }
 
+/** @public — part of this module's surface; no in-repo consumer yet. */
 export class AccessDenied extends Error {
   constructor(personaId: EntityId, workspaceId: EntityId) {
     super(`persona ${personaId} has no grant on workspace ${workspaceId}`);
@@ -41,7 +42,7 @@ const tempId = async (patch: Record<string, unknown>): Promise<EntityId> => {
 
 // ---- Users ---------------------------------------------------------------
 
-export async function findUser(email: string): Promise<EntityId | null> {
+async function findUser(email: string): Promise<EntityId | null> {
   const rows = await tquery({
     find: ["?u"],
     where: [

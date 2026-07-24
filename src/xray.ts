@@ -13,7 +13,7 @@ interface XraySpec {
   src: string; // file · function pointer
 }
 
-export const XRAY: Record<string, XraySpec> = {
+const XRAY: Record<string, XraySpec> = {
   board: {
     title: "The board — ONE canonical reactor",
     mech: "The board is not re-queried per render. A single stored reactor does everything server-side: it reads the session's own facts (viewer, view, tag-active, workspace) plus its `sf` facet children, derives blocked/overdue/effectiveStatus, applies EVERY filter, orders, and projects the finished row. Every browser reads that same reactor through a per-stream bind (?bind={sid …}), so one definition serves all sessions and the client only ever holds a reactor id and its sid — it cannot widen the scope. readSnapshot() is a point-in-time read; the stream re-emits when the session's `rev` changes.",

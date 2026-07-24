@@ -322,10 +322,6 @@ export async function setStatus(
   await patchTodo(ctx, id, { status, done: status === "done" }, actor, expectTx ? { [id]: expectTx } : undefined);
 }
 
-export async function setDue(ctx: WorkspaceCtx, id: EntityId, dueIso: string | null, actor?: string): Promise<void> {
-  await patchTodo(ctx, id, { due: dueIso ? { "#utc": dueIso } : null }, actor);
-}
-
 export async function setPriority(ctx: WorkspaceCtx, id: EntityId, priority: Priority, actor?: string): Promise<void> {
   await patchTodo(ctx, id, { priority }, actor);
 }

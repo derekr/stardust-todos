@@ -16,6 +16,7 @@
 //     the `ok: false` arm of `WriteResult`)
 
 export type EntityId = number;
+/** @public — part of this module's surface; no in-repo consumer yet. */
 export type Ref = { "#": EntityId | string };
 
 /**
@@ -42,7 +43,7 @@ export interface TxResult {
 
 // ---- Record streams ---------------------------------------------------------
 
-/** The terminal item of a failed record stream. */
+/** The terminal item of a failed record stream. @public */
 export interface ErrorRecord {
   "stardust/error": true;
   code: string;
@@ -50,10 +51,10 @@ export interface ErrorRecord {
   details?: unknown;
 }
 
-export const isErrorRecord = (r: unknown): r is ErrorRecord =>
+const isErrorRecord = (r: unknown): r is ErrorRecord =>
   !!r && typeof r === "object" && (r as Record<string, unknown>)["stardust/error"] === true;
 
-/** A record stream that ended in `stardust/error`. */
+/** A record stream that ended in `stardust/error`. @public */
 export class StardustError extends Error {
   readonly code: string;
   readonly status: number;
@@ -168,11 +169,12 @@ export async function streamRecords(
 
 // ---- Writes -----------------------------------------------------------------
 
+/** @public — part of this module's surface; no in-repo consumer yet. */
 export interface ValidationDetail {
   instanceLocation: string;
   errors: Record<string, string>;
 }
-/** A rejected write, flattened from the terminal `stardust/error` record. */
+/** A rejected write, flattened from the terminal `stardust/error` record. @public */
 export interface ValidationError {
   valid: false;
   code: string;
@@ -273,23 +275,6 @@ export async function readEntity(id: EntityId): Promise<Record<string, unknown>>
 
 export async function deleteEntity(id: EntityId): Promise<void> {
   await fetch(`${BASE}/entities/${id}`, { method: "DELETE", headers: { Accept: NDJSON } });
-}
-
-/**
- * Subscribe to the committed-transaction event bus. Fires `onTx(id)` for each
- * transaction record (the id is the transaction id text). This is Stardust's
- * durable change feed — the trigger for event-driven dataflow. The record is the
- * bare transaction result: there is no event/id/data wrapper any more, and the
- * `transaction` field doubles as the replay position.
- */
-export async function subscribeTransactions(onTx: (txId: string) => void, signal: AbortSignal): Promise<void> {
-  await streamRecords(
-    "/events/bus/stardust/transactions",
-    (rec: { transaction?: Ref | number }) => {
-      if (rec.transaction !== undefined) onTx(String(refId(rec.transaction)));
-    },
-    signal,
-  );
 }
 
 // ---- Schemas ----------------------------------------------------------------

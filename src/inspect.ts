@@ -34,12 +34,12 @@ function fmtVal(v: unknown): string {
   return String(v);
 }
 
-export interface FieldChange {
+interface FieldChange {
   field: string;
   from: string | null; // null = newly asserted
   to: string | null; // null = retracted
 }
-export interface EntityDelta {
+interface EntityDelta {
   entity: EntityId;
   label: string;
   changes: FieldChange[];
@@ -56,7 +56,7 @@ export interface TxView {
 }
 
 /** Decode one bus event; returns null for a system/bootstrap tx (no app facts). */
-export function decodeEvent(ev: any): TxView | null {
+function decodeEvent(ev: any): TxView | null {
   const tx = ev?.transaction?.["#"];
   if (!tx) return null;
   const patched: Record<string, any> = ev.patched ?? {};
@@ -272,7 +272,7 @@ function entityBlock(d: EntityDelta): string {
   </div>`;
 }
 
-export function txCard(v: TxView): string {
+function txCard(v: TxView): string {
   const attr = v.actor ? `<span class="actor">${esc(v.actor)}</span>` : `<span class="actor anon">—</span>`;
   const cause = v.causation
     ? `<span class="cause ${v.causation.startsWith("workflow") ? "wf" : ""}">${esc(v.causation)}</span>`

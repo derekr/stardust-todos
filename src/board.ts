@@ -11,15 +11,14 @@ import type { Priority, Status, Todo } from "./todos.ts";
 import { type EntityId, query, refId } from "./stardust.ts";
 import { query as tquery } from "./typed-query.ts"; // compile-time-checked query for static literals
 import { APP } from "./tenancy.ts";
-import { ready } from "./features.ts";
-import { openBlockerExists, overdueExists, visibleTo } from "./derive.ts";
+import { openBlockerExists, visibleTo } from "./derive.ts";
 
 /** Effective display status: "blocked" is DERIVED (not stored). `done` wins. */
 export const effectiveStatus = (t: Pick<Todo, "status" | "blocked">): Status =>
   t.blocked && t.status !== "done" ? "blocked" : t.status;
 
-export type DerivedView = "all" | "ready" | "overdue" | "mine" | "done";
-export type GroupBy = "none" | "status" | "priority";
+type DerivedView = "all" | "ready" | "overdue" | "mine" | "done";
+type GroupBy = "none" | "status" | "priority";
 
 export interface Filter {
   status: Status[]; // empty = all (multi-select via `contains {#set ...}`)
@@ -36,81 +35,6 @@ export const emptyFilter: Filter = {
   view: "all",
   group: "status",
 };
-
-// Fixed "now" for deterministic overdue demos on the seeded data.
-const NOW_ISO = "2026-07-11T00:00:00Z";
-
-/** Todos VISIBLE to `viewerPersonaId` and matching the filter, projected by
- *  Stardust. Row-level visibility (drafts) is enforced server-side here — hidden
- *  rows never reach the client. */
-export async function filteredTodos(
-  ctx: WorkspaceCtx,
-  f: Filter,
-  viewerPersonaId: number,
-  mineActor?: string,
-): Promise<Todo[]> {
-  const where: unknown[] = [
-    ["?t", "app", APP],
-    ["?t", "workspace", { "#": ctx.workspaceId }],
-    ["?t", "title", "?title"],
-    ["?t", "status", "?status"],
-    ["?t", "priority", "?priority"],
-    ["?t", "done", "?done"],
-    ["?t", "lastActor", "?lastActor"],
-    ...visibleTo(viewerPersonaId), // draft/author binding + "published OR mine"
-  ];
-  // Multi-select membership: `contains {#set [...]} ?field` (an expression
-  // predicate — the correct Stardust idiom for "value in a set"). Priority is a
-  // stored field so it filters query-side; STATUS filters app-side below because
-  // "blocked" is derived (a projected $exists), not a stored value.
-  if (f.priority.length) where.push(["contains", { "#set": f.priority }, "?priority"]);
-  if (f.view === "mine" && mineActor) where.push(["?t", "lastActor", mineActor]); // "changed by me"
-  if (f.tags.length) {
-    where.push(
-      ["?e", "kind", "tag"],
-      ["?e", "todo", "?t"],
-      ["?e", "label", "?l"],
-      ["contains", { "#set": f.tags }, "?l"],
-    );
-  }
-
-  const rows = (await query({
-    find: ["?t", "?title", "?done", "?priority", "?status", "?lastActor"],
-    where,
-    orderBy: ["?priority", "?title"],
-    then: {
-      project: {
-        id: "?t",
-        title: "?title",
-        done: "?done",
-        priority: "?priority",
-        status: "?status",
-        lastActor: "?lastActor",
-        draft: "?draft", // bound by visibleTo — drives the "draft" badge for the author
-        blocked: openBlockerExists("?t"), // DERIVED per row — no worker, no stored "blocked"
-        overdue: overdueExists("?t", NOW_ISO), // DERIVED per row — same $exists pattern as blocked
-      },
-    },
-  })) as Todo[];
-
-  // A tag join can duplicate a todo (one row per matching tag) — dedupe by id.
-  const seen = new Map<EntityId, Todo>();
-  for (const t of rows) seen.set(t.id, t);
-  let todos = [...seen.values()];
-
-  // Status filter is on the DERIVED effective status, so it happens here.
-  if (f.status.length) todos = todos.filter((t) => f.status.includes(effectiveStatus(t)));
-
-  if (f.view === "ready") {
-    const ids = new Set((await ready(ctx)).map((r) => r.id));
-    todos = todos.filter((t) => ids.has(t.id));
-  } else if (f.view === "overdue") {
-    todos = todos.filter((t) => t.overdue); // derived per-row above — no separate query, no id-set intersection
-  } else if (f.view === "done") {
-    todos = todos.filter((t) => effectiveStatus(t) === "done");
-  }
-  return todos;
-}
 
 /**
  * (The board's filtering used to be split — a session reactor for priority +

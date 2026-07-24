@@ -647,5 +647,3 @@ export function page(view?: BoardView): string {
 </body>
 </html>`;
 }
-
-export { esc };

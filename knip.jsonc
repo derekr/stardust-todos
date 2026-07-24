@@ -1,0 +1,13 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+
+  // Entry points come from package.json scripts; only the tests need declaring.
+  "entry": ["src/**/*.test.ts"],
+  "project": ["src/**/*.ts", "scripts/**/*.ts"],
+
+  // public/ holds vendored browser assets (scripts/vendor-assets.sh). They are
+  // referenced from generated HTML strings, never imported, so they are not part
+  // of the module graph and would otherwise report as unused.
+  // src/generated/** is codegen output owned by gen-query.ts.
+  "ignore": ["src/generated/**"]
+}

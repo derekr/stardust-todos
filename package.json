@@ -7,33 +7,24 @@
   "scripts": {
     "web": "node src/server.ts",
     "cli": "node src/cli.ts",
-    "demo:tenancy": "node src/demo-tenancy.ts",
-    "demo:fields": "node src/demo-fields.ts",
-    "demo:projects": "node src/demo-projects.ts",
-    "demo:workflow": "node src/demo-workflow.ts",
     "seed": "node src/seed-demo.ts",
     "fmt": "oxfmt src scripts",
     "fmt:check": "oxfmt --check src scripts",
     "lint": "oxlint src scripts",
     "lint:fix": "oxlint --fix src scripts",
     "test": "node --test 'src/**/*.test.ts'",
-    "check": "oxfmt --check src scripts && oxlint src scripts && tsgo --noEmit && node --test 'src/**/*.test.ts'",
+    "check": "oxfmt --check src scripts && oxlint src scripts && tsgo --noEmit && knip && node --test 'src/**/*.test.ts'",
     "typecheck": "tsgo --noEmit",
-    "gen:types": "node scripts/gen-types.ts",
-    "demo:typed": "node src/demo-typed.ts",
     "gen:query": "node scripts/gen-query.ts",
-    "demo:hybrid": "node src/demo-hybrid.ts",
-    "demo:validation": "node src/demo-validation.ts"
+    "knip": "knip"
   },
   "dependencies": {
-    "@starfederation/datastar-sdk": "^1.0.0",
-    "arktype": "^2.2.3"
+    "@starfederation/datastar-sdk": "^1.0.0"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
     "@typescript/native-preview": "^7.0.0-dev.20260707.2",
-    "json-schema-to-typescript": "^15.0.4",
-    "openapi-typescript": "^7.13.0",
+    "knip": "^6.29.0",
     "oxfmt": "^0.58.0",
     "oxlint": "^1.73.0"
   }

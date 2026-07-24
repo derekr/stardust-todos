@@ -42,39 +42,6 @@ export function openBlockerExists(todoVar: string): object {
   return { $exists: openBlockerSubquery(todoVar) };
 }
 
-/**
- * The same open-blocker check as a `where`-clause verb. `["exists", …]` keeps
- * rows that ARE blocked; `["notExists", …]` keeps rows that are NOT — the two
- * one-clause forms that replace the old two-query + JS set-difference for
- * blocked/ready. Feed straight into a raw `query` `where` (the typed-query
- * checker only models 3-tuples, so exists/notExists go through raw query).
- */
-export function openBlockerClause(todoVar: string, negate: boolean): unknown[] {
-  return [negate ? "notExists" : "exists", openBlockerSubquery(todoVar)];
-}
-
-/** $exists directive: TRUE iff `todoVar` is not done and has a due date before
- *  `nowIso`. Overdue is derived on read, exactly like blocked — no stored flag,
- *  no separate query. The whole predicate lives INSIDE the subquery so it's
- *  0-safe: a todo with no `due` fact simply yields false (the correlated $exists
- *  is the only way to compute this per-row over ALL todos — a `where`-level
- *  `["?t","due","?d"]` would inner-join out the dateless ones). */
-export function overdueExists(todoVar: string, nowIso: string): object {
-  const key = todoVar.slice(1); // "?t" -> "t"
-  return {
-    $exists: {
-      capture: { [key]: todoVar },
-      find: ["?due"],
-      where: [
-        [todoVar, "due", "?due"],
-        ["<", "?due", { "#utc": nowIso }],
-        [todoVar, "status", "?st"],
-        ["!=", "?st", "done"], // a completed todo is never "overdue"
-      ],
-    },
-  };
-}
-
 /** $exists directive: TRUE iff `projVar` has ≥1 not-done todo. */
 export function openTodoExists(projVar: string): object {
   const key = projVar.slice(1);

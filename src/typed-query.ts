@@ -1,11 +1,11 @@
 // A typesafe Stardust query — the HYBRID.
 //
-//   - The field→type map (TodoFields) AND the per-field runtime validators are
-//     GENERATED from Stardust's JSON Schema (src/generated/query-fields.ts,
-//     `npm run gen:query`). One source of truth, regenerable, no drift.
+//   - The field→type map AND the per-field runtime validators are GENERATED from
+//     Stardust's JSON Schema (src/generated/schema-fields.ts, `npm run gen:query`).
+//     One source of truth, regenerable, no drift.
 //   - The compile-time "you cannot write an invalid query" machinery below is
-//     PURE TypeScript over that generated map — no validation library at
-//     compile time. (Adapted from the arktype prototype's checker.)
+//     PURE TypeScript over that generated map — no validation library at all,
+//     at compile time or runtime.
 //   - Runtime boundary validation reuses the generated validators — no library.
 //
 // The call site stays plain JSON: `query({ find, where, then })` — no builder.

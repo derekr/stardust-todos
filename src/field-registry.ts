@@ -12,10 +12,8 @@
 import type { Ref, SchemaFieldTypes } from "./generated/schema-fields.ts";
 import { schemaValidators } from "./generated/schema-fields.ts";
 
-export type { Ref, Instant } from "./generated/schema-fields.ts";
-
 /** Open-world fields — declared by convention, not enforced by a schema. */
-export interface DeclaredFields {
+interface DeclaredFields {
   kind: "user" | "persona" | "workspace" | "grant" | "command" | "tag" | "dep" | "project";
   name: string; // workspace / persona / project name
   email: string; // user login identity

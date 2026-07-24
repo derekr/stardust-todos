@@ -17,10 +17,10 @@
 // status filter is a value-join of the session's facts onto `?eff`.
 //
 // Todos are a point-in-time SNAPSHOT: a one-shot read always recomputes; the live
-// stream re-emits when the session changes (a filter edit, `refresh()`, or a
-// `sessionWrite` that folds a `rev` bump into the mutation).
+// stream re-emits when the session changes — a filter edit (setFilter) or an
+// explicit `refresh()`, both of which bump the session's `rev`.
 
-import { type EntityId, createReactor, deleteEntity, query, readResults, streamResults, transact } from "./stardust.ts";
+import { type EntityId, createReactor, deleteEntity, query, readResults, transact } from "./stardust.ts";
 import type { Filter } from "./board.ts";
 import { APP } from "./tenancy.ts";
 
@@ -225,24 +225,8 @@ export async function refresh(h: SessionHandle): Promise<void> {
   await bumpRev(h.sessionId);
 }
 
-/** Apply a mutation AND bump this session's `rev` in ONE transaction — a write
- *  "during a session" carries the session and self-refreshes its snapshot. */
-export async function sessionWrite(h: SessionHandle, patch: Record<string, Record<string, unknown>>): Promise<void> {
-  await transact({ ...patch, [h.sessionId]: { rev: Date.now() } });
-}
-
 /** The current fully-filtered board snapshot — a one-shot read (always recomputes). */
 export async function readSnapshot(h: SessionHandle): Promise<SnapshotRow[]> {
   const rid = await ensureBoardReactor();
   return (await readResults(rid, { sid: h.sessionId })) as SnapshotRow[];
-}
-
-/** Live snapshots for this session: pushes on filter change / refresh() / mutation. */
-export async function streamSnapshot(
-  h: SessionHandle,
-  cb: (todos: SnapshotRow[]) => void,
-  signal: AbortSignal,
-): Promise<void> {
-  const rid = await ensureBoardReactor();
-  await streamResults(rid, (rows) => cb(rows as SnapshotRow[]), signal, { sid: h.sessionId });
 }

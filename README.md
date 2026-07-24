@@ -52,7 +52,7 @@ Run `node src/cli.ts add "..."` in a terminal and watch the browser update too.
 | create             | `POST /schemas/{id}/entities` — one validated write carrying `workspace` + `app` |
 | complete / reopen  | `PATCH /schemas/{id}/entities/{id}` with `{ done: true|false }` |
 | delete             | `DELETE /entities/{id}` (retracts every field)               |
-| the live list      | a per-workspace **reactor** (`find`/`where`/`then.project`) streamed over SSE |
+| the live list      | a **reactor** (`find`/`where`/`then.project`) read as a record stream — one canonical session reactor for the web board, a per-workspace reactor for the CLI |
 
 ## Multi-tenancy: user → persona → workspace
 
@@ -64,21 +64,16 @@ rewrite** — see the jj history (`jj log`). The model is plain facts:
 - **workspace** — the **data-isolation boundary**; todos live in exactly one.
 - **grant** — an edge fact `(persona, workspace, role)`. Access = a grant exists.
 
-Run the isolation proof (12 assertions):
-
-```sh
-node src/demo-tenancy.ts        # npm run demo:tenancy
-```
-
 ### Leak-safe by construction — three independent layers
 
 1. **Types.** Every todo read/write requires a `WorkspaceCtx`, and the only way to
    get one is `openWorkspace(persona, workspace)`, which runs the grant check first.
    "Forgot to scope by tenant" is unrepresentable — it won't compile.
-2. **Reads.** Each workspace gets its **own reactor**, pinned to a single clause
-   `[?t workspace {# id}]`, created server-side at workspace creation. The client
-   only ever holds the reactor **id** — never the filter — so it cannot widen the
-   scope. Stardust also does the ordering and shapes the output (`then.project`
+2. **Reads.** Reads go through a reactor whose scope is fixed server-side — the
+   per-workspace reactor (CLI) is pinned to `[?t workspace {# id}]` at workspace
+   creation, and the canonical board reactor (web) takes its workspace and viewer
+   from the session's own facts. Either way the client holds only an **id** —
+   never the filter — so it cannot widen the scope. Stardust also does the ordering and shapes the output (`then.project`
    returns `{id,title,done,priority}`), so there's no positional mapping to get wrong.
 3. **Writes.** `authorizeWrite` re-checks ownership before every mutation, so a
    stray cross-tenant id can't be toggled or deleted even if it reached the server.
@@ -100,36 +95,28 @@ first boot; isolated workspaces never touch it.
 ## Evolution stages (see `jj log`)
 
 The app grew far past its original design without a rewrite. Each stage is a
-commit and a runnable proof:
+commit; `jj log` is the record:
 
-| Stage | What was added | Stardust idiom | Proof |
-|-------|----------------|----------------|-------|
-| 1 | single-tenant todos | schema + reactor + SSE | `npm run web` / `cli` |
-| 2 | multi-tenancy | per-workspace pinned reactors, capability types | `npm run demo:tenancy` |
-| 3 | status, due dates, tags, dependencies | instant field predicates; tags/deps as **edge entities**; graph joins | `npm run demo:fields` |
-| 4 | projects + duplicate | atomic **temp-id ref remapping** in one transaction | `npm run demo:projects` |
-| 5 | durable workflows | event-bus dataflow: derive facts, apply across the write boundary, causation-linked | `npm run demo:workflow` + `npm run worker` |
+| Stage | What was added | Stardust idiom |
+|-------|----------------|----------------|
+| 1 | single-tenant todos | schema + reactor + SSE |
+| 2 | multi-tenancy | per-workspace pinned reactors, capability types |
+| 3 | status, tags, dependencies | tags/deps as **edge entities**; graph joins |
+| 4 | derive-on-read | correlated `exists` bound to a var, so a DERIVED value is filterable |
+| 5 | the session reactor | ONE reactor computes effectiveStatus + every filter server-side |
 
 Highlights of the later stages:
 
-- **Rich fields nobody planned up front** (`src/features.ts`). Due dates are
-  Stardust instants queried with a field predicate (`[< ?due {#utc now}]`).
-  Tags and dependencies are **edge entities** (like `grant`), so membership and
-  graph questions ("what's blocked?", "what's ready?") are plain datalog joins
-  rather than array gymnastics. `ready` is a set-diff of two positive queries
-  because Stardust's `not`/`or-not` don't compose safely (verified).
-- **Projects + duplication** (`src/projects.ts`). `duplicateProject` clones a
-  project, its todos, and the dependency/tag edges among them in **one
-  transaction**, using temp-id references (`{"#":"_t<id>"}`) so Stardust rewires
-  every dependency to the new copies atomically — no dangling cross-project refs.
-- **Durable workflows** (`src/workflow.ts`, `src/worker.ts`). Per the theory —
-  *reactors define and observe; writes still cross the write boundary* — a
-  workflow is derivation rules (queries) + an applier that reacts to the
-  transaction event bus. It auto-blocks/unblocks todos from the dependency graph
-  and auto-closes/reopens projects, tagging each derived write with the causing
-  transaction id (`Tx-Causation-Id`). It's idempotent, so it converges to a
-  fixpoint and stops. Verified live: adding a dependency auto-blocks the
-  dependent with no explicit call.
+- **Rich fields nobody planned up front** (`src/features.ts`). Tags and
+  dependencies are **edge entities** (like `grant`), so membership and graph
+  questions are plain datalog joins rather than array gymnastics. Due dates are
+  Stardust instants, queried with a field predicate (`[< ?due {#utc now}]`) in
+  the session reactor's `overdue` subquery.
+- **Derived state, no worker** (`src/session.ts`, `src/derive.ts`). Blocked-ness
+  and the derived views used to be materialized onto `status` by a background
+  worker reacting to the transaction bus. They are now DERIVED on read by a
+  correlated `exists` bound to a variable inside the board reactor, so nothing
+  ever needs un-writing and the worker was deleted outright.
 - **Workspace switching in the web UI** (`src/server.ts`, `#wsbar`). One active
   workspace at a time; switching updates the server context and closes streams,
   and Datastar auto-reconnects to re-render against the new workspace.
@@ -147,26 +134,28 @@ Highlights of the later stages:
 ## Why it's a clean fit (TS + Datastar + Stardust)
 
 - **One reactor = the source of truth for the UI.** Commands (add/toggle/remove) only
-  *write facts*; they never render the list. The reactor recomputes and Stardust pushes
-  new results over SSE, so every connected client re-renders. This is exactly Datastar's
+  *write facts*; they never render the list. The reactor recomputes and Stardust
+  pushes the new result down the open record stream, so every connected client
+  re-renders. This is exactly Datastar's
   CQRS pattern — long-lived read stream, short-lived command posts.
-- **Two SSE streams meet in the middle.** Stardust reactor SSE → the Node server →
-  Datastar `patch-elements` SSE → the browser DOM. The server (`src/server.ts`, `/stream`)
-  is a ~10-line bridge.
+- **Two streams meet in the middle.** Stardust's reactor results arrive as an
+  NDJSON **record stream** (0.0.6 dropped machine SSE) → the Node server →
+  Datastar `patch-elements` SSE → the browser DOM. The server (`src/server.ts`,
+  `/stream`) is the bridge.
 - **Pure JSON to Stardust.** `src/stardust.ts` uses only `fetch` and a streamed `fetch`
   body — no driver, no RON. Writes are JSON Merge Patch; the schema is JSON Schema.
 
 ## Files
 
-- `src/stardust.ts`      — tiny JSON-only Stardust client (fetch, SSE, tx bus, causation).
+- `src/stardust.ts`      — tiny Stardust 0.0.6 client (NDJSON record streams, tx bus, causation).
 - `src/tenancy.ts`       — users, personas, workspaces, grants; per-workspace reactors.
 - `src/workspace.ts`     — `WorkspaceCtx` capability, `openWorkspace` (access gate), default tenant.
 - `src/todos.ts`         — workspace-scoped schema (evolved 3×) + commands + projected reads.
-- `src/features.ts`      — tags & dependencies (edges); overdue/blocked/ready queries.
-- `src/projects.ts`      — projects + `duplicateProject` (atomic ref remapping).
-- `src/workflow.ts`      — durable-workflow derivation rules + event-bus worker.
-- `src/worker.ts`        — runnable workflow worker (`npm run worker`).
+- `src/features.ts`      — tags & dependencies (edge entities).
+- `src/derive.ts`        — the correlated `exists` fragments (blocked, visibility).
+- `src/session.ts`       — the search session + the ONE canonical board reactor.
 - `src/cli.ts`           — the CLI (operates in the default workspace).
 - `src/server.ts`        — Node HTTP + Datastar web server (CQRS + workspace switching).
 - `src/view.ts`          — server-rendered HTML: `#wsbar` switcher + morph-friendly `#list`.
-- `src/demo-*.ts`        — runnable proofs: tenancy (12), fields (9), projects (8), workflow (10).
+- `src/xray.ts`          — the in-situ "how is this resolved?" overlay.
+- `src/app.test.ts`      — unit tests for the pure query/derivation helpers.
