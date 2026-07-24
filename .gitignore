@@ -1,3 +1,10 @@
 node_modules/
 .state.json
 *.log
+.DS_Store
+
+# Stardust databases — demo data, and they are rebuilt by `npm run seed`.
+*.stardust
+
+# Vendor binaries live outside the repo (see the playground VM's ~/stardust).
+bin/
