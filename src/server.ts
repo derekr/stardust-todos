@@ -74,6 +74,50 @@ import {
 } from "./inspect.ts";
 
 /** Reactors the x-ray may hand out as RON: exactly the ones it documents. */
+/**
+ * Values to substitute for a reactor's free vars, so a copied body RUNS.
+ *
+ * The console's lab takes a query and nothing else — there is no bind field — so a
+ * body pasted with vars still free is not "unbound", it is a cartesian product over
+ * every session/workspace/todo that matches. Pasting the board that way returns
+ * every todo once per SESSION, which is how this was found.
+ *
+ * `sid` and `todo` come from the page the x-ray was opened on, so what you paste is
+ * scoped to what you were looking at; the rest come from the current workspace.
+ */
+function runnableBinds(name: string, from: { sid?: string; todo?: string }): Record<string, string> {
+  const ws = `{# ${ctx.workspaceId}}`;
+  const viewer = `{# ${ctx.personaId}}`;
+  switch (name) {
+    case BOARD_REACTOR:
+      return from.sid ? { sid: from.sid } : {};
+    case "board-counts":
+    case "todo-options":
+      return { ws, viewer };
+    case "board-blockers":
+    case "board-tags":
+      return { ws };
+    case "todo-tags":
+    case "todo-blocks":
+      return from.todo ? { todo: `{# ${from.todo}}` } : {};
+    case "command-menu":
+      return { scope: "'global'", rank: "2" };
+    case "command-authz":
+      return { cmdId: "'workspace.archive'", rank: "2" };
+    default:
+      return {};
+  }
+}
+
+/** Replace `?var` with a RON literal. The lookahead stops `?ws` eating `?wsBar`. */
+function bindInto(body: string, binds: Record<string, string>): string {
+  let out = body;
+  for (const [v, lit] of Object.entries(binds)) {
+    out = out.replace(new RegExp(`\\?${v}(?![A-Za-z0-9_])`, "g"), lit);
+  }
+  return out;
+}
+
 const RON_EXPORTABLE = new Set<string>([BOARD_REACTOR, ...DECLARED.map((d) => d.name)]);
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -309,7 +353,8 @@ async function sendDetail(stream: any, id: number) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url ?? "/", "http://localhost").pathname;
+  const parsed = new URL(req.url ?? "/", "http://localhost");
+  const url = parsed.pathname;
   const method = req.method ?? "GET";
   const seg = url.split("/").filter(Boolean); // path segments
 
@@ -652,8 +697,15 @@ const server = http.createServer(async (req, res) => {
         res.end("not provisioned");
         return;
       }
+      const body = await readReactorRon(id);
+      const binds = parsed.searchParams.get("runnable")
+        ? runnableBinds(name, {
+            sid: parsed.searchParams.get("sid") ?? undefined,
+            todo: parsed.searchParams.get("todo") ?? undefined,
+          })
+        : {};
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-      res.end(await readReactorRon(id));
+      res.end(bindInto(body, binds));
       return;
     }
 

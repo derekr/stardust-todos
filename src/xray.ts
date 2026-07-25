@@ -258,10 +258,17 @@ const SCRIPT = `
     if(el){ e.preventDefault(); e.stopPropagation(); showPop(el.getAttribute('data-xray'), el); }
     else { pop.hidden = true; }
   }, true);
-  function copyRon(r, btn, pre){
+  function copyRon(r, btn, pre, runnable){
     var label = btn.textContent;
     btn.disabled = true; btn.textContent = 'fetching\u2026';
-    fetch(XRAY_BASE + '/xray/ron/' + encodeURIComponent(r.name))
+    var q = '';
+    if(runnable){
+      // scope the copy to whatever this page is showing
+      var m = location.pathname.match(/\\/s\\/(\\d+)/);
+      var t = location.pathname.match(/\\/todo\\/(\\d+)/);
+      q = '?runnable=1' + (m ? '&sid=' + m[1] : '') + (t ? '&todo=' + t[1] : '');
+    }
+    fetch(XRAY_BASE + '/xray/ron/' + encodeURIComponent(r.name) + q)
       .then(function(res){ if(!res.ok) throw new Error(res.status); return res.text(); })
       .then(function(txt){
         // show the real body either way: if the clipboard is unavailable
@@ -270,7 +277,7 @@ const SCRIPT = `
         if(!navigator.clipboard) throw new Error('no clipboard');
         return navigator.clipboard.writeText(txt);
       })
-      .then(function(){ btn.textContent = '\u2713 copied \u2014 paste into /reactors/lab'; })
+      .then(function(){ btn.textContent = runnable ? '\u2713 copied \u2014 runs as-is' : '\u2713 copied \u2014 free vars, see below'; })
       .catch(function(){ btn.textContent = 'shown above \u2014 select and copy'; })
       .then(function(){
         btn.disabled = false;
@@ -288,12 +295,19 @@ const SCRIPT = `
     pop.appendChild(row('xr-mech', d.mech));
     var pre=document.createElement('pre'); pre.className='xr-code'; pre.textContent=d.code; pop.appendChild(pre);
     (d.reactors||[]).forEach(function(r){
-      var b=document.createElement('button');
-      b.className='xr-ron'; b.type='button';
-      b.textContent='\u29c9 copy ' + r.name + ' as RON';
-      b.addEventListener('click', function(){ copyRon(r, b, pre); });
-      pop.appendChild(b);
-      pop.appendChild(row('xr-bind', 'needs a bind, e.g. ' + r.bind));
+      var exact=document.createElement('button');
+      exact.className='xr-ron'; exact.type='button';
+      exact.textContent='\u29c9 ' + r.name + ' as stored';
+      exact.addEventListener('click', function(){ copyRon(r, exact, pre, false); });
+      pop.appendChild(exact);
+      var run=document.createElement('button');
+      run.className='xr-ron xr-run'; run.type='button';
+      run.textContent='\u25b6 runnable in lab';
+      run.addEventListener('click', function(){ copyRon(r, run, pre, true); });
+      pop.appendChild(run);
+      pop.appendChild(row('xr-bind',
+        'free vars: ' + r.bind + ' \u2014 the lab has no bind field, so the stored ' +
+        'body joins across EVERY match. "runnable" substitutes this page\u2019s ids.'));
     });
     pop.appendChild(row('xr-src', d.src));
     var r=el.getBoundingClientRect();
@@ -337,6 +351,7 @@ export function xrayAssets(): string {
     .xr-ron{font-family:var(--mono);font-size:11px;color:var(--aqua);background:transparent;
       border:1px solid var(--aqua);border-radius:7px;padding:5px 9px;cursor:pointer;margin:0 6px 6px 0;}
     .xr-ron:disabled{opacity:.6;cursor:default;}
+    .xr-run{color:var(--bg);background:var(--aqua);font-weight:600;}
     .xr-bind{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin:0 0 8px;}
   </style>
   <script>var XRAY_BASE=${JSON.stringify(B)};${SCRIPT}</script>`;
