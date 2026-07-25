@@ -227,7 +227,7 @@ export function detailFragment(todo: Todo, opts: DetailOpts): string {
       <button class="navmore" data-on:click="$menuOpen = !$menuOpen" aria-label="actions">•••</button>
     </div>
     <div class="mback" style="display:none" data-show="$menuOpen" data-on:click="$menuOpen=false"></div>
-    <div class="actionsmenu" style="display:none" data-show="$menuOpen">
+    <div class="actionsmenu" data-xray="commands" style="display:none" data-show="$menuOpen">
       ${cmdItems || `<div class="empty">No actions available.</div>`}
     </div>
 

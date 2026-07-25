@@ -52,9 +52,11 @@ export interface Counts {
  *
  * Once visibility is per-viewer (drafts), ws-wide counts would leak and mislead
  * ("Blocked 3" when you can see 1), so counts must be tallied over the SAME
- * visible set as the board. That can't be a shared per-workspace reactor (a
- * reactor has no viewer parameter), so it's a viewer-scoped dry-run: project
- * {status, priority, blocked} for the viewer's visible todos and tally here.
+ * visible set as the board. It was a viewer-scoped dry-run for exactly as long as
+ * "a reactor has no viewer parameter" looked true; the viewer is a per-read BIND,
+ * so one stored reactor (`counts`) serves every workspace and viewer. It projects
+ * {status, priority, blocked} for the viewer's visible todos; the tally stays here
+ * because the group key is the DERIVED effective status.
  */
 export async function aggregateCounts(ctx: WorkspaceCtx, viewerPersonaId: number): Promise<Counts> {
   const rows = (await counts.read({

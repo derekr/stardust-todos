@@ -87,10 +87,13 @@ export async function ensureReactor(name: string, body: Record<string, unknown>)
  * literal by `ResultOf` rather than emitted into a generated file, so there is no
  * artifact to drift out of sync.
  *
- * Rows are validated at the boundary by the same schema-generated validators
- * `typed-query.query()` uses. It does NOT apply that module's compile-time
- * `CheckQuery`: the checker models plain 3-tuple fact clauses, and these queries
- * deliberately use `or` and a bound `exists`, which it cannot express.
+ * A query that PROJECTS (`then.project`) has its rows validated at the boundary by
+ * the same schema-generated validators `typed-query.query()` uses; one with a bare
+ * `find` comes back as positional tuples, which give the validator no key to check
+ * against, so those are inferred but unchecked. It does NOT apply that module's
+ * compile-time `CheckQuery` either way: the checker models plain 3-tuple fact
+ * clauses, and these queries deliberately use `or` and a bound `exists`, which it
+ * cannot express.
  *
  * Parameters are per-read BINDS, so one stored reactor serves every caller: a var
  * left unbound by `where` is supplied at read time (`?bind={ws {# 12}}`), and

@@ -140,6 +140,31 @@ await blockedByTodo.read({ todo: {"#": id} });`,
 await blockers.read({ ws: {"#": ctx.workspaceId} });`,
     src: "src/queries.ts · blockers · src/board.ts · blockerMap()",
   },
+  commands: {
+    title: "Commands — a catalog, not hardcoded UI",
+    mech: "Every command in this menu is a Stardust ENTITY (kind:\"command\") carrying its label, the role rank it needs, whether a denied viewer sees it grayed, and its scope. ONE stored reactor returns the catalog of a scope in order; the ⌘K palette reads it with ?bind={scope 'global'} and this menu with {scope 'todo'} — same definition, two binds, no app-side filtering. A pure projection then folds the viewer's role into {visible, enabled, reason}, and the write boundary (POST /command/<id>) re-reads that SAME catalog before mutating anything, so what you're shown and what you're allowed cannot drift. Granting Teammate the right to archive is a fact write, not a deploy. The bind IS the scope rather than a filter over a shared result: an omitted bind is not an error in Stardust, it would just return both scopes looking perfectly healthy — so the reactor is unexported and the only reader takes the scope as a required argument.",
+    code: `// declared once (src/queries.ts); ?scope is left unbound:
+const commandCatalog = define("command-catalog", {
+  find: ["?cmdId", "?label", "?minRank",
+         "?showWhenDenied", "?danger", "?order"],
+  where: [
+    ["?c", "kind", "command"],
+    ["?c", "scope", "?scope"],          // supplied per read
+    ["?c", "cmdId", "?cmdId"], ["?c", "label", "?label"],
+    ["?c", "minRank", "?minRank"], /* … */
+  ],
+  orderBy: ["?order"],
+});
+// ?scope stays OUT of find: the caller knows it, so the row is
+// exactly a CommandDef minus its scope.
+
+// the guard — there is no way to reach .read({}) from outside:
+export const commandsInScope = (scope) => commandCatalog.read({ scope });
+
+project(await catalog("todo"), role)    // this menu
+await authorizeCommand(cmdId, role)     // the same catalog, on write`,
+    src: "src/queries.ts · commandCatalog + commandsInScope · src/commands.ts · catalog() + authorizeCommand()",
+  },
   activity: {
     title: "Activity — read straight off the fact log",
     mech: "No audit table, and no event replay needed. Every fact carries the transaction that asserted it, so ONE facts read for this entity + field already IS that field's history — a `status` fact only exists because that write actually changed the value. Rows come back newest-first; we reverse to chronological, then attribute each one by reading its transaction ENTITY, where the commit instant and the Tx-Meta headers landed as ordinary facts. (The /inspect page does use bus replay — that's a different mechanism, for the whole log.)",

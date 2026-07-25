@@ -33,15 +33,7 @@ import type { EntityId } from "./stardust.ts";
 import { createPersona, createWorkspace, ensureUser, grantAccess, listPersonas, roleOf } from "./tenancy.ts";
 import { authorizeCommand, catalog, ensureCommandCatalog, project } from "./commands.ts";
 import { addDependency, removeDependency, tagsOf } from "./features.ts";
-import {
-  type Filter,
-  aggregateCounts,
-  availableTags,
-  blockerMap,
-  effectiveStatus,
-  emptyFilter,
-  todoOptions,
-} from "./board.ts";
+import { aggregateCounts, availableTags, blockerMap, effectiveStatus, emptyFilter, todoOptions } from "./board.ts";
 import {
   type SessionHandle,
   createSession,

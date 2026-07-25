@@ -140,6 +140,10 @@ Highlights of the later stages:
   + `then.project`), not in TS.
 - One schema write creates a reactor-ready todo (`workspace` + `app` are schema
   fields) instead of a create-then-tag pair.
+- Even the command surface is data: commands are entities, and the ⌘K palette and
+  the per-todo ••• menu are ONE stored reactor read with `?bind={scope …}` — the
+  narrowing and the ordering are Stardust's, not a `.filter()`. The same catalog
+  is re-read at the write boundary, so the menu and the permission cannot drift.
 - Stardust's expression engine is **bounded and fails closed** (AST depth, macro
   depth, higher-order fuel, output-list size — see docs `expressions/limits`), so
   it's safe to push aggregation/projection server-side without app-side guards.
@@ -171,6 +175,8 @@ Highlights of the later stages:
 - `src/features.ts`      — tags & dependencies (edge entities).
 - `src/derive.ts`        — the correlated `exists` fragments (blocked, visibility).
 - `src/session.ts`       — the search session + the ONE canonical board reactor.
+- `src/queries.ts`       — the declared reactors (one definition each, typed readers out).
+- `src/commands.ts`      — commands as entities: the scoped catalog + the role projection.
 - `src/cli.ts`           — the CLI (operates in the default workspace).
 - `src/server.ts`        — Node HTTP + Datastar web server (CQRS + workspace switching).
 - `src/view.ts`          — server-rendered HTML: `#wsbar` switcher + morph-friendly `#list`.

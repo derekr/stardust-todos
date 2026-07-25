@@ -288,6 +288,11 @@ export async function readSnapshot(h: SessionHandle): Promise<SnapshotRow[]> {
  * `where` — so the server does not have to notice anything itself. An emission means
  * the rows differ; writing a field without changing the result pushes nothing.
  *
+ * TOP-LEVEL clauses are the reliable trigger, and they cover rows that did not
+ * exist when the stream opened: a brand-new entity the top-level clauses match
+ * invalidates too, and only for the binds it actually matches (measured on the
+ * `command-catalog` reactor — see AGENTS.md, "What a subscription pushes").
+ *
  * The one measured gap is TAG edges. Adding a tag pushes nothing — verified from a
  * background script and again with the tag filter active, so even an edge that
  * changes which rows match is invisible here. DEP edges do push (measured twice),

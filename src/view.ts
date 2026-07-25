@@ -234,7 +234,7 @@ export function palette(globalCmds: ProjectedCommand[]): string {
     .join("");
   return `<div id="palette">
     <div class="pal-scrim" data-on:click="@get('${B}/palette/0')"></div>
-    <div class="pal-card">
+    <div class="pal-card" data-xray="commands">
       <div class="pal-head">Commands<kbd>⌘K</kbd></div>
       ${items || `<div class="pal-empty">No commands available.</div>`}
     </div>

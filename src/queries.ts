@@ -6,10 +6,15 @@
 // workspace, viewer and todo instead of one query execution per render.
 //
 // Everything a caller used to pass as a literal (`{"#": ctx.workspaceId}`) is now
-// a var the reader binds. Note what that means for safety: an UNBOUND var matches
-// everything, so a caller that forgets `ws` gets the whole database rather than an
-// error. Every reader below therefore takes its scope as a required argument.
+// a var the reader binds. Note the asymmetry that creates: Stardust rejects a bind
+// var NAME it does not know (`unknown bind var ?scoop`), but never an ABSENT bind —
+// an unbound var matches everything, so a caller who forgets `ws` gets the whole
+// database back, ordered, looking perfectly healthy. Every read below passes its
+// scope; where the over-broad answer would be an AUTHORIZATION answer the
+// `Declared` is not exported at all, and the only reader takes the scope as a
+// required argument (see `commandsInScope`).
 
+import type { Scope } from "./commands.ts";
 import { visibleTo } from "./derive.ts";
 import { define } from "./reactors.ts";
 import { APP } from "./tenancy.ts";
@@ -108,5 +113,50 @@ export const blockedByTodo = define("todo-blocks", {
   then: { project: { title: "?bt" } },
 } as const);
 
+/** Every command entity of ONE scope, ordered — the ⌘K palette and the per-todo
+ *  ••• menu are the same reactor read with a different bind.
+ *
+ *  `?scope` is deliberately absent from `find`: the reader supplies it, so the row
+ *  is exactly a `CommandDef` minus its scope. It stays an ordinary top-level
+ *  clause, which is what makes a NEW command entity push to a subscriber bound to
+ *  that scope — and to that scope only (measured; see AGENTS.md). Nothing
+ *  subscribes today, the menus read per render, but the shape is what would make
+ *  a live catalog free. */
+const commandCatalog = define("command-catalog", {
+  find: ["?cmdId", "?label", "?minRank", "?showWhenDenied", "?danger", "?order"],
+  where: [
+    ["?c", "kind", "command"],
+    ["?c", "scope", "?scope"],
+    ["?c", "cmdId", "?cmdId"],
+    ["?c", "label", "?label"],
+    ["?c", "minRank", "?minRank"],
+    ["?c", "showWhenDenied", "?showWhenDenied"],
+    ["?c", "danger", "?danger"],
+    ["?c", "order", "?order"],
+  ],
+  orderBy: ["?order"],
+} as const);
+
+/**
+ * The catalog of one scope. The scope is a required ARGUMENT, not a bind the
+ * caller assembles, and that is the whole guard: the reactor above is unexported,
+ * so there is no way to reach `.read({})`.
+ *
+ * Why bother, when every other reader here just passes a bind — because this one
+ * feeds `authorizeCommand`, and Stardust will not complain. A misspelled bind var
+ * is an error; an OMITTED one is not. It simply leaves `?scope` free, and the
+ * reactor then returns every command in BOTH scopes, in order, looking entirely
+ * healthy. A missing function argument is the same mistake the compiler catches.
+ */
+export const commandsInScope = (scope: Scope) => commandCatalog.read({ scope });
+
 /** Everything `npm run stardust:setup` provisions, besides the board reactor. */
-export const DECLARED = [counts, blockers, workspaceTags, todoPicker, tagsOfTodo, blockedByTodo] as const;
+export const DECLARED = [
+  counts,
+  blockers,
+  workspaceTags,
+  todoPicker,
+  tagsOfTodo,
+  blockedByTodo,
+  commandCatalog,
+] as const;

@@ -7,6 +7,7 @@
 // so the menu you see and the mutation you're allowed can never drift, and
 // changing access is a fact write, not a deploy.
 
+import { commandsInScope } from "./queries.ts";
 import type { Role } from "./tenancy.ts";
 import { query as tquery } from "./typed-query.ts";
 
@@ -31,35 +32,30 @@ export interface ProjectedCommand extends CommandDef {
   reason: string;
 }
 
-/** All command entities of a scope, ordered. */
+/**
+ * All command entities of a scope, ordered.
+ *
+ * This was a dry-run that fetched BOTH scopes and threw half the rows away in TS.
+ * It is now the `command-catalog` reactor read with `?scope` bound, so Stardust
+ * does the narrowing and the ordering — and the ⌘K palette and the ••• menu are
+ * one stored definition read two ways.
+ *
+ * The six columns are scalar fields, so the reactor's row type is inferred from
+ * its literal as exactly [string, string, number, boolean, boolean, number] —
+ * `CommandDef` minus the `scope` the caller just passed in, which is why `scope`
+ * is added back here rather than projected out of the query.
+ */
 export async function catalog(scope: Scope): Promise<CommandDef[]> {
-  // All seven columns are scalar fields → tquery infers the tuple exactly:
-  // [string, string, number, boolean, boolean, "global" | "todo", number].
-  const rows = await tquery({
-    find: ["?cmdId", "?label", "?minRank", "?showWhenDenied", "?danger", "?scope", "?order"],
-    where: [
-      ["?c", "kind", "command"],
-      ["?c", "cmdId", "?cmdId"],
-      ["?c", "label", "?label"],
-      ["?c", "minRank", "?minRank"],
-      ["?c", "showWhenDenied", "?showWhenDenied"],
-      ["?c", "danger", "?danger"],
-      ["?c", "scope", "?scope"],
-      ["?c", "order", "?order"],
-    ],
-    orderBy: ["?order"],
-  } as const);
-  return rows
-    .map(([cmdId, label, minRank, showWhenDenied, danger, s, order]) => ({
-      cmdId,
-      label,
-      minRank,
-      showWhenDenied,
-      danger,
-      scope: s,
-      order,
-    }))
-    .filter((c) => c.scope === scope);
+  const rows = await commandsInScope(scope);
+  return rows.map(([cmdId, label, minRank, showWhenDenied, danger, order]) => ({
+    cmdId,
+    label,
+    minRank,
+    showWhenDenied,
+    danger,
+    scope,
+    order,
+  }));
 }
 
 /** Project the catalog for one role: compute visible/enabled/reason. */
@@ -74,7 +70,11 @@ export function project(cmds: CommandDef[], role: Role | null): ProjectedCommand
     .filter((c) => c.visible);
 }
 
-/** The write-boundary check — reads the SAME catalog + role. */
+/** The write-boundary check — reads the SAME catalog + role.
+ *
+ *  A cmdId names one command, but the reactor is scoped, so "the whole catalog"
+ *  is now two bound reads rather than one unfiltered one. That is the trade for
+ *  making the unbound read unreachable, and it is a menu-sized query. */
 export async function authorizeCommand(cmdId: string, role: Role | null): Promise<CommandDef | null> {
   const all = [...(await catalog("global")), ...(await catalog("todo"))];
   const c = all.find((x) => x.cmdId === cmdId);
