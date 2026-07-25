@@ -8,8 +8,11 @@
 // deploy fails here rather than on a user's first request.
 
 import { type Provisioned, ensureReactor } from "../src/reactors.ts";
+import { ensureSchema } from "../src/registry.ts";
 import { DECLARED } from "../src/queries.ts";
+import { DECLARED_SCHEMAS } from "../src/schemas.ts";
 import { BOARD_REACTOR, canonicalBody } from "../src/session.ts";
+import { ensureTodoSchema } from "../src/todos.ts";
 import { BASE } from "../src/stardust.ts";
 
 // The board reactor is provisioned directly (it is hand-written, not a declared
@@ -27,6 +30,13 @@ const MARK = {
 
 async function main() {
   console.log(`stardust ${BASE}\n`);
+  // Schemas first: they are write boundaries the reactors' data is written through.
+  await ensureTodoSchema();
+  console.log(`  ${MARK.current}  schema todo`);
+  for (const s of DECLARED_SCHEMAS) {
+    await ensureSchema(s.name, s.doc);
+    console.log(`  ${MARK.current}  schema ${s.name}`);
+  }
   for (const r of REACTORS) {
     const { id, status } = await r.provision();
     console.log(`  ${MARK[status]}  ${r.name.padEnd(12)} #${id}`);

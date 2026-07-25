@@ -16,7 +16,7 @@
 // deploy-time step, not a hot path, so the simpler model wins — and fixed ids
 // turned out not to generalize anyway (see reactors.ts).
 
-import { type EntityId, query, refId, transact } from "./stardust.ts";
+import { type EntityId, createSchema, patchSchema, query, readSchema, refId, transact } from "./stardust.ts";
 import { APP } from "./tenancy.ts";
 
 /** What a marker points at. One kind per sort of provisioned thing. */
@@ -39,4 +39,26 @@ export async function lookupRef(kind: RefKind, name: string): Promise<EntityId |
 /** Record that `target` is the thing called `name`. */
 export async function putRef(kind: RefKind, name: string, target: EntityId): Promise<void> {
   await transact({ "#_ref": { kind, app: APP, name, target: { "#": target } } });
+}
+
+/**
+ * Make the schema named `name` exist and match `doc`, and return its id.
+ *
+ * Schemas are WRITE BOUNDARIES you opt into: entities written through
+ * `/schemas/{id}/entities` are validated and a bad value is refused with 422,
+ * while the same fact sent to `/commands/transact` commits unchecked. So giving a
+ * kind a schema only means something once its writes move to the schema route.
+ *
+ * Growth is a merge-patch of the whole document — adding a property or widening
+ * `required` is not a migration, and existing entities are untouched.
+ */
+export async function ensureSchema(name: string, doc: Record<string, unknown>): Promise<EntityId> {
+  const existing = await lookupRef("schemaRef", name);
+  if (existing !== undefined && (await readSchema(existing)).status === 200) {
+    await patchSchema(existing, doc);
+    return existing;
+  }
+  const id = (await createSchema(doc)).schemaId;
+  await putRef("schemaRef", name, id);
+  return id;
 }

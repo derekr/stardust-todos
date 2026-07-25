@@ -10,7 +10,8 @@
 // distinguished by a `kind` field. No schema is required for infra entities;
 // the isolation guarantees come from how queries are shaped, not from classes.
 
-import { type EntityId, createReactor, query, readEntity, refId, transact } from "./stardust.ts";
+import { type EntityId, createReactor, createSchemaEntity, query, readEntity, refId, transact } from "./stardust.ts";
+import { grantSchema } from "./schemas.ts";
 import { query as tquery } from "./typed-query.ts";
 
 export type Role = "owner" | "member";
@@ -119,12 +120,15 @@ export async function createWorkspace(personaId: EntityId, name: string): Promis
 }
 
 export async function grantAccess(workspaceId: EntityId, personaId: EntityId, role: Role): Promise<void> {
-  await tempId({
+  // Through the schema route, not transact: `role` decides authorization, so a
+  // value outside the enum must be refused by Stardust (422), not merely unused.
+  const r = await createSchemaEntity(await grantSchema(), {
     kind: "grant",
     persona: { "#": personaId },
     workspace: { "#": workspaceId },
     role,
   });
+  if (!r.ok) throw new Error(`grant rejected: ${r.error.message}`);
 }
 
 /** Workspaces this persona may access, resolved through grants. */

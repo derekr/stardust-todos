@@ -20,7 +20,8 @@
 // stream re-emits when the session changes — a filter edit (setFilter) or an
 // explicit `refresh()`, both of which bump the session's `rev`.
 
-import { type EntityId, deleteEntity, query, readResults, transact } from "./stardust.ts";
+import { type EntityId, createSchemaEntity, deleteEntity, patchSchemaEntity, query, readResults } from "./stardust.ts";
+import { facetSchema, sessionSchema } from "./schemas.ts";
 import { ensureReactor } from "./reactors.ts";
 import type { Filter } from "./board.ts";
 import { APP } from "./tenancy.ts";
@@ -182,17 +183,18 @@ async function writeFacet(sessionId: EntityId, facet: string, values: readonly s
     ],
   })) as [EntityId][];
   await Promise.all(existing.map(([id]) => deleteEntity(id)));
-  const patch: Record<string, Record<string, unknown>> = {};
-  values.forEach((v, i) => {
-    patch[`#_f${i}`] = { kind: "sf", session: { "#": sessionId }, facet, value: v };
-  });
-  if (Object.keys(patch).length) await transact(patch);
+  const schemaId = await facetSchema();
+  for (const value of values) {
+    const r = await createSchemaEntity(schemaId, { kind: "sf", session: { "#": sessionId }, facet, value });
+    if (!r.ok) throw new Error(`facet rejected: ${r.error.message}`);
+  }
 }
 
 // Bump `rev` to a fresh value so the reactor's top-level [?sess rev ?rev] clause
 // invalidates and re-emits. A timestamp avoids a read-modify-write race.
 async function bumpRev(sessionId: EntityId): Promise<void> {
-  await transact({ [sessionId]: { rev: Date.now() } });
+  const r = await patchSchemaEntity(await sessionSchema(), sessionId, { rev: Date.now() });
+  if (!r.ok) throw new Error(`rev bump rejected: ${r.error.message}`);
 }
 
 /** Create a search session (filter = everything, view=all) + ensure the reactor. */
@@ -201,19 +203,21 @@ export async function createSession(
   viewerPersonaId: EntityId,
   actor: string,
 ): Promise<SessionHandle> {
-  const r = await transact({
-    "#_ss": {
-      kind: "session",
-      workspace: { "#": workspaceId },
-      viewer: { "#": viewerPersonaId },
-      actor,
-      view: "all",
-      tagActive: false,
-      rev: 1,
-    },
+  const created = await createSchemaEntity(await sessionSchema(), {
+    kind: "session",
+    workspace: { "#": workspaceId },
+    viewer: { "#": viewerPersonaId },
+    actor,
+    view: "all",
+    tagActive: false,
+    rev: 1,
   });
-  const sessionId = r.tempIds!.ss;
-  await transact({ [sessionId]: { sid: sessionId } }); // sid = self, the bind selector
+  if (!created.ok) throw new Error(`session rejected: ${created.error.message}`);
+  const sessionId = created.entityId;
+  // sid = self, the bind selector. A patch through the same boundary, so the
+  // session cannot drift out of its schema after creation either.
+  const sid = await patchSchemaEntity(await sessionSchema(), sessionId, { sid: sessionId });
+  if (!sid.ok) throw new Error(`session sid rejected: ${sid.error.message}`);
   await writeFacet(sessionId, "status", STATUS_DOMAIN);
   await writeFacet(sessionId, "priority", PRIORITY_DOMAIN);
   await ensureBoardReactor();
@@ -225,7 +229,15 @@ export async function setFilter(h: SessionHandle, f: Filter, actor: string): Pro
   await writeFacet(h.sessionId, "status", f.status.length ? f.status : STATUS_DOMAIN);
   await writeFacet(h.sessionId, "priority", f.priority.length ? f.priority : PRIORITY_DOMAIN);
   await writeFacet(h.sessionId, "tag", f.tags);
-  await transact({ [h.sessionId]: { view: f.view, actor, tagActive: f.tags.length > 0, rev: Date.now() } });
+  const r = await patchSchemaEntity(await sessionSchema(), h.sessionId, {
+    view: f.view,
+    actor,
+    tagActive: f.tags.length > 0,
+    rev: Date.now(),
+  });
+  // `view` is an enum in the schema, so an unknown view is refused here rather
+  // than silently producing a board that matches nothing.
+  if (!r.ok) throw new Error(`filter rejected: ${r.error.message}`);
 }
 
 /** A qualifying action happened: bump `rev` so the stream pushes a fresh snapshot. */

@@ -5,28 +5,38 @@
 //   - schema-derived (generated): fields covered by a schema boundary. These
 //     carry a real guarantee — Stardust validates writes against the schema.
 //   - declared (below): fields we write OPEN-WORLD with no schema (edge/infra
-//     facts like kind/role/label/blocker). No engine guarantee — this is the
-//     app asserting its own conventions. Add a schema for any of them and they
-//     move to the generated half automatically, gaining the real guarantee.
+//     facts like kind/label/blocker). No engine guarantee — this is the app
+//     asserting its own conventions. Add a schema for any of them and they move
+//     to the generated half automatically, gaining the real guarantee — which is
+//     what just happened to role, persona, author and draft.
 
 import type { Ref, SchemaFieldTypes } from "./generated/schema-fields.ts";
 import { schemaValidators } from "./generated/schema-fields.ts";
 
 /** Open-world fields — declared by convention, not enforced by a schema. */
 interface DeclaredFields {
-  kind: "user" | "persona" | "workspace" | "grant" | "command" | "tag" | "dep" | "project";
+  // spans schematised and open-world entities alike — see FieldTypes below
+  kind:
+    | "user"
+    | "persona"
+    | "workspace"
+    | "grant"
+    | "command"
+    | "tag"
+    | "dep"
+    | "project"
+    | "session"
+    | "sf"
+    | "reactorRef"
+    | "schemaRef";
   name: string; // workspace / persona / project name
   email: string; // user login identity
   user: Ref; // persona → user
-  role: "owner" | "member";
   label: string; // tag label
   todo: Ref; // edge → todo
   blocker: Ref; // dep edge → blocker
-  persona: Ref; // grant → persona
   reactor: Ref; // workspace → its board reactor
   countsReactor: Ref; // workspace → its aggregate (counts) reactor
-  author: Ref; // todo → creating persona (row-level visibility)
-  draft: boolean; // todo visible only to its author until published
   adopts: boolean;
   cmdId: string;
   minRank: number;
@@ -36,11 +46,18 @@ interface DeclaredFields {
   order: number;
 }
 
-/** Full vocabulary = schema-derived ∪ declared. (No key overlap by design;
- *  a field meaning that genuinely varies by kind — e.g. project vs todo status
- *  — would need a union here, the one place Stardust's field-not-a-class model
- *  can bite.) */
-export interface FieldTypes extends SchemaFieldTypes, DeclaredFields {}
+/**
+ * Full vocabulary = schema-derived ∪ declared.
+ *
+ * `kind` is the one field that genuinely spans both halves, and it is the place
+ * Stardust's field-is-not-a-class model bites. Each schema pins it to a `const`
+ * discriminator, so the generator — seeing three different consts for one field —
+ * can only widen it to `unknown`; and even a union of those three would be wrong,
+ * because tags, deps, users and the rest carry a `kind` with no schema at all.
+ * The declared union below is the honest global type, so it wins here. Its
+ * validator likewise overrides the generated `() => true`.
+ */
+export interface FieldTypes extends Omit<SchemaFieldTypes, "kind">, DeclaredFields {}
 
 const isRef = (v: unknown) => typeof (v as { "#"?: unknown })?.["#"] === "number";
 export const validators: Record<string, (v: unknown) => boolean> = {
@@ -49,15 +66,11 @@ export const validators: Record<string, (v: unknown) => boolean> = {
   name: (v) => typeof v === "string",
   email: (v) => typeof v === "string",
   user: isRef,
-  role: (v) => v === "owner" || v === "member",
   label: (v) => typeof v === "string",
   todo: isRef,
   blocker: isRef,
-  persona: isRef,
   reactor: isRef,
   countsReactor: isRef,
-  author: isRef,
-  draft: (v) => typeof v === "boolean",
   adopts: (v) => typeof v === "boolean",
   cmdId: (v) => typeof v === "string",
   minRank: (v) => typeof v === "number",

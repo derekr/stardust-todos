@@ -11,17 +11,15 @@
 
 import { readFile } from "node:fs/promises";
 import type { WorkspaceCtx } from "./workspace.ts";
-import { lookupRef, putRef } from "./registry.ts";
+import { ensureSchema, lookupRef, putRef } from "./registry.ts";
 import { APP } from "./tenancy.ts";
 import {
   type CheckLast,
   type EntityId,
   type MergePatch,
   TxConflictError,
-  createSchema,
   createSchemaEntity,
   deleteEntity,
-  patchSchema,
   patchSchemaEntity,
   query,
   readEntity,
@@ -121,42 +119,14 @@ async function readState(): Promise<{ schemaId?: EntityId }> {
 export async function ensureTodoSchema(): Promise<EntityId> {
   if (schemaIdCache) return schemaIdCache;
 
-  let schemaId = await lookupRef("schemaRef", SCHEMA_NAME);
-  let adopted = false;
-  if (schemaId === undefined) {
-    // one-time migration: adopt the id the local state file remembers
+  // one-time migration: adopt the id an older checkout cached on disk, so
+  // upgrading records the existing schema instead of creating a second one.
+  if ((await lookupRef("schemaRef", SCHEMA_NAME)) === undefined) {
     const legacy = (await readState()).schemaId;
-    if (legacy && (await readSchema(legacy)).status === 200) {
-      schemaId = legacy;
-      adopted = true;
-    }
+    if (legacy && (await readSchema(legacy)).status === 200) await putRef("schemaRef", SCHEMA_NAME, legacy);
   }
-
-  if (schemaId && (await readSchema(schemaId)).status === 200) {
-    // In-place evolution of an existing single-tenant schema: add `workspace`,
-    // replace `required`. Merge-patch — existing todos are not migrated.
-    await patchSchema(schemaId, {
-      properties: {
-        workspace: { type: "object" },
-        app: { type: "string" },
-        status: { type: "string", enum: ["todo", "doing", "blocked", "done"] },
-        due: { type: "object" },
-        project: { type: "object" },
-        lastActor: { type: "string" },
-        author: { type: "object" },
-        draft: { type: "boolean" },
-      },
-      required: ["title", "done", "workspace", "app"],
-    });
-  } else {
-    schemaId = (await createSchema(TODO_SCHEMA)).schemaId;
-  }
-
-  if (adopted || (await lookupRef("schemaRef", SCHEMA_NAME)) === undefined) {
-    await putRef("schemaRef", SCHEMA_NAME, schemaId);
-  }
-  schemaIdCache = schemaId;
-  return schemaId;
+  schemaIdCache = await ensureSchema(SCHEMA_NAME, TODO_SCHEMA);
+  return schemaIdCache;
 }
 
 /**
