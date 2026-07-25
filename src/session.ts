@@ -23,13 +23,14 @@
 import {
   type EntityId,
   createSchemaEntity,
-  deleteEntity,
   patchSchemaEntity,
   query,
   readEntity,
   readResults,
+  transact,
 } from "./stardust.ts";
-import { facetSchema, sessionSchema } from "./schemas.ts";
+import { sessionSchema } from "./schemas.ts";
+import { validators } from "./field-registry.ts";
 import { ensureReactor } from "./reactors.ts";
 import type { Filter } from "./board.ts";
 import { APP } from "./tenancy.ts";
@@ -180,22 +181,48 @@ export function ensureBoardReactor(): Promise<EntityId> {
   return (reactorPromise ??= ensureReactor(BOARD_REACTOR, canonicalBody()).then((r) => r.id));
 }
 
-/** Rewrite one facet's `sf` entities (empty = the full domain, i.e. "all"). */
-async function writeFacet(sessionId: EntityId, facet: string, values: readonly string[]): Promise<void> {
+/**
+ * Rewrite ALL of a session's facets in ONE transaction.
+ *
+ * It used to be a delete-then-create loop per facet — roughly fifteen
+ * transactions for one filter click. Every one of them invalidated the board
+ * reactor, so a subscriber watching the bound results stream saw the half-written
+ * states go by: measured, a single filter change emitted six results with row
+ * counts 8, 3, 8, 1, 8, 3. One transaction means one recompute, straight to the
+ * final answer.
+ *
+ * The cost is that these rows no longer go through the `sf` schema — a transact
+ * writes facts unchecked, and there is no batch form of
+ * `POST /schemas/{id}/entities`. So the values are checked here first, against the
+ * SAME generated validators the schema produces. That is a weaker guarantee (the
+ * app asserting it, not the engine enforcing it) and worth knowing about; the
+ * session's own scalars still go through their schema below, which is where the
+ * enum that matters (`view`) lives.
+ */
+async function writeFacets(sessionId: EntityId, spec: { facet: string; values: readonly string[] }[]): Promise<void> {
   const existing = (await query({
     find: ["?f"],
     where: [
       ["?f", "kind", "sf"],
       ["?f", "session", { "#": sessionId }],
-      ["?f", "facet", facet],
     ],
   })) as [EntityId][];
-  await Promise.all(existing.map(([id]) => deleteEntity(id)));
-  const schemaId = await facetSchema();
-  for (const value of values) {
-    const r = await createSchemaEntity(schemaId, { kind: "sf", session: { "#": sessionId }, facet, value });
-    if (!r.ok) throw new Error(`facet rejected: ${r.error.message}`);
+
+  const patch: Record<string, Record<string, unknown>> = {};
+  // Retract the old rows in the same transaction that writes the new ones. An
+  // `sf` entity is exactly these four facts, so nulling them empties it, and it
+  // stops matching the reactor's `kind` clause.
+  for (const [id] of existing) patch[id] = { kind: null, session: null, facet: null, value: null };
+
+  let i = 0;
+  for (const { facet, values } of spec) {
+    if (!validators.facet(facet)) throw new Error(`unknown facet '${facet}'`);
+    for (const value of values) {
+      if (!validators.value(value)) throw new Error(`facet ${facet} value must be a string, got ${typeof value}`);
+      patch[`#_f${i++}`] = { kind: "sf", session: { "#": sessionId }, facet, value };
+    }
   }
+  await transact(patch);
 }
 
 // Bump `rev` to a fresh value so the reactor's top-level [?sess rev ?rev] clause
@@ -226,17 +253,21 @@ export async function createSession(
   // session cannot drift out of its schema after creation either.
   const sid = await patchSchemaEntity(await sessionSchema(), sessionId, { sid: sessionId });
   if (!sid.ok) throw new Error(`session sid rejected: ${sid.error.message}`);
-  await writeFacet(sessionId, "status", STATUS_DOMAIN);
-  await writeFacet(sessionId, "priority", PRIORITY_DOMAIN);
+  await writeFacets(sessionId, [
+    { facet: "status", values: STATUS_DOMAIN },
+    { facet: "priority", values: PRIORITY_DOMAIN },
+  ]);
   await ensureBoardReactor();
   return { sessionId, workspaceId };
 }
 
 /** Push the whole Filter into the session facts (+ view/actor/tagActive) and bump rev. */
 export async function setFilter(h: SessionHandle, f: Filter, actor: string): Promise<void> {
-  await writeFacet(h.sessionId, "status", f.status.length ? f.status : STATUS_DOMAIN);
-  await writeFacet(h.sessionId, "priority", f.priority.length ? f.priority : PRIORITY_DOMAIN);
-  await writeFacet(h.sessionId, "tag", f.tags);
+  await writeFacets(h.sessionId, [
+    { facet: "status", values: f.status.length ? f.status : STATUS_DOMAIN },
+    { facet: "priority", values: f.priority.length ? f.priority : PRIORITY_DOMAIN },
+    { facet: "tag", values: f.tags },
+  ]);
   const r = await patchSchemaEntity(await sessionSchema(), h.sessionId, {
     view: f.view,
     group: f.group, // display-only, but per-session state, so it lives here too

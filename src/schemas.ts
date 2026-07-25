@@ -50,6 +50,13 @@ const SESSION_SCHEMA = {
   additionalProperties: false,
 };
 
+/**
+ * Facets are no longer WRITTEN through this schema — they go out in one atomic
+ * transact (see session.ts writeFacets), and there is no batch form of the schema
+ * entity route. It stays declared because it is still the shape of record, and
+ * because `npm run gen:query` turns it into the `facet` and `value` validators
+ * that the atomic write checks against. Declared shape, app-side enforcement.
+ */
 const FACET_SCHEMA = {
   title: "SessionFacet",
   type: "object",
@@ -76,7 +83,6 @@ function idOf(name: string, doc: Record<string, unknown>): Promise<EntityId> {
 
 export const grantSchema = () => idOf("grant", GRANT_SCHEMA);
 export const sessionSchema = () => idOf("session", SESSION_SCHEMA);
-export const facetSchema = () => idOf("sf", FACET_SCHEMA);
 
 /** Everything `npm run stardust:setup` provisions, besides the Todo schema. */
 export const DECLARED_SCHEMAS = [
