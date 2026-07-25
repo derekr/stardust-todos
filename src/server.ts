@@ -75,12 +75,17 @@ import {
 
 /** Reactors the x-ray may hand out as RON: exactly the ones it documents. */
 /**
- * Values to substitute for a reactor's free vars, so a copied body RUNS.
+ * Bind values for a reactor's free vars, so a copied body RUNS as pasted.
  *
- * The console's lab takes a query and nothing else — there is no bind field — so a
- * body pasted with vars still free is not "unbound", it is a cartesian product over
- * every session/workspace/todo that matches. Pasting the board that way returns
- * every todo once per SESSION, which is how this was found.
+ * A query body carries its own `bind {…}` clause — the same mechanism as the
+ * `?bind=` query param, expressed in the document — so the body itself is left
+ * byte-identical to what is stored and the bind sits on top, visible and editable
+ * in the lab. That matters: the point of pasting into a playground is to change
+ * the input, and a substituted literal is no longer a parameter.
+ *
+ * Without one, a free var in a fact clause matches everything: the board pasted
+ * bare returns every todo once per SESSION (208 rows against 8), which is how this
+ * was found.
  *
  * `sid` and `todo` come from the page the x-ray was opened on, so what you paste is
  * scoped to what you were looking at; the rest come from the current workspace.
@@ -109,13 +114,11 @@ function runnableBinds(name: string, from: { sid?: string; todo?: string }): Rec
   }
 }
 
-/** Replace `?var` with a RON literal. The lookahead stops `?ws` eating `?wsBar`. */
-function bindInto(body: string, binds: Record<string, string>): string {
-  let out = body;
-  for (const [v, lit] of Object.entries(binds)) {
-    out = out.replace(new RegExp(`\\?${v}(?![A-Za-z0-9_])`, "g"), lit);
-  }
-  return out;
+/** Prepend the body's own `bind {…}` clause. Values are already RON literals. */
+function withBindClause(body: string, binds: Record<string, string>): string {
+  const pairs = Object.entries(binds);
+  if (!pairs.length) return body;
+  return `bind {${pairs.map(([k, v]) => `${k} ${v}`).join(" ")}}\n${body}`;
 }
 
 const RON_EXPORTABLE = new Set<string>([BOARD_REACTOR, ...DECLARED.map((d) => d.name)]);
@@ -705,7 +708,7 @@ const server = http.createServer(async (req, res) => {
           })
         : {};
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-      res.end(bindInto(body, binds));
+      res.end(withBindClause(body, binds));
       return;
     }
 

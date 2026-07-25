@@ -306,8 +306,9 @@ const SCRIPT = `
       run.addEventListener('click', function(){ copyRon(r, run, pre, true); });
       pop.appendChild(run);
       pop.appendChild(row('xr-bind',
-        'free vars: ' + r.bind + ' \u2014 the lab has no bind field, so the stored ' +
-        'body joins across EVERY match. "runnable" substitutes this page\u2019s ids.'));
+        'free vars: ' + r.bind + ' \u2014 pasted bare they match EVERYTHING (the board ' +
+        'returns every todo once per session). "runnable" prepends a bind {\u2026} ' +
+        'clause for this page, which the lab lets you edit.'));
     });
     pop.appendChild(row('xr-src', d.src));
     var r=el.getBoundingClientRect();
