@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { anyTodoExists, openBlockerExists, openTodoExists, visibleTo } from "./derive.ts";
+import { openBlockerExists, visibleTo } from "./derive.ts";
 import { effectiveStatus } from "./board.ts";
 import { validators } from "./field-registry.ts";
 import { validationPlan } from "./typed-query.ts";
@@ -23,13 +23,6 @@ test("openBlockerExists is a correlated $exists (capture binds the outer var)", 
   assert.equal(d.$exists.capture.t, "?t");
   assert.deepEqual(d.$exists.where[0], ["?e", "kind", "dep"]);
   assert.deepEqual(d.$exists.where.at(-1), ["!=", "?bs", "done"]);
-});
-
-test("project-rollup directives correlate on the project var", () => {
-  const open = openTodoExists("?p") as { $exists: { capture: Record<string, string> } };
-  const any = anyTodoExists("?p") as { $exists: { capture: Record<string, string> } };
-  assert.equal(open.$exists.capture.p, "?p");
-  assert.equal(any.$exists.capture.p, "?p");
 });
 
 test("effectiveStatus: blocked is derived, done wins over blocked", () => {

@@ -6,17 +6,17 @@
 // into the subquery — keys omit the leading "?"), and it's 0-safe: a row with
 // no match still appears, projected as `false`.
 //
-// Why this eliminates the worker: blocked-ness and project rollup are computed
-// on every READ, so they never need to be written back OR undone. The one thing
+// Why this eliminates the worker: blocked-ness is computed on every READ, so it
+// never needs to be written back OR undone. The one thing
 // Stardust can't do — reactively drive a join-derived state BACK when the
 // condition ceases (no correlated antijoin in `where`, no reactor auto-retract)
 // — simply never comes up, because nothing is materialized in the first place.
 
 /**
- * The correlated "open blocker" subquery, shared by BOTH the projection `$exists`
- * directive and the `where`-clause `exists`/`notExists` functions — a single
- * definition of "≥1 dependency on a not-done blocker", correlated on `todoVar`
- * via `capture`. (A bare fact `not`/multi-clause join can't express this; only a
+ * The correlated "open blocker" subquery — "≥1 dependency on a not-done blocker",
+ * correlated on `todoVar` via `capture`. This is the `$exists` PROJECTION form,
+ * used by dry-runs; src/queries.ts carries the same predicate in the bind-to-a-var
+ * form a reactor needs. (A bare fact `not`/multi-clause join can't express this; only a
  * captured subquery correlates per-row. Verified against 0.0.4: as a standalone
  * `where` clause `exists`/`notExists` correlates correctly, but the same subquery
  * does NOT correlate nested inside a `cond`/expression or a `scalar` — so this
@@ -40,28 +40,6 @@ function openBlockerSubquery(todoVar: string): object {
 /** $exists projection directive: TRUE iff `todoVar` has ≥1 not-done blocker. */
 export function openBlockerExists(todoVar: string): object {
   return { $exists: openBlockerSubquery(todoVar) };
-}
-
-/** $exists directive: TRUE iff `projVar` has ≥1 not-done todo. */
-export function openTodoExists(projVar: string): object {
-  const key = projVar.slice(1);
-  return {
-    $exists: {
-      capture: { [key]: projVar },
-      find: ["?t"],
-      where: [
-        ["?t", "project", projVar],
-        ["?t", "status", "?s"],
-        ["!=", "?s", "done"],
-      ],
-    },
-  };
-}
-
-/** $exists directive: TRUE iff `projVar` has ≥1 todo at all. */
-export function anyTodoExists(projVar: string): object {
-  const key = projVar.slice(1);
-  return { $exists: { capture: { [key]: projVar }, find: ["?t"], where: [["?t", "project", projVar]] } };
 }
 
 // ---------------------------------------------------------------------------
