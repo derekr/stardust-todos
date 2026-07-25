@@ -10,10 +10,12 @@
 // var NAME it does not know (`unknown bind var ?scoop`), but usually not an ABSENT
 // one — a var a FACT CLAUSE would bind matches everything instead, so a caller who
 // forgets `ws` gets the whole database back, ordered, looking perfectly healthy.
-// The exception is a var read by an EXPRESSION, which errors rather than matching
-// (see the command reactors below). Every read here passes its scope regardless;
-// where the over-broad answer would be an AUTHORIZATION answer the `Declared` is
-// not exported at all and the reader takes its scope as a required argument.
+// The exception is a var read by an EXPRESSION, which cannot widen the answer: it
+// errors, or returns a subset if no row ever reaches the predicate (see the
+// command reactors below, and AGENTS.md for the measured limits). Every read here
+// passes its scope regardless; where the over-broad answer would be an
+// AUTHORIZATION answer the `Declared` is not exported at all and the reader takes
+// its scope as a required argument.
 
 import type { Scope } from "./commands.ts";
 import { visibleTo } from "./derive.ts";
@@ -123,8 +125,15 @@ export const blockedByTodo = define("todo-blocks", {
 // two specifically. An ordinary fact clause BINDS its var by scanning, so an
 // omitted bind silently matches everything; an expression predicate only filters
 // rows that already exist, so it cannot invent `?rank` and the read fails with
-// `unbound input var ?rank`. The gate therefore fails CLOSED — it cannot be
-// forgotten quietly, which is the property a write boundary wants. See AGENTS.md.
+// `unbound input var ?rank`. The gate therefore fails CLOSED, which is the
+// property a write boundary wants.
+//
+// Precisely: that error is raised when the predicate is EVALUATED, so it needs a
+// candidate row to reach it. Here one always does — the catalog is seeded at
+// startup, and an empty catalog would return no commands to authorize anyway — but
+// the general rule is weaker than "an absent bind always errors". It is "an absent
+// expression-only bind never widens the answer". See AGENTS.md for where that
+// distinction bites (`visibleTo`).
 
 /** Commands of ONE scope that a rank may SEE, ordered — the ⌘K palette and the
  *  per-todo ••• menu are this one reactor read with a different bind.

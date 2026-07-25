@@ -97,19 +97,36 @@ not an error. Guard it by not exporting the `Declared` and taking the value as a
 required function argument, so the compiler asks the question instead — see
 `visibleCommands` in `src/queries.ts`.
 
-**In an expression, an absent bind is an error.** A predicate like `[">=",
-"?rank", "?minRank"]` filters rows that already exist; it cannot scan facts or
-create a variable. Omit the bind and the read fails outright:
+**In an expression, an absent bind never widens the answer.** A predicate like
+`[">=", "?rank", "?minRank"]` filters rows that already exist; it cannot scan
+facts or create a variable. Omit the bind and the read usually fails outright:
 
 ```
 query_failed: unbound input var ?rank; ?rank is read by an expression before any
 earlier where, bind, or scalar clause binds it.
 ```
 
-So a gate expressed as an expression over a bind FAILS CLOSED, which is why the
-command authorization check is shaped that way — forgetting `?rank` cannot
-quietly return every command. Prefer that shape when the bind is what makes an
-answer safe rather than merely narrow.
+So a gate expressed this way FAILS CLOSED, which is why the command
+authorization check is shaped that way — forgetting `?rank` cannot quietly
+return every command. Guards built this way hold under rephrasing: comparing
+directly, binding the comparison to a var and testing it, and wrapping it in
+`not` were all measured, and all refuse the omitted bind.
+
+**But the check is EVALUATION-time, not plan-time — it needs a row to reach the
+predicate.** This is the part to be careful about, because the same reactor with
+the same missing bind can error or not depending on the DATA:
+
+- Zero candidate rows: silent empty result, no error.
+- An `or` that short-circuits before reaching the var: no error. Measured on
+  `visibleTo`'s exact shape (`published OR mine`) — with only published rows
+  present, an omitted `?viewer` returned the published row happily; adding a
+  single DRAFT row made the identical read start erroring.
+
+The invariant that always held is the useful one: **an omitted expression-only
+bind yields an error or a subset, never a superset.** So it is a real safety
+property but not a reliable "this argument is required" — do not treat an
+error-free read as proof the bind was supplied. `visibleTo` in `src/derive.ts`
+sits exactly here today.
 
 ## The tension is the point — record it, don't resolve it silently
 
