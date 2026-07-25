@@ -82,21 +82,23 @@ await counts.read({ ws: {"#": ctx.workspaceId},
   },
   visibility: {
     title: "Draft visibility — an app predicate, server-side",
-    mech: "Stardust does authentication, not authorization — so row-level visibility is an APP predicate: a todo is visible if it's published OR you authored it. On the board the viewer is a FACT on the session, so the rule is an expression-`or` over two bound vars and the browser never sends a persona id at all — it holds only a reactor id and a sid, so it cannot widen the scope. The counts and tag queries apply the same rule as a dry-run with the persona injected server-side. Either way it's join-free, it paginates, and hidden rows never cross the wire.",
-    code: `// In the board reactor — ?viewer comes from the session's own facts:
-["?sess", "viewer", "?viewer"],
-["?t", "draft", "?draft"], ["?t", "author", "?author"],
-["or", ["=", "?draft", false], ["=", "?author", "?viewer"]],
-
-// Same rule for the counts/tags dry-runs, persona injected server-side:
-function visibleTo(personaId) {
+    mech: "Stardust does authentication, not authorization — so row-level visibility is an APP predicate: a todo is visible if it's published OR you authored it. ONE definition of that rule (visibleTo) serves every read. On the board the viewer is a FACT on the session; on the counts/options reactors it is a per-read bind. Either way the rule is an expression-`or` over two bound vars, the browser never sends a persona id — it holds only a reactor id and a sid, so it cannot widen the scope — and it stays join-free, paginates, and keeps hidden rows off the wire.",
+    code: `// One rule. A "?var" leaves the viewer to a per-read bind (reactors);
+// a persona id pins it into the query (one-shot dry-runs).
+function visibleTo(viewer) {
+  const who = typeof viewer === "number" ? { "#": viewer } : viewer;
   return [
     ["?t", "draft", "?draft"],
     ["?t", "author", "?author"],
-    ["or", ["=", "?draft", false],
-           ["=", "?author", { "#": personaId }]],
+    ["or", ["=", "?draft", false], ["=", "?author", who]],
   ];
-}`,
+}
+
+// board reactor — ?viewer comes from the session's own facts:
+["?sess", "viewer", "?viewer"], ...visibleTo("?viewer")
+
+// counts / todo-options reactors — supplied at read time:
+await counts.read({ ws: {"#": wsId}, viewer: {"#": personaId} });`,
     src: "src/session.ts · canonicalBody() · src/derive.ts · visibleTo() (bound as ?viewer in src/queries.ts)",
   },
   "detail-meta": {
