@@ -179,6 +179,7 @@ Highlights of the later stages:
 - `src/derive.ts`        — the correlated `exists` fragments (blocked, visibility).
 - `src/session.ts`       — the search session + the ONE canonical board reactor.
 - `src/queries.ts`       — the declared reactors (one definition each, typed readers out).
+- `src/indexes.ts`       — value-index policy for the fields those reactors key on.
 - `src/commands.ts`      — commands as entities; the role gate lives in the query.
 - `src/cli.ts`           — the CLI (operates in the default workspace).
 - `src/server.ts`        — Node HTTP + Datastar web server (CQRS + workspace switching).

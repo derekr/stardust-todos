@@ -128,6 +128,33 @@ property but not a reliable "this argument is required" — do not treat an
 error-free read as proof the bind was supplied. `visibleTo` in `src/derive.ts`
 sits exactly here today.
 
+## Matching a VALUE is not indexed until you say so
+
+The built-in read paths cover entities, transactions, fields and backlinks. None of
+them covers "this field equals this value": the field path is ordered by entity and
+transaction, so a clause like `["?c", "kind", "command"]` — or a `?sid` supplied as
+a bind — scans every fact of that field and filters the payload. The lab's explain
+says so per clause: `not component-indexed`, with an FET scan count next to it.
+
+Value indexes are opt-in per field (`PUT`/`PATCH /indexes/{field}`, ETag-guarded);
+only UTC, duration and UUID components promote automatically. Measured on the demo
+data by toggling the whole set off and back on:
+
+| board reactor | indexed | not indexed |
+| --- | --- | --- |
+| dry-run p50 | 27ms | 54ms |
+| stored read p50 | 29ms | 54ms |
+
+`src/indexes.ts` holds the list and `npm run stardust:setup` provisions it, so it
+is policy in code rather than something done by hand to one database. The list is
+the fields the reactors KEY on — matched as a constant, supplied as a bind, or used
+as a join key. Fields only read out of an already-matched row (`title`, `order`,
+`danger`) are deliberately absent: projection does not need a value index, and the
+docs are explicit that each one costs write work and storage.
+
+Worth knowing: reading a stored reactor with a bind costs about the same as the
+equivalent dry-run. A stored reactor is not a cache you read for free.
+
 ## The tension is the point — record it, don't resolve it silently
 
 Pushing everything into Stardust is not automatically right, and finding where it

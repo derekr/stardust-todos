@@ -8,6 +8,7 @@
 // deploy fails here rather than on a user's first request.
 
 import { type Provisioned, ensureReactor } from "../src/reactors.ts";
+import { KEYED_FIELDS, ensureValueIndex } from "../src/indexes.ts";
 import { ensureSchema } from "../src/registry.ts";
 import { DECLARED } from "../src/queries.ts";
 import { DECLARED_SCHEMAS } from "../src/schemas.ts";
@@ -40,6 +41,13 @@ async function main() {
   for (const r of REACTORS) {
     const { id, status } = await r.provision();
     console.log(`  ${MARK[status]}  ${r.name.padEnd(12)} #${id}`);
+  }
+  // Value indexes last: they are policy over fields the reactors above match on,
+  // and a rebuild reads canonical facts, so there is nothing to gain by doing it
+  // before the queries that need it exist.
+  for (const f of KEYED_FIELDS) {
+    const state = await ensureValueIndex(f);
+    console.log(`  ${state === "enabled" ? MARK.created : MARK.current}  index ${f}`);
   }
   console.log("\nreactors provisioned.");
 }
