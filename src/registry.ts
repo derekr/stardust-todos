@@ -19,7 +19,15 @@
 import { type EntityId, createSchema, patchSchema, query, readSchema, refId, transact } from "./stardust.ts";
 import { APP } from "./tenancy.ts";
 
-/** What a marker points at. One kind per sort of provisioned thing. */
+/**
+ * What a marker points at. One kind per sort of provisioned thing.
+ *
+ * These two are the one place in this app where `kind` is genuinely load-bearing
+ * rather than redundant: every other family is identifiable by its field shape
+ * (a dep is "has todo and blocker"), but a reactorRef and a schemaRef are
+ * structurally IDENTICAL — same app, name and target — so the tag is the only
+ * thing separating them. Don't "simplify" it away.
+ */
 export type RefKind = "reactorRef" | "schemaRef";
 
 /** The entity previously provisioned under this (kind, name), if any. */
@@ -36,7 +44,14 @@ export async function lookupRef(kind: RefKind, name: string): Promise<EntityId |
   return rows.length ? refId(rows[0][1]) : undefined;
 }
 
-/** Record that `target` is the thing called `name`. */
+/**
+ * Record that `target` is the thing called `name`.
+ *
+ * The marker carries `app` so a shared database can host more than one app. Note
+ * the hazard that created: a backfill scoped to `app` alone matches markers too,
+ * and one in todos.ts stamped `author`/`draft`/`lastActor` onto every one of them
+ * before it was scoped to entities that actually have a `title`.
+ */
 export async function putRef(kind: RefKind, name: string, target: EntityId): Promise<void> {
   await transact({ "#_ref": { kind, app: APP, name, target: { "#": target } } });
 }

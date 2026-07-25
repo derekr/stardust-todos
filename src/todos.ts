@@ -226,6 +226,7 @@ export async function migrateVisibilityFields(ownerPersonaId: EntityId): Promise
     find: ["?t"],
     where: [
       ["?t", "app", APP],
+      ["?t", "title", "?title"], // a todo has a title — `app` alone also matches infra markers
       ["not", ["?t", "author", "?a"]],
     ],
   })) as [EntityId][];
@@ -284,6 +285,7 @@ export async function backfillActor(): Promise<number> {
     find: ["?t"],
     where: [
       ["?t", "app", APP],
+      ["?t", "title", "?title"], // ditto — never stamp lastActor onto a marker
       ["not", ["?t", "lastActor", "?a"]],
     ],
   })) as [EntityId][];
@@ -348,6 +350,7 @@ export async function migrateOrphanTodos(ctx: WorkspaceCtx): Promise<number> {
     find: ["?t"],
     where: [
       ["?t", "app", APP],
+      ["?t", "title", "?title"], // ditto — a marker has no workspace and needs none
       ["not", ["?t", "workspace", "?w"]],
     ],
   })) as [EntityId][];
