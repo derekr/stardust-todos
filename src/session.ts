@@ -297,10 +297,12 @@ export async function readSnapshot(h: SessionHandle): Promise<SnapshotRow[]> {
  * session's `rev` changes or a todo field in the reactor's top-level `where` moves,
  * so the server does not have to notice anything itself.
  *
- * What it will NOT push: a write to an entity the reactor only reaches through a
- * bound `exists` subquery — a new tag edge, verified, even when that edge changes
- * which rows match. Treat the board as a snapshot that advances on rev and on
- * direct field changes.
+ * The one measured gap is TAG edges. Adding a tag pushes nothing — verified from a
+ * background script and again with the tag filter active, so even an edge that
+ * changes which rows match is invisible here. DEP edges do push (measured twice),
+ * as do todo field writes from anywhere including the CLI, so this is narrower than
+ * "subqueries don't invalidate": it is specifically the tag path. Treat the board as
+ * a snapshot that advances on rev, on field writes, and on dependency changes.
  */
 export async function watchSnapshot(
   h: SessionHandle,

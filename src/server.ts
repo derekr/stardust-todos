@@ -449,10 +449,10 @@ const server = http.createServer(async (req, res) => {
         // snapshot, then one per change to this todo's facts. So the repaint trigger
         // is a subscription rather than app code sifting the commit bus.
         //
-        // Narrower than the tripwire it replaces, deliberately: it fires for THIS
-        // todo's fields, not for a new tag edge or a blocker's status. The browser
-        // that makes such a change repaints from its own request; another browser
-        // sees it on next load.
+        // Narrower than the tripwire it replaces, deliberately: the scope is this
+        // entity's own facts, so a new tag edge or a blocker's status change does not
+        // land here. The browser that makes such a change repaints from its own
+        // request; another browser sees it on next load.
         while (!closed) {
           await sendDetail(stream, id); // paint, then repaint per pushed snapshot
           await watchEntity(id, () => void sendDetail(stream, id).catch(() => {}), ac.signal);
