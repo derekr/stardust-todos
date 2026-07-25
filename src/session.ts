@@ -291,7 +291,7 @@ export async function readSnapshot(h: SessionHandle): Promise<SnapshotRow[]> {
  * TOP-LEVEL clauses are the reliable trigger, and they cover rows that did not
  * exist when the stream opened: a brand-new entity the top-level clauses match
  * invalidates too, and only for the binds it actually matches (measured on the
- * `command-catalog` reactor — see AGENTS.md, "What a subscription pushes").
+ * `command-menu` reactor — see AGENTS.md, "What a subscription pushes").
  *
  * The one measured gap is TAG edges. Adding a tag pushes nothing — verified from a
  * background script and again with the tag filter active, so even an edge that

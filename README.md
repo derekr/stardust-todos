@@ -140,10 +140,13 @@ Highlights of the later stages:
   + `then.project`), not in TS.
 - One schema write creates a reactor-ready todo (`workspace` + `app` are schema
   fields) instead of a create-then-tag pair.
-- Even the command surface is data: commands are entities, and the ⌘K palette and
-  the per-todo ••• menu are ONE stored reactor read with `?bind={scope …}` — the
-  narrowing and the ordering are Stardust's, not a `.filter()`. The same catalog
-  is re-read at the write boundary, so the menu and the permission cannot drift.
+- Even the command surface is data, and so is the permission check: commands are
+  entities, and the viewer's RANK is a bind, so `[">=", "?rank", "?minRank"]` is a
+  clause rather than a pass over the results. The ⌘K palette and the per-todo •••
+  menu are ONE reactor read with `{scope … rank …}`, returning only what that
+  persona may see; the write boundary asks a second reactor for one command at one
+  rank, where an EMPTY result is the denial. Menu and permission cannot drift
+  because neither re-derives the verdict.
 - Stardust's expression engine is **bounded and fails closed** (AST depth, macro
   depth, higher-order fuel, output-list size — see docs `expressions/limits`), so
   it's safe to push aggregation/projection server-side without app-side guards.
@@ -176,7 +179,7 @@ Highlights of the later stages:
 - `src/derive.ts`        — the correlated `exists` fragments (blocked, visibility).
 - `src/session.ts`       — the search session + the ONE canonical board reactor.
 - `src/queries.ts`       — the declared reactors (one definition each, typed readers out).
-- `src/commands.ts`      — commands as entities: the scoped catalog + the role projection.
+- `src/commands.ts`      — commands as entities; the role gate lives in the query.
 - `src/cli.ts`           — the CLI (operates in the default workspace).
 - `src/server.ts`        — Node HTTP + Datastar web server (CQRS + workspace switching).
 - `src/view.ts`          — server-rendered HTML: `#wsbar` switcher + morph-friendly `#list`.

@@ -1,13 +1,19 @@
 // A data-driven command catalog.
 //
-// Commands are Stardust ENTITIES (kind:"command"), not hardcoded UI. A single
-// projection turns the catalog + the current persona's role into per-command
-// state {visible, enabled, reason}. The SAME projection feeds every surface
-// (contextual menu, toolbar button, command palette) AND the write boundary —
-// so the menu you see and the mutation you're allowed can never drift, and
-// changing access is a fact write, not a deploy.
+// Commands are Stardust ENTITIES (kind:"command"), not hardcoded UI, and the role
+// gate is a clause in the query rather than a pass over the results. Two reactors
+// share it: `command-menu` returns what a rank may SEE (contextual menu, toolbar,
+// ⌘K palette) and `command-authz` returns a command only if that rank may RUN it.
+// So the menu you see and the mutation you're allowed cannot drift — they compare
+// the same `minRank` the same way — and changing access is a fact write, not a
+// deploy.
+//
+// What remains on this side is the role HIERARCHY (any < member < owner) and the
+// denial copy. The hierarchy is the more interesting leftover: while the app turns
+// a role into a rank, "who may do what" is still partly TypeScript. Making ranks
+// facts would finish the job, and is why `roleRank` is the only logic here.
 
-import { commandsInScope } from "./queries.ts";
+import { commandAuthzRows, commandMenuRows } from "./queries.ts";
 import type { Role } from "./tenancy.ts";
 import { query as tquery } from "./typed-query.ts";
 
@@ -26,60 +32,68 @@ export interface CommandDef {
   order: number;
 }
 
-export interface ProjectedCommand extends CommandDef {
+/**
+ * A command as a menu renders it — deliberately NOT `CommandDef` plus flags.
+ *
+ * There is no `visible` field because the query no longer returns rows this
+ * persona may not see, so nothing downstream has a visibility test to forget.
+ * `minRank`, `showWhenDenied` and `order` are gone for the same reason: they are
+ * inputs to a decision Stardust has already made.
+ */
+export interface ProjectedCommand {
+  cmdId: string;
+  label: string;
   enabled: boolean;
-  visible: boolean;
-  reason: string;
+  danger: boolean;
+  reason: string; // why it is disabled; "" when enabled
 }
 
 /**
- * All command entities of a scope, ordered.
+ * The commands of a scope this role may SEE, ordered, already projected.
  *
- * This was a dry-run that fetched BOTH scopes and threw half the rows away in TS.
- * It is now the `command-catalog` reactor read with `?scope` bound, so Stardust
- * does the narrowing and the ordering — and the ⌘K palette and the ••• menu are
- * one stored definition read two ways.
+ * This began as a dry-run over both scopes plus a `.filter()`, then became a
+ * scoped reactor plus a `project()` pass. Both halves are now the `command-menu`
+ * reactor read with `?scope` and `?rank` bound: the rank comparison, the
+ * visibility rule and the ordering all happen in the engine, and what comes back
+ * is already the rows this persona is allowed to see.
  *
- * The six columns are scalar fields, so the reactor's row type is inferred from
- * its literal as exactly [string, string, number, boolean, boolean, number] —
- * `CommandDef` minus the `scope` the caller just passed in, which is why `scope`
- * is added back here rather than projected out of the query.
+ * What stays here is the part that is not a fact about access: `reason` is UI
+ * copy, so it is derived from `minRank` on this side rather than embedded in a
+ * stored query where changing a string would be a reactor patch.
  */
-export async function catalog(scope: Scope): Promise<CommandDef[]> {
-  const rows = await commandsInScope(scope);
-  return rows.map(([cmdId, label, minRank, showWhenDenied, danger, order]) => ({
-    cmdId,
-    label,
-    minRank,
-    showWhenDenied,
-    danger,
-    scope,
-    order,
-  }));
+export async function visibleCommands(scope: Scope, role: Role | null): Promise<ProjectedCommand[]> {
+  const rows = await commandMenuRows(scope, roleRank(role));
+  return rows.map(([cmdId, label, minRank, row, danger]) => {
+    // `?enabled` is an expression result, not a schema field, so the row type
+    // cannot infer it. Narrow rather than assert: anything but a literal true
+    // renders as denied, which is the safe direction for a permission flag.
+    const enabled = row === true;
+    return {
+      cmdId,
+      label,
+      enabled,
+      danger,
+      reason: enabled ? "" : minRank >= 2 ? "Owner only" : "Members only",
+    };
+  });
 }
 
-/** Project the catalog for one role: compute visible/enabled/reason. */
-export function project(cmds: CommandDef[], role: Role | null): ProjectedCommand[] {
-  const rank = roleRank(role);
-  return cmds
-    .map((c) => {
-      const enabled = rank >= c.minRank;
-      const reason = enabled ? "" : c.minRank >= 2 ? "Owner only" : "Members only";
-      return { ...c, enabled, visible: enabled || c.showWhenDenied, reason };
-    })
-    .filter((c) => c.visible);
-}
-
-/** The write-boundary check — reads the SAME catalog + role.
+/** The write-boundary check: the authorization decision IS the query.
  *
- *  A cmdId names one command, but the reactor is scoped, so "the whole catalog"
- *  is now two bound reads rather than one unfiltered one. That is the trade for
- *  making the unbound read unreachable, and it is a menu-sized query. */
+ *  `command-authz` returns the command only when `?rank` clears its `minRank`, so
+ *  this no longer reads a catalog and re-derives the verdict — an empty result IS
+ *  the denial. Unknown and denied are both empty, which is the distinction this
+ *  function never made anyway.
+ *
+ *  The gate cannot be bypassed by forgetting the bind: `?rank` is read by an
+ *  expression, so an absent bind fails the read outright instead of matching
+ *  every row (measured; see AGENTS.md). */
 export async function authorizeCommand(cmdId: string, role: Role | null): Promise<CommandDef | null> {
-  const all = [...(await catalog("global")), ...(await catalog("todo"))];
-  const c = all.find((x) => x.cmdId === cmdId);
-  if (!c || roleRank(role) < c.minRank) return null; // denied or unknown
-  return c;
+  const rows = await commandAuthzRows(cmdId, roleRank(role));
+  const row = rows[0];
+  if (!row) return null; // denied or unknown — indistinguishable, by design
+  const [id, label, minRank, showWhenDenied, danger, scope, order] = row;
+  return { cmdId: id, label, minRank, showWhenDenied, danger, scope: scope as Scope, order };
 }
 
 /** Seed the catalog + a member persona (idempotent). Returns nothing. */

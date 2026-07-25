@@ -64,8 +64,11 @@ contract. It is measured, not assumed, and the README points here for it.
 Writing a field named in the reactor's top-level `where` re-emits: a priority
 change, a status change, a retraction and a publish each produced exactly one
 emission. So does a brand-new ENTITY that those clauses match. Creating a
-`command` fact set pushed to an open `command-catalog` subscription immediately,
-with nothing watching the commit bus.
+`command` fact set pushed to an open `command-menu` subscription immediately, with
+nothing watching the commit bus, and so did changing an existing command's
+`minRank` — which is what makes "changing access is a fact write, not a deploy"
+literally true. Expression clauses in the body do not suppress this: that reactor
+computes `enabled`/`visible` with `>=` and `or`, and still woke on both writes.
 
 **That push is bind-scoped.** Two subscriptions on that one reactor, `{scope
 'global'}` and `{scope 'todo'}`, were woken separately: a new global command
@@ -81,10 +84,32 @@ through a bound `exists`, so "subqueries don't invalidate" is the wrong lesson.
 The rule that has never missed is the first one: reason about what appears as a
 top-level clause. If liveness matters for a fact, put it there.
 
-The counterpart trap is the same asymmetry in the other direction: Stardust
-rejects a bind var name it does not know, but never an ABSENT one — an unbound var
-matches everything and the over-broad result looks healthy. See `commandsInScope`
-in `src/queries.ts` for the shape of the guard.
+## An omitted bind is usually silent, and once is not
+
+Stardust rejects a bind var NAME it does not know (`unknown bind var ?scoop`).
+What it does with an ABSENT bind depends on where the var is read, and the
+difference decides whether a forgotten argument is loud or dangerous.
+
+**In a fact clause, an absent bind matches everything.** `["?c", "scope",
+"?scope"]` binds `?scope` by scanning, so omitting it returns both scopes,
+ordered, looking perfectly healthy. This is the trap: the failure is a superset,
+not an error. Guard it by not exporting the `Declared` and taking the value as a
+required function argument, so the compiler asks the question instead — see
+`visibleCommands` in `src/queries.ts`.
+
+**In an expression, an absent bind is an error.** A predicate like `[">=",
+"?rank", "?minRank"]` filters rows that already exist; it cannot scan facts or
+create a variable. Omit the bind and the read fails outright:
+
+```
+query_failed: unbound input var ?rank; ?rank is read by an expression before any
+earlier where, bind, or scalar clause binds it.
+```
+
+So a gate expressed as an expression over a bind FAILS CLOSED, which is why the
+command authorization check is shaped that way — forgetting `?rank` cannot
+quietly return every command. Prefer that shape when the bind is what makes an
+answer safe rather than merely narrow.
 
 ## The tension is the point — record it, don't resolve it silently
 
@@ -104,6 +129,18 @@ worth reading before you re-litigate one:
 - `kind` is redundant for ten of eleven entity families — the field shape already
   identifies them. It stays because the redundancy is cheap insurance against a
   future entity carrying the same fields.
+- The command role gate moved INTO the query, the denial copy did not. `[">=",
+  "?rank", "?minRank"]` belongs there because it is the rule; "Owner only" does
+  not, because changing a string should not be a reactor patch, and English in a
+  stored query cannot be localised. The line drawn was rule-in, copy-out.
+- That gate cost lines rather than saving them: the two command reactors are
+  longer than the `project()` they replaced. It was taken for the fail-closed
+  bind and for one definition serving menu and write boundary, NOT for brevity —
+  the same trade as promoting the per-render queries. Expect it again.
+- The role HIERARCHY is still TypeScript (`roleRank`: any < member < owner). The
+  app turns a role into a rank and Stardust compares it, so half of "who may do
+  what" is still a deploy away. Making ranks facts is the obvious next step and
+  was deliberately not bundled in.
 
 When you make one of these calls, say which way you went and why in the commit
 message. A reversed decision is fine; an unrecorded one gets made again.

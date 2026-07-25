@@ -7,12 +7,13 @@
 //
 // Everything a caller used to pass as a literal (`{"#": ctx.workspaceId}`) is now
 // a var the reader binds. Note the asymmetry that creates: Stardust rejects a bind
-// var NAME it does not know (`unknown bind var ?scoop`), but never an ABSENT bind —
-// an unbound var matches everything, so a caller who forgets `ws` gets the whole
-// database back, ordered, looking perfectly healthy. Every read below passes its
-// scope; where the over-broad answer would be an AUTHORIZATION answer the
-// `Declared` is not exported at all, and the only reader takes the scope as a
-// required argument (see `commandsInScope`).
+// var NAME it does not know (`unknown bind var ?scoop`), but usually not an ABSENT
+// one — a var a FACT CLAUSE would bind matches everything instead, so a caller who
+// forgets `ws` gets the whole database back, ordered, looking perfectly healthy.
+// The exception is a var read by an EXPRESSION, which errors rather than matching
+// (see the command reactors below). Every read here passes its scope regardless;
+// where the over-broad answer would be an AUTHORIZATION answer the `Declared` is
+// not exported at all and the reader takes its scope as a required argument.
 
 import type { Scope } from "./commands.ts";
 import { visibleTo } from "./derive.ts";
@@ -113,42 +114,82 @@ export const blockedByTodo = define("todo-blocks", {
   then: { project: { title: "?bt" } },
 } as const);
 
-/** Every command entity of ONE scope, ordered — the ⌘K palette and the per-todo
- *  ••• menu are the same reactor read with a different bind.
+// ---------------------------------------------------------------------------
+// Commands. The role gate is IN the query: both reactors below take `?rank` and
+// compare it against each command's `minRank`, so "may this persona run this"
+// is answered by Stardust rather than reconstructed in TypeScript afterwards.
+//
+// `?rank` is read by an expression, and that changes the bind hazard for these
+// two specifically. An ordinary fact clause BINDS its var by scanning, so an
+// omitted bind silently matches everything; an expression predicate only filters
+// rows that already exist, so it cannot invent `?rank` and the read fails with
+// `unbound input var ?rank`. The gate therefore fails CLOSED — it cannot be
+// forgotten quietly, which is the property a write boundary wants. See AGENTS.md.
+
+/** Commands of ONE scope that a rank may SEE, ordered — the ⌘K palette and the
+ *  per-todo ••• menu are this one reactor read with a different bind.
  *
- *  `?scope` is deliberately absent from `find`: the reader supplies it, so the row
- *  is exactly a `CommandDef` minus its scope. It stays an ordinary top-level
- *  clause, which is what makes a NEW command entity push to a subscriber bound to
- *  that scope — and to that scope only (measured; see AGENTS.md). Nothing
- *  subscribes today, the menus read per render, but the shape is what would make
- *  a live catalog free. */
-const commandCatalog = define("command-catalog", {
-  find: ["?cmdId", "?label", "?minRank", "?showWhenDenied", "?danger", "?order"],
+ *  `visible` is `enabled || showWhenDenied`: a command the persona cannot run
+ *  still appears greyed when it is meant to advertise itself, and vanishes
+ *  entirely otherwise. Both the filter and the ordering are the engine's.
+ *
+ *  `?minRank` stays in `find` even though the gate already used it, because the
+ *  DENIAL COPY is derived from it app-side ("Owner only" vs "Members only").
+ *  That copy is UI text and deliberately does not live in the reactor.
+ *
+ *  `?scope` is an ordinary top-level clause, which is what makes a NEW command
+ *  entity push to a subscriber bound to that scope — and to that scope only
+ *  (measured; see AGENTS.md). Nothing subscribes today, the menus read per
+ *  render, but the shape is what would make a live catalog free. */
+const commandMenu = define("command-menu", {
+  find: ["?cmdId", "?label", "?minRank", "?enabled", "?danger", "?order"],
   where: [
     ["?c", "kind", "command"],
     ["?c", "scope", "?scope"],
-    ["?c", "cmdId", "?cmdId"],
-    ["?c", "label", "?label"],
     ["?c", "minRank", "?minRank"],
     ["?c", "showWhenDenied", "?showWhenDenied"],
+    [[">=", "?rank", "?minRank"], "?enabled"],
+    [["or", "?enabled", "?showWhenDenied"], "?visible"],
+    ["=", "?visible", true],
+    ["?c", "cmdId", "?cmdId"],
+    ["?c", "label", "?label"],
     ["?c", "danger", "?danger"],
     ["?c", "order", "?order"],
   ],
   orderBy: ["?order"],
 } as const);
 
-/**
- * The catalog of one scope. The scope is a required ARGUMENT, not a bind the
- * caller assembles, and that is the whole guard: the reactor above is unexported,
- * so there is no way to reach `.read({})`.
+/** ONE command, returned only if this rank may RUN it — the write boundary.
  *
- * Why bother, when every other reader here just passes a bind — because this one
- * feeds `authorizeCommand`, and Stardust will not complain. A misspelled bind var
- * is an error; an OMITTED one is not. It simply leaves `?scope` free, and the
- * reactor then returns every command in BOTH scopes, in order, looking entirely
- * healthy. A missing function argument is the same mistake the compiler catches.
+ *  Not scoped: a cmdId names one command wherever it lives. A denied command and
+ *  an unknown one are both the empty result, which is exactly the distinction the
+ *  caller already declined to make. */
+const commandAuthz = define("command-authz", {
+  find: ["?cmdId", "?label", "?minRank", "?showWhenDenied", "?danger", "?scope", "?order"],
+  where: [
+    ["?c", "kind", "command"],
+    ["?c", "cmdId", "?cmdId"],
+    ["?c", "minRank", "?minRank"],
+    [">=", "?rank", "?minRank"],
+    ["?c", "label", "?label"],
+    ["?c", "showWhenDenied", "?showWhenDenied"],
+    ["?c", "danger", "?danger"],
+    ["?c", "scope", "?scope"],
+    ["?c", "order", "?order"],
+  ],
+} as const);
+
+/**
+ * Both readers take their scope as required ARGUMENTS rather than a bind the
+ * caller assembles, and the `Declared`s above are unexported so `.read({})` is
+ * unreachable. `?rank` now fails closed on its own, but `?scope` and `?cmdId` are
+ * fact-clause vars and still do not: omit `?scope` and you get both scopes,
+ * omit `?cmdId` and you get every command the rank allows — ordered, and looking
+ * perfectly healthy. A missing function argument is the same mistake the
+ * compiler catches for free.
  */
-export const commandsInScope = (scope: Scope) => commandCatalog.read({ scope });
+export const commandMenuRows = (scope: Scope, rank: number) => commandMenu.read({ scope, rank });
+export const commandAuthzRows = (cmdId: string, rank: number) => commandAuthz.read({ cmdId, rank });
 
 /** Everything `npm run stardust:setup` provisions, besides the board reactor. */
 export const DECLARED = [
@@ -158,5 +199,6 @@ export const DECLARED = [
   todoPicker,
   tagsOfTodo,
   blockedByTodo,
-  commandCatalog,
+  commandMenu,
+  commandAuthz,
 ] as const;

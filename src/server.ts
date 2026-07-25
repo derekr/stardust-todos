@@ -31,7 +31,7 @@ import {
 import { type WorkspaceCtx, defaultWorkspace, openWorkspace } from "./workspace.ts";
 import type { EntityId } from "./stardust.ts";
 import { createPersona, createWorkspace, ensureUser, grantAccess, listPersonas, roleOf } from "./tenancy.ts";
-import { authorizeCommand, catalog, ensureCommandCatalog, project } from "./commands.ts";
+import { authorizeCommand, ensureCommandCatalog, visibleCommands } from "./commands.ts";
 import { addDependency, removeDependency, tagsOf } from "./features.ts";
 import { aggregateCounts, availableTags, blockerMap, effectiveStatus, emptyFilter, todoOptions } from "./board.ts";
 import {
@@ -283,7 +283,7 @@ async function detailData(id: number): Promise<{ todo: any; opts: DetailOpts } |
   const tags = await tagsOf(ctx, id);
   const history = ((await statusHistory(id)) as HistEntry[]).slice(-8); // most recent changes
   const role = await curRole();
-  const commands = project(await catalog("todo"), role);
+  const commands = await visibleCommands("todo", role);
   const canPublish = e.draft === true && (e.author as { "#": number } | undefined)?.["#"] === viewPersona;
   // "Blocks" = titles of todos that depend on THIS one (reverse dep edge).
   const blocks = (await blockedByTodo.read({ todo: { "#": id } })).map((r) => r.title as string);
@@ -481,7 +481,7 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         const role = await curRole();
-        stream.patchElements(palette(project(await catalog("global"), role)));
+        stream.patchElements(palette(await visibleCommands("global", role)));
       });
       return;
     }
