@@ -3,14 +3,34 @@
 // one pops a card explaining the Stardust query/derivation behind it, with a real
 // code sample and a source pointer. It's the glass box, in situ.
 //
+// Cards backed by a stored reactor also offer "copy as RON": the body is fetched
+// from the DATABASE on click, not re-serialized from the literal in queries.ts, so
+// what lands on the clipboard is what is actually running — ready to paste into
+// the Stardust console's /reactors/lab.
+//
 // Zero app-state: it's a self-contained overlay (a registry embedded as JSON + a
 // small vanilla script) that both the list and detail pages include verbatim.
+
+import { B } from "./base.ts";
 
 interface XraySpec {
   title: string;
   mech: string; // one-paragraph explanation
   code: string; // a real, concise snippet
   src: string; // file · function pointer
+  /**
+   * The stored reactors behind this card, offered as "copy as RON".
+   *
+   * The `code` above is a readable ILLUSTRATION — trimmed, commented, sometimes
+   * TypeScript. This is the real thing: the body is fetched from the database on
+   * click, so it cannot drift from what is running.
+   *
+   * `bind` is an example, not a default. Every one of these leaves vars for the
+   * reader to supply, and Stardust does not object to a missing bind on a fact
+   * clause — it just answers for every value. Pasting a body into the lab without
+   * one is how you get a confidently wrong answer.
+   */
+  reactors?: { name: string; bind: string }[];
 }
 
 const XRAY: Record<string, XraySpec> = {
@@ -39,6 +59,7 @@ const XRAY: Record<string, XraySpec> = {
 // read it:   readResults(reactorId, { sid })     // ?bind={sid 574}
 // watch it:  streamResults(reactorId, onRows, signal, { sid })`,
     src: "src/session.ts · canonicalBody() + readSnapshot()",
+    reactors: [{ name: "board", bind: "{sid 1519}" }],
   },
   counts: {
     title: "Counts — a viewer-scoped tally",
@@ -61,6 +82,7 @@ await counts.read({ ws: {"#": ctx.workspaceId},
                     viewer: {"#": viewerPersonaId} });
 // then tally effectiveStatus(row) + priority app-side`,
     src: "src/queries.ts · counts · src/board.ts · aggregateCounts()",
+    reactors: [{ name: "board-counts", bind: "{ws {# 12} viewer {# 7}}" }],
   },
   blocked: {
     title: "Blocked — derived on read, not stored",
@@ -80,6 +102,7 @@ await counts.read({ ws: {"#": ctx.workspaceId},
 [["cond", ["and", "?blocked", ["!=", "?status", "done"]],
           "blocked", true, "?status"], "?eff"],   // done beats blocked`,
     src: "src/session.ts · depSub (board) · src/queries.ts · OPEN_BLOCKER (counts)",
+    reactors: [{ name: "board", bind: "{sid 1519}" }],
   },
   visibility: {
     title: "Draft visibility — an app predicate, server-side",
@@ -101,6 +124,7 @@ function visibleTo(viewer) {
 // counts / todo-options reactors — supplied at read time:
 await counts.read({ ws: {"#": wsId}, viewer: {"#": personaId} });`,
     src: "src/session.ts · canonicalBody() · src/derive.ts · visibleTo() (bound as ?viewer in src/queries.ts)",
+    reactors: [{ name: "board-counts", bind: "{ws {# 12} viewer {# 7}}" }],
   },
   "detail-meta": {
     title: "Metadata — assembled from facts",
@@ -120,6 +144,7 @@ export const blockedByTodo = define("todo-blocks", {
 
 await blockedByTodo.read({ todo: {"#": id} });`,
     src: "src/server.ts · detailData()",
+    reactors: [{ name: "todo-blocks", bind: "{todo {# 729}}" }],
   },
   blockers: {
     title: "Blocked by — a dependency-graph join",
@@ -139,6 +164,7 @@ await blockedByTodo.read({ todo: {"#": id} });`,
 
 await blockers.read({ ws: {"#": ctx.workspaceId} });`,
     src: "src/queries.ts · blockers · src/board.ts · blockerMap()",
+    reactors: [{ name: "board-blockers", bind: "{ws {# 12}}" }],
   },
   commands: {
     title: "Commands — the role gate is the query",
@@ -170,6 +196,10 @@ const commandAuthz = define("command-authz", {
 await visibleCommands("todo", role)   // this menu
 await authorizeCommand(cmdId, role)   // same rule, on write`,
     src: "src/queries.ts · commandMenu + commandAuthz · src/commands.ts · visibleCommands() + authorizeCommand()",
+    reactors: [
+      { name: "command-menu", bind: "{scope 'global' rank 2}" },
+      { name: "command-authz", bind: "{cmdId 'workspace.archive' rank 2}" },
+    ],
   },
   activity: {
     title: "Activity — read straight off the fact log",
@@ -228,6 +258,25 @@ const SCRIPT = `
     if(el){ e.preventDefault(); e.stopPropagation(); showPop(el.getAttribute('data-xray'), el); }
     else { pop.hidden = true; }
   }, true);
+  function copyRon(r, btn, pre){
+    var label = btn.textContent;
+    btn.disabled = true; btn.textContent = 'fetching\u2026';
+    fetch(XRAY_BASE + '/xray/ron/' + encodeURIComponent(r.name))
+      .then(function(res){ if(!res.ok) throw new Error(res.status); return res.text(); })
+      .then(function(txt){
+        // show the real body either way: if the clipboard is unavailable
+        // (it needs a secure context) it can still be selected by hand.
+        pre.textContent = txt;
+        if(!navigator.clipboard) throw new Error('no clipboard');
+        return navigator.clipboard.writeText(txt);
+      })
+      .then(function(){ btn.textContent = '\u2713 copied \u2014 paste into /reactors/lab'; })
+      .catch(function(){ btn.textContent = 'shown above \u2014 select and copy'; })
+      .then(function(){
+        btn.disabled = false;
+        setTimeout(function(){ btn.textContent = label; }, 4000);
+      });
+  }
   function row(cls, txt){ var d=document.createElement('div'); d.className=cls; d.textContent=txt; return d; }
   function showPop(key, el){
     var d = XR[key]; if(!d) return;
@@ -238,6 +287,14 @@ const SCRIPT = `
     pop.appendChild(h);
     pop.appendChild(row('xr-mech', d.mech));
     var pre=document.createElement('pre'); pre.className='xr-code'; pre.textContent=d.code; pop.appendChild(pre);
+    (d.reactors||[]).forEach(function(r){
+      var b=document.createElement('button');
+      b.className='xr-ron'; b.type='button';
+      b.textContent='\u29c9 copy ' + r.name + ' as RON';
+      b.addEventListener('click', function(){ copyRon(r, b, pre); });
+      pop.appendChild(b);
+      pop.appendChild(row('xr-bind', 'needs a bind, e.g. ' + r.bind));
+    });
     pop.appendChild(row('xr-src', d.src));
     var r=el.getBoundingClientRect();
     pop.hidden=false;
@@ -277,6 +334,10 @@ export function xrayAssets(): string {
     .xr-code{font-family:var(--mono);font-size:11.5px;line-height:1.5;color:var(--fg);background:var(--bg);
       border:1px solid var(--line);border-radius:9px;padding:11px;overflow-x:auto;white-space:pre;margin:0 0 8px;}
     .xr-src{font-family:var(--mono);font-size:11px;color:var(--faint);}
+    .xr-ron{font-family:var(--mono);font-size:11px;color:var(--aqua);background:transparent;
+      border:1px solid var(--aqua);border-radius:7px;padding:5px 9px;cursor:pointer;margin:0 6px 6px 0;}
+    .xr-ron:disabled{opacity:.6;cursor:default;}
+    .xr-bind{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin:0 0 8px;}
   </style>
-  <script>${SCRIPT}</script>`;
+  <script>var XRAY_BASE=${JSON.stringify(B)};${SCRIPT}</script>`;
 }

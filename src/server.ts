@@ -29,12 +29,14 @@ import {
   toggleTodo,
 } from "./todos.ts";
 import { type WorkspaceCtx, defaultWorkspace, openWorkspace } from "./workspace.ts";
+import { lookupRef } from "./registry.ts";
 import type { EntityId } from "./stardust.ts";
 import { createPersona, createWorkspace, ensureUser, grantAccess, listPersonas, roleOf } from "./tenancy.ts";
 import { authorizeCommand, ensureCommandCatalog, visibleCommands } from "./commands.ts";
 import { addDependency, removeDependency, tagsOf } from "./features.ts";
 import { aggregateCounts, availableTags, blockerMap, effectiveStatus, emptyFilter, todoOptions } from "./board.ts";
 import {
+  BOARD_REACTOR,
   type SessionHandle,
   createSession,
   ensureBoardReactor,
@@ -44,8 +46,8 @@ import {
   setFilter,
   watchSnapshot,
 } from "./session.ts";
-import { BASE, TxConflictError, lastTx, readEntity, watchEntity } from "./stardust.ts";
-import { blockedByTodo } from "./queries.ts";
+import { BASE, TxConflictError, lastTx, readEntity, readReactorRon, watchEntity } from "./stardust.ts";
+import { DECLARED, blockedByTodo } from "./queries.ts";
 import { statusHistory } from "./history.ts";
 import {
   type BoardView,
@@ -70,6 +72,9 @@ import {
   scrubber,
   streamTxFeed,
 } from "./inspect.ts";
+
+/** Reactors the x-ray may hand out as RON: exactly the ones it documents. */
+const RON_EXPORTABLE = new Set<string>([BOARD_REACTOR, ...DECLARED.map((d) => d.name)]);
 
 const PORT = Number(process.env.PORT ?? 3000);
 
@@ -625,6 +630,30 @@ const server = http.createServer(async (req, res) => {
     if (removeMatch && method === "DELETE") {
       await removeTodo(ctx, Number(removeMatch[1]));
       noopStream(req, res);
+      return;
+    }
+
+    // X-ray "copy as RON": the stored body of ONE named reactor, as text.
+    //
+    // The name is checked against the app's own catalog before it is looked up —
+    // not because a marker lookup is dangerous, but because an open name->body
+    // endpoint invites using this page as a general database browser. The console
+    // at /reactors already is one, behind its own auth.
+    if (seg[0] === "xray" && seg[1] === "ron" && seg.length === 3 && method === "GET") {
+      const name = decodeURIComponent(seg[2]);
+      if (!RON_EXPORTABLE.has(name)) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("unknown reactor");
+        return;
+      }
+      const id = await lookupRef("reactorRef", name);
+      if (id === undefined) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("not provisioned");
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+      res.end(await readReactorRon(id));
       return;
     }
 

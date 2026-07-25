@@ -378,6 +378,45 @@ export async function readReactor(id: EntityId): Promise<ReactorDoc> {
   return one<ReactorDoc>("GET", `/reactors/${id}`);
 }
 
+/**
+ * A stored reactor's BODY as RON, ready to paste into the console's
+ * `/reactors/lab`.
+ *
+ * Read straight from the database rather than re-serialized from the literal in
+ * `queries.ts`, so what you copy is what is actually stored — including any drift
+ * from a body that was patched out of band.
+ *
+ * The document comes back as `enabled true reactor{…} reactorId{# N}`; Lab wants
+ * the query on its own, so the `reactor{…}` value is unwrapped. Note the media
+ * type: NDRON is the only one of the RON profiles this route answers (the others
+ * 406), which is the same trap as reading a schema.
+ */
+export async function readReactorRon(id: EntityId): Promise<string> {
+  const res = await fetch(`${BASE}/reactors/${id}`, { headers: { Accept: "application/x-ndron" } });
+  if (!res.ok) throw new Error(`reactor ${id}: ${res.status}`);
+  return unwrapReactor(await res.text());
+}
+
+/** Take the `reactor{…}` value out of a reactor document, brace-balanced.
+ *  Quote-aware so a `'…}…'` literal inside a clause cannot end it early. */
+function unwrapReactor(doc: string): string {
+  const open = doc.indexOf("reactor{");
+  if (open === -1) return doc.trim();
+  let depth = 0;
+  let quoted = false;
+  for (let i = open + "reactor".length; i < doc.length; i++) {
+    const ch = doc[i];
+    if (quoted) {
+      if (ch === "'") quoted = false;
+    } else if (ch === "'") quoted = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}" && --depth === 0) {
+      return doc.slice(open + "reactor".length + 1, i).trim();
+    }
+  }
+  return doc.trim();
+}
+
 /** Replace a stored reactor's body. Note: plain JSON — reactors reject merge-patch. */
 export async function patchReactor(id: EntityId, body: unknown): Promise<ReactorDoc> {
   return one<ReactorDoc>("PATCH", `/reactors/${id}`, { body, contentType: "application/json" });
