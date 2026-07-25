@@ -41,20 +41,25 @@ const XRAY: Record<string, XraySpec> = {
   },
   counts: {
     title: "Counts — a viewer-scoped tally",
-    mech: "aggregateCounts() runs over the viewer-VISIBLE set — the same visibility rule as the board, so a draft you can't see can't leak into the numbers — but deliberately NOT narrowed by the active facets, which is why the chips can show what you'd get if you picked them. It projects {status, priority, blocked} per visible todo; the effective-status tally is a tiny app-side fold (blocked isn't a groupable stored field). Unlike the board, this is a plain dry-run, not the reactor.",
-    code: `const rows = await query({
+    mech: "aggregateCounts() runs over the viewer-VISIBLE set — the same visibility rule as the board, so a draft you can't see can't leak into the numbers — but deliberately NOT narrowed by the active facets, which is why the chips can show what you'd get if you picked them. It projects {status, priority, blocked} per visible todo; the effective-status tally is a tiny app-side fold (blocked isn't a groupable stored field). It used to be a dry-run replanned on every render; it is now a STORED reactor read with the workspace and viewer supplied as per-read binds, so one reactor serves every workspace.",
+    code: `// declared once (src/queries.ts) — ?ws and ?viewer are left unbound:
+export const counts = define("board-counts", {
   find: ["?t", "?status", "?priority"],
   where: [
-    ["?t", "app", "todo-app"],
-    ["?t", "workspace", { "#": ctx.workspaceId }],
+    ["?t", "app", "todo-app"], ["?t", "workspace", "?ws"],
     ["?t", "status", "?status"], ["?t", "priority", "?priority"],
-    ...visibleTo(viewerPersonaId),
+    ...visibleTo("?viewer"),
+    [["exists", OPEN_BLOCKER], "?blocked"],   // bind, then project
   ],
   then: { project: { status: "?status", priority: "?priority",
-                     blocked: openBlockerExists("?t") } },
+                     blocked: "?blocked" } },
 });
+
+// read it, scoped per call — ?bind={ws {# 12} viewer {# 7}}:
+await counts.read({ ws: {"#": ctx.workspaceId},
+                    viewer: {"#": viewerPersonaId} });
 // then tally effectiveStatus(row) + priority app-side`,
-    src: "src/board.ts · aggregateCounts()",
+    src: "src/queries.ts · counts · src/board.ts · aggregateCounts()",
   },
   blocked: {
     title: "Blocked — derived on read, not stored",
@@ -73,7 +78,7 @@ const XRAY: Record<string, XraySpec> = {
 [["exists", depSub], "?blocked"],
 [["cond", ["and", "?blocked", ["!=", "?status", "done"]],
           "blocked", true, "?status"], "?eff"],   // done beats blocked`,
-    src: "src/session.ts · depSub (board) · src/derive.ts · openBlockerExists() (counts)",
+    src: "src/session.ts · depSub (board) · src/queries.ts · OPEN_BLOCKER (counts)",
   },
   visibility: {
     title: "Draft visibility — an app predicate, server-side",
@@ -92,40 +97,45 @@ function visibleTo(personaId) {
            ["=", "?author", { "#": personaId }]],
   ];
 }`,
-    src: "src/session.ts · canonicalBody() · src/derive.ts · visibleTo()",
+    src: "src/session.ts · canonicalBody() · src/derive.ts · visibleTo() (bound as ?viewer in src/queries.ts)",
   },
   "detail-meta": {
     title: "Metadata — assembled from facts",
     mech: "detailData() composes the detail from facts and small queries: readEntity for the todo, tagsOf for tags, blockerMap for blockers, and a reverse-dependency query for the 'Blocks' row (which todos depend on this one). No joins baked into a table — each field is a fact or a scoped query.",
-    code: `// "Blocks" = titles of todos that depend on THIS one (reverse edge).
-// tquery = the compile-time-checked query: field names and the projected
-// shape are verified against the generated field registry before it runs.
-const blocks = await tquery({
+    code: `// "Blocks" = titles of todos that depend on THIS one (reverse edge),
+// declared once and read with the todo bound per call:
+export const blockedByTodo = define("todo-blocks", {
   find: ["?bt"],
   where: [
     ["?d", "kind", "dep"],
-    ["?d", "blocker", { "#": id }],   // this todo is the blocker
+    ["?d", "blocker", "?todo"],       // this todo is the blocker
     ["?d", "todo", "?t"],
     ["?t", "title", "?bt"],
   ],
   then: { project: { title: "?bt" } },
-} as const);`,
+});
+
+await blockedByTodo.read({ todo: {"#": id} });`,
     src: "src/server.ts · detailData()",
   },
   blockers: {
     title: "Blocked by — a dependency-graph join",
     mech: "blockerMap() runs one join over the workspace's kind:'dep' edges (todo → blocker) and buckets by todo id. Dependencies are real edge ENTITIES, not an inline array on the todo — so adding/removing one is a single fact write, and the graph is directly queryable.",
-    code: `await query({
+    code: `export const blockers = define("board-blockers", {
   find: ["?t", "?b", "?bt", "?bs"],
   where: [
     ["?d", "kind", "dep"],
     ["?d", "todo", "?t"],
-    ["?t", "workspace", { "#": ctx.workspaceId }],
+    ["?t", "workspace", "?ws"],        // bound per read, not baked in
     ["?d", "blocker", "?b"],
     ["?b", "title", "?bt"], ["?b", "status", "?bs"],
   ],
-});`,
-    src: "src/board.ts · blockerMap()",
+  then: { project: { todo: "?t", blocker: "?b",
+                     title: "?bt", status: "?bs" } },
+});
+
+await blockers.read({ ws: {"#": ctx.workspaceId} });`,
+    src: "src/queries.ts · blockers · src/board.ts · blockerMap()",
   },
   activity: {
     title: "Activity — read straight off the fact log",

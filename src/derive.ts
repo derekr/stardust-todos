@@ -76,10 +76,13 @@ export function anyTodoExists(projVar: string): object {
 // never cross the wire. Every todo must carry draft+author for the binding
 // clauses to match (addTodo sets them; migrateVisibilityFields backfills).
 // ---------------------------------------------------------------------------
-export function visibleTo(personaId: number): unknown[][] {
+export function visibleTo(viewer: number | string): unknown[][] {
+  // A persona id pins the viewer into the query (dry-runs); a "?var" leaves it to
+  // be supplied per read, which is how a STORED reactor serves every viewer.
+  const who = typeof viewer === "number" ? { "#": viewer } : viewer;
   return [
     ["?t", "draft", "?draft"],
     ["?t", "author", "?author"],
-    ["or", ["=", "?draft", false], ["=", "?author", { "#": personaId }]],
+    ["or", ["=", "?draft", false], ["=", "?author", who]],
   ];
 }

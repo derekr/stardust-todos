@@ -7,18 +7,28 @@
 // reactor body — the app provisions on boot too, but doing it explicitly means a
 // deploy fails here rather than on a user's first request.
 
-import { ensureReactor } from "../src/reactors.ts";
+import { type Provisioned, ensureReactor } from "../src/reactors.ts";
+import { DECLARED } from "../src/queries.ts";
 import { BOARD_REACTOR, canonicalBody } from "../src/session.ts";
 import { BASE } from "../src/stardust.ts";
 
-const REACTORS = [{ name: BOARD_REACTOR, body: canonicalBody }] as const;
+// The board reactor is provisioned directly (it is hand-written, not a declared
+// query); everything else provisions itself from the query catalog.
+const REACTORS: { name: string; provision: () => Promise<Provisioned> }[] = [
+  { name: BOARD_REACTOR, provision: () => ensureReactor(BOARD_REACTOR, canonicalBody()) },
+  ...DECLARED.map((d) => ({ name: d.name, provision: () => d.provision() })),
+];
 
-const MARK = { created: "\x1b[32m+ created\x1b[0m", updated: "\x1b[33m~ updated\x1b[0m", current: "\x1b[2m= current\x1b[0m" };
+const MARK = {
+  created: "\x1b[32m+ created\x1b[0m",
+  updated: "\x1b[33m~ updated\x1b[0m",
+  current: "\x1b[2m= current\x1b[0m",
+};
 
 async function main() {
   console.log(`stardust ${BASE}\n`);
   for (const r of REACTORS) {
-    const { id, status } = await ensureReactor(r.name, r.body());
+    const { id, status } = await r.provision();
     console.log(`  ${MARK[status]}  ${r.name.padEnd(12)} #${id}`);
   }
   console.log("\nreactors provisioned.");

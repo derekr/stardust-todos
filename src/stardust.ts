@@ -352,7 +352,6 @@ export interface ReactorDoc {
   reactor: Record<string, unknown>;
 }
 
-
 export async function readReactor(id: EntityId): Promise<ReactorDoc> {
   return one<ReactorDoc>("GET", `/reactors/${id}`);
 }
@@ -373,22 +372,32 @@ export async function query<Row = unknown>(body: unknown): Promise<Row[]> {
   return (await one<Row[]>("POST", "/reactors/dry-run", { body })) ?? [];
 }
 
+/** Values a reactor var can be bound to at read time. A `Ref` binds an entity —
+ *  which is how a query scoped by `[?t workspace ?ws]` is parameterized per read. */
+export type Bind = Record<string, string | number | Ref>;
+
 /** Render a bind override as a RON object for the `?bind=` results param:
- *  `{ sid: 42 }` → `{sid 42}`, `{ v: "x" }` → `{v 'x'}`. Per-subscription bind
- *  lets ONE stored reactor serve many parameterizations (e.g. one canonical board
- *  reactor read per search session). */
-function ronBind(bind: Record<string, string | number>): string {
-  const parts = Object.entries(bind).map(([k, v]) => `${k} ${typeof v === "number" ? v : `'${v}'`}`);
-  return `{${parts.join(" ")}}`;
+ *  `{ sid: 42 }` → `{sid 42}`, `{ v: "x" }` → `{v 'x'}`, `{ ws: {"#":12} }` →
+ *  `{ws {# 12}}`. Per-subscription bind lets ONE stored reactor serve many
+ *  parameterizations, so a scoped query needs one reactor, not one per scope. */
+function ronBind(bind: Bind): string {
+  const lit = (v: string | number | Ref): string => {
+    if (typeof v === "number") return String(v);
+    if (typeof v === "string") return `'${v}'`;
+    return `{# ${refId(v)}}`;
+  };
+  return `{${Object.entries(bind)
+    .map(([k, v]) => `${k} ${lit(v)}`)
+    .join(" ")}}`;
 }
 
-function bindQuery(bind?: Record<string, string | number>): string {
+function bindQuery(bind?: Bind): string {
   return bind ? `&bind=${encodeURIComponent(ronBind(bind))}` : "";
 }
 
 /** The reactor's current result. Stored results are a live route, so `max=1`
  *  takes the current nested result and completes. */
-export async function readResults(id: EntityId, bind?: Record<string, string | number>): Promise<unknown[]> {
+export async function readResults(id: EntityId, bind?: Bind): Promise<unknown[]> {
   return (await one<unknown[]>("GET", `/reactors/${id}/results?max=1${bindQuery(bind)}`)) ?? [];
 }
 
@@ -399,7 +408,7 @@ export async function streamResults(
   id: EntityId,
   onRows: (rows: unknown[]) => void,
   signal: AbortSignal,
-  bind?: Record<string, string | number>,
+  bind?: Bind,
 ): Promise<void> {
   const q = bindQuery(bind).replace(/^&/, "?");
   await streamRecords(`/reactors/${id}/results${q}`, (rows) => void onRows(rows as unknown[]), signal);

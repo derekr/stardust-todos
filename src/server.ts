@@ -38,7 +38,7 @@ import {
 } from "./board.ts";
 import { type SessionHandle, createSession, ensureBoardReactor, readSnapshot, refresh, setFilter } from "./session.ts";
 import { BASE, TxConflictError, lastTx, readEntity } from "./stardust.ts";
-import { query as tquery } from "./typed-query.ts"; // compile-time-checked query for static literals
+import { blockedByTodo } from "./queries.ts";
 import { statusHistory } from "./history.ts";
 import {
   type BoardView,
@@ -235,18 +235,7 @@ async function detailData(id: number): Promise<{ todo: any; opts: DetailOpts } |
   const commands = project(await catalog("todo"), role);
   const canPublish = e.draft === true && (e.author as { "#": number } | undefined)?.["#"] === viewPersona;
   // "Blocks" = titles of todos that depend on THIS one (reverse dep edge).
-  const blocks = (
-    await tquery({
-      find: ["?bt"],
-      where: [
-        ["?d", "kind", "dep"],
-        ["?d", "blocker", { "#": id }],
-        ["?d", "todo", "?t"],
-        ["?t", "title", "?bt"],
-      ],
-      then: { project: { title: "?bt" } },
-    } as const)
-  ).map((r) => r.title);
+  const blocks = (await blockedByTodo.read({ todo: { "#": id } })).map((r) => r.title as string);
   const due = (e.due as { "#utc"?: string } | undefined)?.["#utc"];
   // The entity's last transaction NOW — the CTA embeds it as its Tx-Check-Last
   // guard, so a transition only commits if the todo hasn't moved since render.

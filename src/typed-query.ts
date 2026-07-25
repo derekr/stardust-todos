@@ -156,7 +156,7 @@ export interface QueryLiteral {
 type Env<Q extends QueryLiteral> = BuildEnv<Q["where"], Fields>;
 
 // Intersect the argument with this. Any Err<...> position breaks assignment there.
-type CheckQuery<Q extends QueryLiteral> = {
+export type CheckQuery<Q extends QueryLiteral> = {
   find: CheckFind<Q["find"]>;
   where: CheckWhere<Q["where"], Fields, Env<Q>>;
 } & (Q extends { then: infer Tn } ? { then: CheckThen<Tn, Env<Q>> } : {});
@@ -214,7 +214,10 @@ export function validationPlan(where: readonly unknown[], project: Record<string
   return plan;
 }
 
-function rowValidator(where: readonly unknown[], project: Record<string, string>): (row: unknown) => string | null {
+export function rowValidator(
+  where: readonly unknown[],
+  project: Record<string, string>,
+): (row: unknown) => string | null {
   const plan = validationPlan(where, project);
   return (row) => {
     if (typeof row !== "object" || row === null) return "row is not an object";

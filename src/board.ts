@@ -8,10 +8,8 @@
 
 import type { WorkspaceCtx } from "./workspace.ts";
 import type { Priority, Status, Todo } from "./todos.ts";
-import { type EntityId, query, refId } from "./stardust.ts";
-import { query as tquery } from "./typed-query.ts"; // compile-time-checked query for static literals
-import { APP } from "./tenancy.ts";
-import { openBlockerExists, visibleTo } from "./derive.ts";
+import { type EntityId, refId } from "./stardust.ts";
+import { blockers, counts, todoPicker, workspaceTags } from "./queries.ts";
 
 /** Effective display status: "blocked" is DERIVED (not stored). `done` wins. */
 export const effectiveStatus = (t: Pick<Todo, "status" | "blocked">): Status =>
@@ -59,16 +57,9 @@ export interface Counts {
  * {status, priority, blocked} for the viewer's visible todos and tally here.
  */
 export async function aggregateCounts(ctx: WorkspaceCtx, viewerPersonaId: number): Promise<Counts> {
-  const rows = (await query({
-    find: ["?t", "?status", "?priority"],
-    where: [
-      ["?t", "app", APP],
-      ["?t", "workspace", { "#": ctx.workspaceId }],
-      ["?t", "status", "?status"],
-      ["?t", "priority", "?priority"],
-      ...visibleTo(viewerPersonaId),
-    ],
-    then: { project: { status: "?status", priority: "?priority", blocked: openBlockerExists("?t") } },
+  const rows = (await counts.read({
+    ws: { "#": ctx.workspaceId },
+    viewer: { "#": viewerPersonaId },
   })) as Array<Pick<Todo, "status" | "priority" | "blocked">>;
   const status: Record<string, number> = {};
   const priority: Record<string, number> = {};
@@ -95,40 +86,20 @@ export interface Blocker {
  *  rejects the ref. Typing this correctly needs the checker to understand
  *  ref-bound projections (a typed-query enhancement), so `refId` normalizes here. */
 export async function blockerMap(ctx: WorkspaceCtx): Promise<Map<EntityId, Blocker[]>> {
-  const rows = (await query({
-    find: ["?t", "?b", "?bt", "?bs"],
-    where: [
-      ["?d", "kind", "dep"],
-      ["?d", "todo", "?t"],
-      ["?t", "workspace", { "#": ctx.workspaceId }],
-      ["?d", "blocker", "?b"],
-      ["?b", "title", "?bt"],
-      ["?b", "status", "?bs"],
-    ],
-  })) as [unknown, unknown, string, Status][];
+  const rows = await blockers.read({ ws: { "#": ctx.workspaceId } });
   const map = new Map<EntityId, Blocker[]>();
-  for (const [t, b, bt, bs] of rows) {
-    const id = refId(t);
+  for (const r of rows) {
+    const id = refId(r.todo);
     if (!map.has(id)) map.set(id, []);
-    map.get(id)!.push({ id: refId(b), title: bt, status: bs });
+    map.get(id)!.push({ id: refId(r.blocker), title: r.title as string, status: r.status as Status });
   }
   return map;
 }
 
 /** Distinct tag labels used in the workspace. */
 export async function availableTags(ctx: WorkspaceCtx): Promise<string[]> {
-  const rows = await tquery({
-    find: ["?label"],
-    where: [
-      ["?e", "kind", "tag"],
-      ["?e", "todo", "?t"],
-      ["?t", "workspace", { "#": ctx.workspaceId }],
-      ["?e", "label", "?label"],
-    ],
-    orderBy: ["?label"],
-    then: { project: { label: "?label" } }, // Stardust shapes+validates each row
-  } as const);
-  return [...new Set(rows.map((r) => r.label))];
+  const rows = await workspaceTags.read({ ws: { "#": ctx.workspaceId } });
+  return [...new Set(rows.map((r) => r.label as string))];
 }
 
 /** VISIBLE todos as {id,title} — the "add blocker" picker. Scoped to the viewer
@@ -137,16 +108,8 @@ export async function todoOptions(
   ctx: WorkspaceCtx,
   viewerPersonaId: number,
 ): Promise<{ id: EntityId; title: string }[]> {
-  const rows = (await query({
-    find: ["?t", "?title"],
-    where: [
-      ["?t", "app", APP],
-      ["?t", "workspace", { "#": ctx.workspaceId }],
-      ["?t", "title", "?title"],
-      ...visibleTo(viewerPersonaId),
-    ],
-    orderBy: ["?title"],
-    then: { project: { id: "?t", title: "?title" } },
+  return (await todoPicker.read({
+    ws: { "#": ctx.workspaceId },
+    viewer: { "#": viewerPersonaId },
   })) as { id: EntityId; title: string }[];
-  return rows;
 }

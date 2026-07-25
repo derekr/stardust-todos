@@ -15,6 +15,7 @@ import type { WorkspaceCtx } from "./workspace.ts";
 import type { EntityId } from "./stardust.ts";
 import { deleteEntity, readEntity, transact } from "./stardust.ts";
 import { query as tquery } from "./typed-query.ts";
+import { tagsOfTodo } from "./queries.ts";
 
 /** Confirm a todo id belongs to this workspace before writing an edge to it. */
 async function assertOwned(ctx: WorkspaceCtx, id: EntityId): Promise<void> {
@@ -43,17 +44,8 @@ export async function addTag(ctx: WorkspaceCtx, todoId: EntityId, label: string)
 }
 
 export async function tagsOf(ctx: WorkspaceCtx, todoId: EntityId): Promise<string[]> {
-  const rows = await tquery({
-    find: ["?label"],
-    where: [
-      ["?e", "kind", "tag"],
-      ["?e", "todo", { "#": todoId }],
-      ["?e", "label", "?label"],
-    ],
-    orderBy: ["?label"],
-    then: { project: { label: "?label" } }, // shaped + validated by Stardust
-  } as const);
-  return rows.map((r) => r.label);
+  const rows = await tagsOfTodo.read({ todo: { "#": todoId } });
+  return rows.map((r) => r.label as string);
 }
 
 // ---- Dependencies (edge entities) ----------------------------------------
