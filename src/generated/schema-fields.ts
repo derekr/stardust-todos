@@ -18,7 +18,6 @@ export interface SchemaFieldTypes {
   persona: Ref;  // from Grant
   priority: "low" | "med" | "high";  // from Todo
   project: Ref;  // from Todo
-  rev: number;  // from Session
   role: "owner" | "member";  // from Grant
   session: Ref;  // from SessionFacet
   sid: number;  // from Session
@@ -45,7 +44,6 @@ export const schemaValidators = {
   persona: (v) => typeof (v as any)?.["#"] === "number",
   priority: (v) => (["low","med","high"] as unknown[]).includes(v),
   project: (v) => typeof (v as any)?.["#"] === "number",
-  rev: (v) => typeof v === "number",
   role: (v) => (["owner","member"] as unknown[]).includes(v),
   session: (v) => typeof (v as any)?.["#"] === "number",
   sid: (v) => typeof v === "number",

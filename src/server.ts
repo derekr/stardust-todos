@@ -43,7 +43,6 @@ import {
   ensureBoardReactor,
   readFilter,
   readSnapshot,
-  refresh,
   retargetSession,
   setFilter,
   watchSnapshot,
@@ -114,12 +113,24 @@ const switchControllers = new Set<AbortController>();
 // canonical reactor re-emits to any terminal panes bound to this session — every
 // board-changing action (filter toggle, todo mutation) refreshes the live curl,
 // not just priority changes.
-const rerenderAll = () => {
-  // Bump every live session so any pane bound to one re-emits — a write is not
-  // scoped to the browser that made it.
-  for (const sid of liveSessions) void refresh(sessionOf(sid)).catch(() => {});
-  for (const c of switchControllers) c.abort();
-};
+/**
+ * Point every live session at the current workspace + viewer.
+ *
+ * This is the ONLY reason the server touches a session now, and it writes the two
+ * fields that actually moved — no revision counter, because both are top-level
+ * clauses in the reactor and so re-emit by themselves.
+ *
+ * Data writes deliberately do nothing here: the reactor pushes them on its own.
+ * Measured against Stardust directly, with no app involvement — a priority change,
+ * a status change, a todo retraction and a publish each produced exactly one
+ * emission. The old rerenderAll() poked EVERY live session on every write, which
+ * made one browser's filter click re-emit every other browser's board.
+ */
+async function retargetAll(): Promise<void> {
+  for (const sid of liveSessions) {
+    await retargetSession(sessionOf(sid), ctx.workspaceId, viewPersona).catch((e) => console.error("retarget:", e));
+  }
+}
 
 const noopStream = (req: http.IncomingMessage, res: http.ServerResponse) =>
   ServerSentEventGenerator.stream(req, res, () => {});
@@ -161,10 +172,11 @@ const liveSessions = new Set<EntityId>();
  * created in. (One active workspace per server is a demo simplification.)
  */
 async function rescope(): Promise<void> {
+  await retargetAll();
+  // A different workspace has different tags and todos, so the old filter is
+  // meaningless there — unlike a "view as" switch, which keeps it.
   for (const sid of liveSessions) {
-    const h = sessionOf(sid);
-    await retargetSession(h, ctx.workspaceId, viewPersona).catch((e) => console.error("rescope:", e));
-    await setFilter(h, { ...emptyFilter }, actorName()).catch((e) => console.error("rescope filter:", e));
+    await setFilter(sessionOf(sid), { ...emptyFilter }, actorName()).catch((e) => console.error("rescope filter:", e));
   }
 }
 
@@ -380,16 +392,14 @@ const server = http.createServer(async (req, res) => {
         // as-is. Nothing here decides what is relevant — the query already did.
         while (!closed) {
           inner = new AbortController();
-          switchControllers.add(inner);
           await watchSnapshot(
             session,
             (rows) =>
               void renderBoard(stream, session, rows as unknown as Todo[]).catch((e) => console.error("render:", e)),
             inner.signal,
           );
-          switchControllers.delete(inner);
-          // Deliberate switch/close aborts inner → re-render instantly.
-          // A dropped upstream stream (idle timeout) did NOT abort → back off.
+          // Only a client close aborts inner now. A dropped upstream stream (idle
+          // timeout) did NOT abort → back off before resubscribing.
           if (!closed && !inner.signal.aborted) await new Promise((r) => setTimeout(r, 500));
         }
       });
@@ -416,7 +426,6 @@ const server = http.createServer(async (req, res) => {
       else if (facet === "view") filter.view = filter.view === (value as any) ? "all" : (value as any);
       else if (facet === "group") filter.group = value as any;
       await setFilter(session, filter, actorName());
-      rerenderAll();
       noopStream(req, res);
       return;
     }
@@ -465,7 +474,10 @@ const server = http.createServer(async (req, res) => {
     // "View as" role switch (RBAC demo) — drives visibility + command projection.
     if (seg[0] === "viewas" && method === "POST") {
       viewPersona = seg[1] === "member" ? MEMBER_PERSONA : OWNER_PERSONA;
-      rerenderAll();
+      // The reactor reads visibility from the session's `viewer` FACT, so switching
+      // has to move it. Previously this only forced a repaint, which re-rendered
+      // with the old viewer still recorded.
+      await retargetAll();
       noopStream(req, res);
       return;
     }
@@ -510,7 +522,6 @@ const server = http.createServer(async (req, res) => {
           msg = `${allowed.label} — done (demo).`;
         }
         stream.patchSignals(JSON.stringify({ toast: msg }));
-        rerenderAll();
       });
       return;
     }
@@ -533,8 +544,7 @@ const server = http.createServer(async (req, res) => {
         if (e instanceof TxConflictError)
           conflict = true; // stale write — refuse, don't clobber
         else throw e;
-      }
-      rerenderAll(); // refresh the list board(s)
+      } // refresh the list board(s)
       ServerSentEventGenerator.stream(req, res, async (stream) => {
         if (conflict) {
           stream.patchSignals(JSON.stringify({ toast: "Someone changed this task — refreshed to the latest." }));
@@ -548,7 +558,6 @@ const server = http.createServer(async (req, res) => {
     if (switchMatch && method === "POST") {
       ctx = await openWorkspace(personaId, Number(switchMatch[1]));
       await rescope();
-      rerenderAll();
       noopStream(req, res);
       return;
     }
@@ -562,7 +571,6 @@ const server = http.createServer(async (req, res) => {
         ctx = await openWorkspace(personaId, ws.id);
         await rescope();
         stream.patchSignals(JSON.stringify({ newWs: "" }));
-        rerenderAll();
       });
       return;
     }
@@ -589,7 +597,6 @@ const server = http.createServer(async (req, res) => {
           actorName(),
         );
         stream.patchSignals(JSON.stringify({ newTitle: "", newDraft: false, error: "" }));
-        rerenderAll();
       });
       return;
     }
@@ -608,7 +615,6 @@ const server = http.createServer(async (req, res) => {
           conflict = true; // draft moved since render
         else ok = false; // not the author
       }
-      rerenderAll();
       ServerSentEventGenerator.stream(req, res, async (stream) => {
         if (conflict) stream.patchSignals(JSON.stringify({ toast: "This draft changed — refreshed to the latest." }));
         else if (!ok) stream.patchSignals(JSON.stringify({ toast: "Only the author can publish this draft." }));
@@ -620,7 +626,6 @@ const server = http.createServer(async (req, res) => {
     const toggleMatch = url.match(/^\/toggle\/(\d+)$/);
     if (toggleMatch && method === "POST") {
       await toggleTodo(ctx, Number(toggleMatch[1]), actorName());
-      rerenderAll();
       noopStream(req, res);
       return;
     }
@@ -628,7 +633,6 @@ const server = http.createServer(async (req, res) => {
     const removeMatch = url.match(/^\/remove\/(\d+)$/);
     if (removeMatch && method === "DELETE") {
       await removeTodo(ctx, Number(removeMatch[1]));
-      rerenderAll();
       noopStream(req, res);
       return;
     }

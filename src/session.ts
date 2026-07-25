@@ -16,9 +16,13 @@
 // `[[cond [and ?blocked [!= ?status done]] "blocked" true ?status] ?eff]`, and the
 // status filter is a value-join of the session's facts onto `?eff`.
 //
-// Todos are a point-in-time SNAPSHOT: a one-shot read always recomputes; the live
-// stream re-emits when the session changes — a filter edit (setFilter) or an
-// explicit `refresh()`, both of which bump the session's `rev`.
+// Todos are a point-in-time SNAPSHOT: a one-shot read always recomputes, and the
+// live stream re-emits whenever the RESULT changes. There is no revision counter
+// and no explicit refresh: the facet rows and the session's scalars are top-level
+// clauses, so writing them invalidates on their own. Measured against Stardust
+// directly — retracting a status facet with no other write pushed 7 rows -> 3, and
+// putting it back pushed 3 -> 7, while a bump of a counter field pushed nothing at
+// all because the result had not changed.
 
 import {
   type EntityId,
@@ -97,8 +101,9 @@ const tagSub = {
 
 // The ONE canonical board reactor. A session is selected by its `sid` (bind); its
 // scalar fields (viewer/view/actor/tagActive/workspace) drive the filters, and its
-// `sf` facet entities drive the multi-select value-joins. Patching the session
-// (its `rev`) re-emits. Projects the fully-filtered, fully-shaped board rows.
+// `sf` facet entities drive the multi-select value-joins. Every one of those is a
+// top-level clause, so writing any of them re-emits — no revision counter needed.
+// Projects the fully-filtered, fully-shaped board rows.
 export function canonicalBody(): Record<string, unknown> {
   return {
     enabled: true,
@@ -106,7 +111,6 @@ export function canonicalBody(): Record<string, unknown> {
     where: [
       ["?sess", "kind", "session"],
       ["?sess", "sid", "?sid"], // ?sid supplied per-stream via ?bind
-      ["?sess", "rev", "?rev"],
       ["?sess", "viewer", "?viewer"],
       ["?sess", "view", "?view"],
       ["?sess", "actor", "?actor"],
@@ -226,13 +230,6 @@ async function writeFacets(sessionId: EntityId, spec: { facet: string; values: r
   await transact(patch);
 }
 
-// Bump `rev` to a fresh value so the reactor's top-level [?sess rev ?rev] clause
-// invalidates and re-emits. A timestamp avoids a read-modify-write race.
-async function bumpRev(sessionId: EntityId): Promise<void> {
-  const r = await patchSchemaEntity(await sessionSchema(), sessionId, { rev: Date.now() });
-  if (!r.ok) throw new Error(`rev bump rejected: ${r.error.message}`);
-}
-
 /** Create a search session (filter = everything, view=all) + ensure the reactor. */
 export async function createSession(
   workspaceId: EntityId,
@@ -246,7 +243,6 @@ export async function createSession(
     actor,
     view: "all",
     tagActive: false,
-    rev: 1,
   });
   if (!created.ok) throw new Error(`session rejected: ${created.error.message}`);
   const sessionId = created.entityId;
@@ -262,7 +258,7 @@ export async function createSession(
   return { sessionId, workspaceId };
 }
 
-/** Push the whole Filter into the session facts (+ view/actor/tagActive) and bump rev. */
+/** Push the whole Filter into the session facts (+ view/actor/tagActive). */
 export async function setFilter(h: SessionHandle, f: Filter, actor: string): Promise<void> {
   await writeFacets(h.sessionId, [
     { facet: "status", values: f.status.length ? f.status : STATUS_DOMAIN },
@@ -274,16 +270,10 @@ export async function setFilter(h: SessionHandle, f: Filter, actor: string): Pro
     group: f.group, // display-only, but per-session state, so it lives here too
     actor,
     tagActive: f.tags.length > 0,
-    rev: Date.now(),
   });
   // `view` is an enum in the schema, so an unknown view is refused here rather
   // than silently producing a board that matches nothing.
   if (!r.ok) throw new Error(`filter rejected: ${r.error.message}`);
-}
-
-/** A qualifying action happened: bump `rev` so the stream pushes a fresh snapshot. */
-export async function refresh(h: SessionHandle): Promise<void> {
-  await bumpRev(h.sessionId);
 }
 
 /** The current fully-filtered board snapshot — a one-shot read (always recomputes). */
@@ -294,15 +284,17 @@ export async function readSnapshot(h: SessionHandle): Promise<SnapshotRow[]> {
 
 /**
  * Watch this session's board. Stardust pushes the complete new result whenever the
- * session's `rev` changes or a todo field in the reactor's top-level `where` moves,
- * so the server does not have to notice anything itself.
+ * result CHANGES — a filter write, a scope change, or a todo field in the top-level
+ * `where` — so the server does not have to notice anything itself. An emission means
+ * the rows differ; writing a field without changing the result pushes nothing.
  *
  * The one measured gap is TAG edges. Adding a tag pushes nothing — verified from a
  * background script and again with the tag filter active, so even an edge that
  * changes which rows match is invisible here. DEP edges do push (measured twice),
  * as do todo field writes from anywhere including the CLI, so this is narrower than
  * "subqueries don't invalidate": it is specifically the tag path. Treat the board as
- * a snapshot that advances on rev, on field writes, and on dependency changes.
+ * a snapshot that advances on its own filter writes, on field writes, and on
+ * dependency changes.
  */
 export async function watchSnapshot(
   h: SessionHandle,
@@ -351,8 +343,8 @@ export async function readFilter(h: SessionHandle): Promise<Filter> {
  * Point a session at a different workspace or viewer.
  *
  * The scope is facts ON the session, so switching workspace or "view as" has to
- * move the session too — otherwise the board keeps rendering the old scope. Bumps
- * `rev` so the reactor re-emits.
+ * move the session too — otherwise the board keeps rendering the old scope. Both
+ * fields are top-level clauses in the reactor, so the write re-emits by itself.
  */
 export async function retargetSession(
   h: SessionHandle,
@@ -362,7 +354,6 @@ export async function retargetSession(
   const r = await patchSchemaEntity(await sessionSchema(), h.sessionId, {
     workspace: { "#": workspaceId },
     viewer: { "#": viewerPersonaId },
-    rev: Date.now(),
   });
   if (!r.ok) throw new Error(`session retarget rejected: ${r.error.message}`);
 }
