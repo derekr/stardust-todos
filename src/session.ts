@@ -20,7 +20,15 @@
 // stream re-emits when the session changes — a filter edit (setFilter) or an
 // explicit `refresh()`, both of which bump the session's `rev`.
 
-import { type EntityId, createSchemaEntity, deleteEntity, patchSchemaEntity, query, readResults } from "./stardust.ts";
+import {
+  type EntityId,
+  createSchemaEntity,
+  deleteEntity,
+  patchSchemaEntity,
+  query,
+  readEntity,
+  readResults,
+} from "./stardust.ts";
 import { facetSchema, sessionSchema } from "./schemas.ts";
 import { ensureReactor } from "./reactors.ts";
 import type { Filter } from "./board.ts";
@@ -231,6 +239,7 @@ export async function setFilter(h: SessionHandle, f: Filter, actor: string): Pro
   await writeFacet(h.sessionId, "tag", f.tags);
   const r = await patchSchemaEntity(await sessionSchema(), h.sessionId, {
     view: f.view,
+    group: f.group, // display-only, but per-session state, so it lives here too
     actor,
     tagActive: f.tags.length > 0,
     rev: Date.now(),
@@ -249,4 +258,58 @@ export async function refresh(h: SessionHandle): Promise<void> {
 export async function readSnapshot(h: SessionHandle): Promise<SnapshotRow[]> {
   const rid = await ensureBoardReactor();
   return (await readResults(rid, { sid: h.sessionId })) as SnapshotRow[];
+}
+
+/**
+ * The Filter a session currently encodes, read back out of Stardust.
+ *
+ * The session IS the filter state, so the server holds none: two browsers on the
+ * same board have two sessions and two independent filters. Note the encoding
+ * this has to invert — an empty facet is materialized as the whole domain (an
+ * absent join matches nothing), so a full set reads back as "no filter". Picking
+ * every value by hand is therefore indistinguishable from picking none, which is
+ * exactly how the UI treats them anyway.
+ */
+export async function readFilter(h: SessionHandle): Promise<Filter> {
+  const [e, rows] = await Promise.all([
+    readEntity(h.sessionId),
+    query({
+      find: ["?facet", "?value"],
+      where: [
+        ["?f", "kind", "sf"],
+        ["?f", "session", { "#": h.sessionId }],
+        ["?f", "facet", "?facet"],
+        ["?f", "value", "?value"],
+      ],
+    }) as Promise<[string, string][]>,
+  ]);
+  const of = (facet: string) => rows.filter(([f]) => f === facet).map(([, v]) => v);
+  const unDomain = (vals: string[], domain: readonly string[]) => (vals.length >= domain.length ? [] : vals);
+  return {
+    status: unDomain(of("status"), STATUS_DOMAIN) as Filter["status"],
+    priority: unDomain(of("priority"), PRIORITY_DOMAIN) as Filter["priority"],
+    tags: of("tag"),
+    view: (e.view as Filter["view"]) ?? "all",
+    group: (e.group as Filter["group"]) ?? "status",
+  };
+}
+
+/**
+ * Point a session at a different workspace or viewer.
+ *
+ * The scope is facts ON the session, so switching workspace or "view as" has to
+ * move the session too — otherwise the board keeps rendering the old scope. Bumps
+ * `rev` so the reactor re-emits.
+ */
+export async function retargetSession(
+  h: SessionHandle,
+  workspaceId: EntityId,
+  viewerPersonaId: EntityId,
+): Promise<void> {
+  const r = await patchSchemaEntity(await sessionSchema(), h.sessionId, {
+    workspace: { "#": workspaceId },
+    viewer: { "#": viewerPersonaId },
+    rev: Date.now(),
+  });
+  if (!r.ok) throw new Error(`session retarget rejected: ${r.error.message}`);
 }

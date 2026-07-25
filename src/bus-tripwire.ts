@@ -78,7 +78,21 @@ async function watchBus(
 
 // ---- Board: everything in the workspace the board renders --------------------
 
-/** This workspace's todos + the tag/dep edges that reference them. */
+/**
+ * This workspace's todos + the tag/dep edges that reference them.
+ *
+ * The edges are scoped APP-SIDE on purpose. The obvious query — `[?e todo ?t]`
+ * joined to `[?t workspace {# id}]` — is rejected with "entity var ?t is not
+ * entity", and the reason is worth knowing: storing a reactor writes its query
+ * body into the same fact space as app data. Reactor 510's clause entity really
+ * does carry `{blocker: "?b", status: "?bs", title: "?bt", todo: "?t"}` — the
+ * variable NAMES as string values. So `blocker` and `todo` hold both refs and
+ * strings, and the planner can no longer treat them as entity-valued.
+ *
+ * That makes any such join hostage to whether some stored reactor happens to
+ * mention the field, which is not a property a tripwire should depend on. Fetch
+ * the edges and filter against the workspace's todo ids here instead.
+ */
 async function boardMembers(ctx: WorkspaceCtx): Promise<Set<EntityId>> {
   const ws = { "#": ctx.workspaceId };
   const todos = (await query({
@@ -88,24 +102,20 @@ async function boardMembers(ctx: WorkspaceCtx): Promise<Set<EntityId>> {
       ["?t", "workspace", ws],
     ],
   })) as [EntityId][];
-  const ids = new Set<EntityId>(todos.map((r) => r[0]));
-  const byTodo = (await query({
-    find: ["?e"],
-    where: [
-      ["?e", "todo", "?t"],
-      ["?t", "workspace", ws],
-    ],
-  })) as [EntityId][];
-  const byBlk = (await query({
-    find: ["?e"],
-    where: [
-      ["?e", "blocker", "?t"],
-      ["?t", "workspace", ws],
-    ],
-  })) as [EntityId][];
-  for (const [e] of byTodo) ids.add(e);
-  for (const [e] of byBlk) ids.add(e);
-  return ids;
+  const todoIds = new Set<EntityId>(todos.map((r) => r[0]));
+  const out = new Set<EntityId>(todoIds);
+
+  const isRef = (v: unknown): boolean => typeof v === "object" && v !== null && "#" in (v as object);
+  for (const field of ["todo", "blocker"] as const) {
+    const rows = (await query({
+      find: ["?e", "?ref"],
+      where: [["?e", field, "?ref"]],
+    })) as [unknown, unknown][];
+    for (const [e, r] of rows) {
+      if (isRef(r) && todoIds.has(refId(r))) out.add(refId(e)); // skip reactor-clause strings
+    }
+  }
+  return out;
 }
 
 /**

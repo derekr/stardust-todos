@@ -24,6 +24,7 @@ import {
   toggleTodo,
 } from "./todos.ts";
 import { type WorkspaceCtx, defaultWorkspace, openWorkspace } from "./workspace.ts";
+import type { EntityId } from "./stardust.ts";
 import { createPersona, createWorkspace, ensureUser, grantAccess, listPersonas, roleOf } from "./tenancy.ts";
 import { authorizeCommand, catalog, ensureCommandCatalog, project } from "./commands.ts";
 import { addDependency, removeDependency, tagsOf } from "./features.ts";
@@ -36,7 +37,16 @@ import {
   emptyFilter,
   todoOptions,
 } from "./board.ts";
-import { type SessionHandle, createSession, ensureBoardReactor, readSnapshot, refresh, setFilter } from "./session.ts";
+import {
+  type SessionHandle,
+  createSession,
+  ensureBoardReactor,
+  readFilter,
+  readSnapshot,
+  refresh,
+  retargetSession,
+  setFilter,
+} from "./session.ts";
 import { BASE, TxConflictError, lastTx, readEntity } from "./stardust.ts";
 import { blockedByTodo } from "./queries.ts";
 import { statusHistory } from "./history.ts";
@@ -67,7 +77,6 @@ import {
 const PORT = Number(process.env.PORT ?? 3000);
 
 let ctx: WorkspaceCtx = await defaultWorkspace();
-let filter: Filter = { ...emptyFilter };
 
 // Demo roles: the default persona owns the workspace; add a "Teammate" persona
 // with a member grant so "view as" can switch role and drive the command
@@ -105,7 +114,9 @@ const switchControllers = new Set<AbortController>();
 // board-changing action (filter toggle, todo mutation) refreshes the live curl,
 // not just priority changes.
 const rerenderAll = () => {
-  if (boardSession) void refresh(boardSession).catch(() => {});
+  // Bump every live session so any pane bound to one re-emits — a write is not
+  // scoped to the browser that made it.
+  for (const sid of liveSessions) void refresh(sessionOf(sid)).catch(() => {});
   for (const c of switchControllers) c.abort();
 };
 
@@ -127,20 +138,51 @@ const getSignals = (req: http.IncomingMessage): Record<string, unknown> => {
   }
 };
 
-// Board SEARCH SESSION: the filter state (priority) + viewer visibility live as
-// facts in Stardust; the board reads a fully-shaped todo SNAPSHOT off the ONE
-// canonical reactor (bound to this session). Recreated when the workspace or the
-// "view as" viewer changes, since visibility is viewer-scoped.
-let boardSession: SessionHandle | null = null;
-let boardSessionKey = "";
-async function ensureBoardSession(): Promise<SessionHandle> {
-  const key = `${ctx.workspaceId}:${viewPersona}`;
-  if (!boardSession || boardSessionKey !== key) {
-    boardSession = await createSession(ctx.workspaceId, viewPersona, actorName());
-    boardSessionKey = key;
-    await setFilter(boardSession, filter, actorName());
+// Board SEARCH SESSION — one per BROWSER, not one per process.
+//
+// The filter state and viewer visibility live as facts in Stardust, and the sid
+// travels in the URL (/s/<sid>) and as a Datastar signal, so two browsers on the
+// same board hold two independent filters. The server keeps no filter state at
+// all; every render reads the session back with readFilter().
+//
+// It used to be a single module-level session keyed by workspace+viewer, which
+// meant every browser shared one filter AND every restart abandoned a session
+// entity — the same accumulation the board reactor had.
+const sessionOf = (sessionId: EntityId): SessionHandle => ({ sessionId, workspaceId: ctx.workspaceId });
+
+/** sids with a live stream, so a write can nudge every open board to re-emit. */
+const liveSessions = new Set<EntityId>();
+
+/**
+ * Move every live session to the current workspace + viewer, resetting its
+ * filter. Needed because a session stores its own scope as facts: without this a
+ * workspace switch would leave open boards rendering the workspace they were
+ * created in. (One active workspace per server is a demo simplification.)
+ */
+async function rescope(): Promise<void> {
+  for (const sid of liveSessions) {
+    const h = sessionOf(sid);
+    await retargetSession(h, ctx.workspaceId, viewPersona).catch((e) => console.error("rescope:", e));
+    await setFilter(h, { ...emptyFilter }, actorName()).catch((e) => console.error("rescope filter:", e));
   }
-  return boardSession;
+}
+
+/** A fresh session for a newly-arrived browser. */
+async function newSession(): Promise<SessionHandle> {
+  const h = await createSession(ctx.workspaceId, viewPersona, actorName());
+  await setFilter(h, { ...emptyFilter }, actorName());
+  return h;
+}
+
+/** The demo affordance (/session.json, the startup banner) needs *a* session. */
+let demoSession: SessionHandle | null = null;
+const ensureDemoSession = async (): Promise<SessionHandle> => (demoSession ??= await newSession());
+
+/** The session a request names in its path: /s/<sid>/… */
+function sidIn(seg: string[]): EntityId | null {
+  if (seg[0] !== "s") return null;
+  const v = Number(seg[1]);
+  return Number.isFinite(v) && v > 0 ? v : null;
 }
 
 // ---- Vendored static assets ------------------------------------------------
@@ -178,8 +220,7 @@ async function serveStatic(parts: string[], res: http.ServerResponse): Promise<v
 // canonical reactor applies EVERY filter (priority, status, tags, views) +
 // visibility + derivation server-side, so there is ONE read path feeding both the
 // SSE patches and the server-rendered first paint.
-async function boardData() {
-  const session = await ensureBoardSession();
+async function boardData(session: SessionHandle) {
   const [snap, counts, tags, blockers] = await Promise.all([
     readSnapshot(session),
     aggregateCounts(ctx, viewPersona), // counts over the SAME visible set
@@ -189,22 +230,23 @@ async function boardData() {
   return { todos: snap as unknown as Todo[], counts, tags, blockers }; // SnapshotRow is Todo-shaped
 }
 
-// Render the filter bar + board over the stream.
-async function renderBoard(stream: any) {
-  const { todos, counts, tags, blockers } = await boardData();
-  stream.patchElements(filterBar(filter, counts.status, counts.priority, tags));
+// Render the filter bar + board over the stream, for ONE session.
+async function renderBoard(stream: any, session: SessionHandle) {
+  const [{ todos, counts, tags, blockers }, filter] = await Promise.all([boardData(session), readFilter(session)]);
+  const sid = session.sessionId;
+  stream.patchElements(filterBar(sid, filter, counts.status, counts.priority, tags));
   stream.patchElements(boardFragment(todos, blockers, filter));
-  stream.patchElements(sidebar(filter, counts.status)); // desktop rail (hidden < 900px)
+  stream.patchElements(sidebar(sid, filter, counts.status)); // desktop rail (hidden < 900px)
 }
 
 // The same board, rendered into the initial HTML so the first paint is the real
 // page. Datastar morphs its first patch over identical markup, so this is purely
 // additive — nothing downstream changes.
-async function boardView(): Promise<BoardView> {
-  const { todos, counts, tags, blockers } = await boardData();
+async function boardView(session: SessionHandle): Promise<BoardView> {
+  const [{ todos, counts, tags, blockers }, filter] = await Promise.all([boardData(session), readFilter(session)]);
   return {
-    sidebar: sidebar(filter, counts.status),
-    filterbar: filterBarEl(filter, counts.status, counts.priority, tags),
+    sidebar: sidebar(session.sessionId, filter, counts.status),
+    filterbar: filterBarEl(session.sessionId, filter, counts.status, counts.priority, tags),
     board: boardEl(todos, blockers, filter),
     visible: todos.length,
     total: visibleTotal(counts.status),
@@ -264,24 +306,32 @@ const server = http.createServer(async (req, res) => {
       await serveStatic(seg.slice(1), res);
       return;
     }
-    // Root → mint/reuse the board session and redirect so the sid lives in the
-    // URL (demo: grab it and watch the SAME reactor stream via curl).
+    // Root → a NEW session for this browser, then redirect so the sid is in the
+    // URL. Reloading /s/<sid> reuses it; arriving at / again starts a fresh one,
+    // which is what "a session per browser session" means here.
     if (url === "/" && method === "GET") {
-      const s = await ensureBoardSession();
+      const s = await newSession();
       res.writeHead(302, { location: `/s/${s.sessionId}` });
       res.end();
       return;
     }
-    // Session-scoped page: same board; the sid in the path is the current session.
+    // Session-scoped page. The sid in the path IS the session — it is handed to
+    // the client as a signal so every later request carries it.
     if (seg[0] === "s" && seg.length === 2 && method === "GET") {
+      const sid = Number(seg[1]);
+      if (!Number.isFinite(sid) || sid <= 0) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("not found");
+        return;
+      }
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      res.end(page(await boardView()));
+      res.end(page(sid, await boardView(sessionOf(sid))));
       return;
     }
     // Demo helper: copy-paste curl commands to watch THIS session's snapshot
     // stream (canonical reactor + per-stream sid bind) and the transaction bus.
     if (url === "/session.json" && method === "GET") {
-      const s = await ensureBoardSession();
+      const s = await ensureDemoSession();
       const rid = await ensureBoardReactor();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
@@ -301,11 +351,20 @@ const server = http.createServer(async (req, res) => {
 
     // Long-lived stream: renders wsbar once per iteration, then the filtered
     // board on every change; re-iterates on switch/filter (inner abort).
-    if (url === "/stream" && method === "GET") {
+    if (seg[0] === "s" && seg[2] === "stream" && method === "GET") {
+      const sid = sidIn(seg);
+      if (sid === null) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("not found");
+        return;
+      }
+      const session = sessionOf(sid);
+      liveSessions.add(sid);
       let closed = false;
       let inner: AbortController | null = null;
       req.on("close", () => {
         closed = true;
+        liveSessions.delete(sid);
         inner?.abort();
       });
       ServerSentEventGenerator.stream(req, res, async (stream) => {
@@ -317,10 +376,10 @@ const server = http.createServer(async (req, res) => {
         while (!closed) {
           inner = new AbortController();
           switchControllers.add(inner);
-          await renderBoard(stream); // initial paint
+          await renderBoard(stream, session); // initial paint
           await watchBoardChanges(
             ctx,
-            () => renderBoard(stream).catch((e) => console.error("render:", e)),
+            () => renderBoard(stream, session).catch((e) => console.error("render:", e)),
             inner.signal,
           );
           switchControllers.delete(inner);
@@ -333,17 +392,25 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Filter toggles: /filter/<facet>/<value>
-    if (seg[0] === "filter" && method === "POST") {
-      const [, facet, raw] = seg;
+    if (seg[0] === "s" && seg[2] === "filter" && method === "POST") {
+      const [, , , facet, raw] = seg;
       const value = decodeURIComponent(raw ?? "");
+      const sid = sidIn(seg);
+      if (sid === null) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("not found");
+        return;
+      }
+      const session = sessionOf(sid);
+      // Read-modify-write against THIS session: the filter is not server state,
+      // so a toggle starts from what Stardust currently holds for this browser.
+      const filter = await readFilter(session);
       if (facet === "status") filter.status = toggle(filter.status, value as Status);
       else if (facet === "priority") filter.priority = toggle(filter.priority, value as Priority);
       else if (facet === "tag") filter.tags = toggle(filter.tags, value);
       else if (facet === "view") filter.view = filter.view === (value as any) ? "all" : (value as any);
       else if (facet === "group") filter.group = value as any;
-      // Push the whole filter into the session facts → the reactor re-filters
-      // server-side (group is display-only grouping, not a server-side filter).
-      if (facet !== "group" && boardSession) await setFilter(boardSession, filter, actorName());
+      await setFilter(session, filter, actorName());
       rerenderAll();
       noopStream(req, res);
       return;
@@ -473,7 +540,7 @@ const server = http.createServer(async (req, res) => {
     const switchMatch = url.match(/^\/switch\/(\d+)$/);
     if (switchMatch && method === "POST") {
       ctx = await openWorkspace(personaId, Number(switchMatch[1]));
-      filter = { ...emptyFilter };
+      await rescope();
       rerenderAll();
       noopStream(req, res);
       return;
@@ -486,7 +553,7 @@ const server = http.createServer(async (req, res) => {
         if (!name) return;
         const ws = await createWorkspace(personaId, name);
         ctx = await openWorkspace(personaId, ws.id);
-        filter = { ...emptyFilter };
+        await rescope();
         stream.patchSignals(JSON.stringify({ newWs: "" }));
         rerenderAll();
       });
@@ -638,7 +705,7 @@ server.listen(PORT, async () => {
   console.log(`stardust     -> ${process.env.STARDUST_URL ?? "http://localhost:1981"}`);
   // Pre-create the board session so `/` can redirect to /s/<sid>, and print the
   // copy-paste demo commands (also at GET /session.json).
-  const s = await ensureBoardSession();
+  const s = await ensureDemoSession();
   const rid = await ensureBoardReactor();
   console.log(`\n  session ${s.sessionId} · canonical reactor ${rid}`);
   console.log(

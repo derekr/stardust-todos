@@ -44,6 +44,7 @@ const SESSION_SCHEMA = {
     tagActive: { type: "boolean" },
     rev: { type: "number" },
     sid: { type: "number" }, // set to the session's own id after creation
+    group: { type: "string", enum: ["none", "status", "priority"] }, // display-only grouping
   },
   required: ["kind", "workspace", "viewer", "view", "tagActive", "rev"],
   additionalProperties: false,

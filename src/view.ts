@@ -65,13 +65,13 @@ const ICON = {
 // Secondary facets (status/priority/tag/group) live in a collapsible row behind
 // the sliders toggle so every endpoint stays reachable without clutter.
 
-const viewChip = (label: string, active: boolean, view: string, count?: number) =>
-  `<button class="vchip ${active ? "on" : ""}" data-on:click="@post('${B}/filter/view/${view}')">${esc(label)}${
+const viewChip = (sid: number, label: string, active: boolean, view: string, count?: number) =>
+  `<button class="vchip ${active ? "on" : ""}" data-on:click="@post('${B}/s/${sid}/filter/view/${view}')">${esc(label)}${
     count !== undefined ? `<span class="vc-n">·${count}</span>` : ""
   }</button>`;
 
-const facetChip = (label: string, active: boolean, action: string, count?: number) =>
-  `<button class="fchip ${active ? "on" : ""}" data-on:click="@post('${B}${action}')">${esc(label)}${
+const facetChip = (sid: number, label: string, active: boolean, action: string, count?: number) =>
+  `<button class="fchip ${active ? "on" : ""}" data-on:click="@post('${B}/s/${sid}${action}')">${esc(label)}${
     count !== undefined ? `<span class="fc-n">${count}</span>` : ""
   }</button>`;
 
@@ -84,6 +84,7 @@ export const visibleTotal = (statusCounts: Record<string, number>): number =>
 
 /** The filter bar element on its own — shared by the SSE patch and the SSR shell. */
 export function filterBarEl(
+  sid: number,
   f: Filter,
   statusCounts: Record<string, number>,
   priorityCounts: Record<string, number>,
@@ -92,22 +93,22 @@ export function filterBarEl(
   const total = visibleTotal(statusCounts);
 
   const views =
-    viewChip("all", f.view === "all", "all", total) +
-    viewChip("ready", f.view === "ready", "ready") +
-    viewChip("overdue", f.view === "overdue", "overdue") +
-    viewChip("mine", f.view === "mine", "mine");
+    viewChip(sid, "all", f.view === "all", "all", total) +
+    viewChip(sid, "ready", f.view === "ready", "ready") +
+    viewChip(sid, "overdue", f.view === "overdue", "overdue") +
+    viewChip(sid, "mine", f.view === "mine", "mine");
 
   const statuses = STATUS_ORDER.map((s) =>
-    facetChip(STATUS_LABEL[s], f.status.includes(s), `/filter/status/${s}`, statusCounts[s] ?? 0),
+    facetChip(sid, STATUS_LABEL[s], f.status.includes(s), `/filter/status/${s}`, statusCounts[s] ?? 0),
   ).join("");
   const prios = PRIOS.map((p) =>
-    facetChip(p, f.priority.includes(p), `/filter/priority/${p}`, priorityCounts[p] ?? 0),
+    facetChip(sid, p, f.priority.includes(p), `/filter/priority/${p}`, priorityCounts[p] ?? 0),
   ).join("");
   const tagChips = tags
-    .map((t) => facetChip(`#${t}`, f.tags.includes(t), `/filter/tag/${encodeURIComponent(t)}`))
+    .map((t) => facetChip(sid, `#${t}`, f.tags.includes(t), `/filter/tag/${encodeURIComponent(t)}`))
     .join("");
   const groups = (["status", "priority", "none"] as const)
-    .map((g) => facetChip(g, f.group === g, `/filter/group/${g}`))
+    .map((g) => facetChip(sid, g, f.group === g, `/filter/group/${g}`))
     .join("");
 
   return `<div id="filterbar">
@@ -132,12 +133,13 @@ export function filterBarEl(
  * count-visible the same way.
  */
 export function filterBar(
+  sid: number,
   f: Filter,
   statusCounts: Record<string, number>,
   priorityCounts: Record<string, number>,
   tags: string[],
 ): string {
-  return `${filterBarEl(f, statusCounts, priorityCounts, tags)}
+  return `${filterBarEl(sid, f, statusCounts, priorityCounts, tags)}
   ${cnum("count-total", visibleTotal(statusCounts))}`;
 }
 
@@ -239,30 +241,30 @@ export function palette(globalCmds: ProjectedCommand[]): string {
 
 // ---- Desktop sidebar (shown ≥900px; reuses the same filter endpoints) ----
 
-const sbView = (label: string, active: boolean, view: string, count?: number) =>
-  `<button class="sb-item ${active ? "on" : ""}" data-on:click="@post('${B}/filter/view/${view}')">
+const sbView = (sid: number, label: string, active: boolean, view: string, count?: number) =>
+  `<button class="sb-item ${active ? "on" : ""}" data-on:click="@post('${B}/s/${sid}/filter/view/${view}')">
     <span class="sb-txt">${esc(label)}</span>${count !== undefined ? `<span class="sb-n">${count}</span>` : ""}
   </button>`;
 
-const sbStatus = (s: Status, active: boolean, count: number) =>
-  `<button class="sb-item ${active ? "on" : ""}" data-on:click="@post('${B}/filter/status/${s}')">
+const sbStatus = (sid: number, s: Status, active: boolean, count: number) =>
+  `<button class="sb-item ${active ? "on" : ""}" data-on:click="@post('${B}/s/${sid}/filter/status/${s}')">
     <span class="sb-dot p-${s === "blocked" ? "high" : s === "doing" ? "med" : s === "done" ? "done" : "low"}"></span>
     <span class="sb-txt">${esc(STATUS_LABEL[s])}</span><span class="sb-n">${count}</span>
   </button>`;
 
-export function sidebar(f: Filter, statusCounts: Record<string, number>): string {
+export function sidebar(sid: number, f: Filter, statusCounts: Record<string, number>): string {
   const total = Object.values(statusCounts).reduce((a, b) => a + b, 0);
   return `<aside id="sidebar">
     <div class="sb-brand">Todos<span class="sb-ws">· Default</span></div>
     <button class="sb-add" data-on:click="$addOpen = true; $error = ''">＋ New task</button>
     <nav class="sb-nav">
       <div class="sb-label">views</div>
-      ${sbView("All", f.view === "all", "all", total)}
-      ${sbView("Ready", f.view === "ready", "ready")}
-      ${sbView("Overdue", f.view === "overdue", "overdue")}
-      ${sbView("Mine", f.view === "mine", "mine")}
+      ${sbView(sid, "All", f.view === "all", "all", total)}
+      ${sbView(sid, "Ready", f.view === "ready", "ready")}
+      ${sbView(sid, "Overdue", f.view === "overdue", "overdue")}
+      ${sbView(sid, "Mine", f.view === "mine", "mine")}
       <div class="sb-label">status</div>
-      ${STATUS_ORDER.map((s) => sbStatus(s, f.status.includes(s), statusCounts[s] ?? 0)).join("")}
+      ${STATUS_ORDER.map((s) => sbStatus(sid, s, f.status.includes(s), statusCounts[s] ?? 0)).join("")}
     </nav>
     <div class="sb-foot">
       <div class="sb-valabel">view as</div>
@@ -288,7 +290,7 @@ export interface BoardView {
   total: number;
 }
 
-export function page(view?: BoardView): string {
+export function page(sid: number, view?: BoardView): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -549,7 +551,7 @@ export function page(view?: BoardView): string {
     ${view ? view.filterbar : `<div id="filterbar"></div>`}
 
     <!-- 5/6. long-lived read stream drives #filterbar + #board -->
-    <div data-init="@get('${B}/stream', {retryInterval: 300, retryMaxCount: 100000})">
+    <div data-init="@get('${B}/s/${sid}/stream', {retryInterval: 300, retryMaxCount: 100000})">
       ${view ? view.board : `<div id="board"></div>`}
     </div>
 
@@ -574,7 +576,7 @@ export function page(view?: BoardView): string {
         ${svg(`<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>`)}
       </button>
     </span>
-    <button class="tab" type="button" data-on:click="@post('${B}/filter/view/done')">${ICON.clock}done</button>
+    <button class="tab" type="button" data-on:click="@post('${B}/s/${sid}/filter/view/done')">${ICON.clock}done</button>
     <button class="tab" type="button" data-on:click="$youOpen = true">${ICON.contrast}you</button>
   </nav>
 
@@ -608,17 +610,17 @@ export function page(view?: BoardView): string {
     <h2>Views</h2>
     <div class="sh-label">show</div>
     <div class="sh-grid">
-      <button data-on:click="@post('${B}/filter/view/all'); $viewsOpen = false">All</button>
-      <button data-on:click="@post('${B}/filter/view/ready'); $viewsOpen = false">Ready</button>
-      <button data-on:click="@post('${B}/filter/view/overdue'); $viewsOpen = false">Overdue</button>
-      <button data-on:click="@post('${B}/filter/view/mine'); $viewsOpen = false">Mine</button>
-      <button data-on:click="@post('${B}/filter/view/done'); $viewsOpen = false">Done</button>
+      <button data-on:click="@post('${B}/s/${sid}/filter/view/all'); $viewsOpen = false">All</button>
+      <button data-on:click="@post('${B}/s/${sid}/filter/view/ready'); $viewsOpen = false">Ready</button>
+      <button data-on:click="@post('${B}/s/${sid}/filter/view/overdue'); $viewsOpen = false">Overdue</button>
+      <button data-on:click="@post('${B}/s/${sid}/filter/view/mine'); $viewsOpen = false">Mine</button>
+      <button data-on:click="@post('${B}/s/${sid}/filter/view/done'); $viewsOpen = false">Done</button>
     </div>
     <div class="sh-label">group by</div>
     <div class="sh-grid">
-      <button data-on:click="@post('${B}/filter/group/status'); $viewsOpen = false">Status</button>
-      <button data-on:click="@post('${B}/filter/group/priority'); $viewsOpen = false">Priority</button>
-      <button data-on:click="@post('${B}/filter/group/none'); $viewsOpen = false">None</button>
+      <button data-on:click="@post('${B}/s/${sid}/filter/group/status'); $viewsOpen = false">Status</button>
+      <button data-on:click="@post('${B}/s/${sid}/filter/group/priority'); $viewsOpen = false">Priority</button>
+      <button data-on:click="@post('${B}/s/${sid}/filter/group/none'); $viewsOpen = false">None</button>
     </div>
   </div>
 
