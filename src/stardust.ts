@@ -273,6 +273,21 @@ export async function readEntity(id: EntityId): Promise<Record<string, unknown>>
   return (await one<Record<string, unknown>>("GET", `/entities/${id}?max=1`)) ?? {};
 }
 
+/**
+ * Watch one entity. The same route without `max` is the live form: the current
+ * snapshot first, then a fresh one whenever the entity's own facts change. This is
+ * Stardust noticing the change instead of the app subscribing to every commit and
+ * filtering — but note the scope is exactly this entity, so a change to something
+ * that merely REFERENCES it (a new tag edge) does not appear here.
+ */
+export async function watchEntity(
+  id: EntityId,
+  onSnapshot: (e: Record<string, unknown>) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  await streamRecords(`/entities/${id}`, (rec) => void onSnapshot(rec as Record<string, unknown>), signal);
+}
+
 export async function deleteEntity(id: EntityId): Promise<void> {
   await fetch(`${BASE}/entities/${id}`, { method: "DELETE", headers: { Accept: NDJSON } });
 }

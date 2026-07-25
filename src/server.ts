@@ -46,8 +46,9 @@ import {
   refresh,
   retargetSession,
   setFilter,
+  watchSnapshot,
 } from "./session.ts";
-import { BASE, TxConflictError, lastTx, readEntity } from "./stardust.ts";
+import { BASE, TxConflictError, lastTx, readEntity, watchEntity } from "./stardust.ts";
 import { blockedByTodo } from "./queries.ts";
 import { statusHistory } from "./history.ts";
 import {
@@ -220,9 +221,9 @@ async function serveStatic(parts: string[], res: http.ServerResponse): Promise<v
 // canonical reactor applies EVERY filter (priority, status, tags, views) +
 // visibility + derivation server-side, so there is ONE read path feeding both the
 // SSE patches and the server-rendered first paint.
-async function boardData(session: SessionHandle) {
+async function boardData(session: SessionHandle, pushed?: Todo[]) {
   const [snap, counts, tags, blockers] = await Promise.all([
-    readSnapshot(session),
+    pushed ? Promise.resolve(pushed) : readSnapshot(session),
     aggregateCounts(ctx, viewPersona), // counts over the SAME visible set
     availableTags(ctx),
     blockerMap(ctx),
@@ -230,9 +231,14 @@ async function boardData(session: SessionHandle) {
   return { todos: snap as unknown as Todo[], counts, tags, blockers }; // SnapshotRow is Todo-shaped
 }
 
-// Render the filter bar + board over the stream, for ONE session.
-async function renderBoard(stream: any, session: SessionHandle) {
-  const [{ todos, counts, tags, blockers }, filter] = await Promise.all([boardData(session), readFilter(session)]);
+// Render the filter bar + board over the stream, for ONE session. `pushed` is the
+// row set Stardust just emitted — passing it through avoids re-reading a snapshot
+// we were handed a moment ago.
+async function renderBoard(stream: any, session: SessionHandle, pushed?: Todo[]) {
+  const [{ todos, counts, tags, blockers }, filter] = await Promise.all([
+    boardData(session, pushed),
+    readFilter(session),
+  ]);
   const sid = session.sessionId;
   stream.patchElements(filterBar(sid, filter, counts.status, counts.priority, tags));
   stream.patchElements(boardFragment(todos, blockers, filter));
@@ -368,18 +374,17 @@ const server = http.createServer(async (req, res) => {
         inner?.abort();
       });
       ServerSentEventGenerator.stream(req, res, async (stream) => {
-        // Bus tripwire, not the workspace reactor stream: the reactor only
-        // re-emits on changes to entities in its top-level `where` (todo fields),
-        // so it's blind to tag/dependency EDGE writes the board renders. The bus
-        // sees every commit; watchBoardChanges filters to this workspace app-side.
-        const { watchBoardChanges } = await import("./bus-tripwire.ts");
+        // The board is driven by Stardust, not by the app watching the commit bus:
+        // the reactor re-emits the whole result when this session's `rev` changes or
+        // a todo field in its top-level `where` moves, and each emission is rendered
+        // as-is. Nothing here decides what is relevant — the query already did.
         while (!closed) {
           inner = new AbortController();
           switchControllers.add(inner);
-          await renderBoard(stream, session); // initial paint
-          await watchBoardChanges(
-            ctx,
-            () => renderBoard(stream, session).catch((e) => console.error("render:", e)),
+          await watchSnapshot(
+            session,
+            (rows) =>
+              void renderBoard(stream, session, rows as unknown as Todo[]).catch((e) => console.error("render:", e)),
             inner.signal,
           );
           switchControllers.delete(inner);
@@ -440,15 +445,17 @@ const server = http.createServer(async (req, res) => {
         ac.abort();
       });
       ServerSentEventGenerator.stream(req, res, async (stream) => {
-        // Entity-scoped bus tripwire: repaint on any change to THIS todo's detail
-        // neighborhood — its own fields, its tags/dependencies, or a dependency
-        // neighbor's status (a blocker completing must repaint). A raw ?entityId
-        // server-side filter would miss the edge-derived parts, so we filter the
-        // bus app-side to that neighborhood.
-        const { watchEntityChanges } = await import("./bus-tripwire.ts");
+        // `GET /entities/{id}` without `max` is Stardust's own live form: current
+        // snapshot, then one per change to this todo's facts. So the repaint trigger
+        // is a subscription rather than app code sifting the commit bus.
+        //
+        // Narrower than the tripwire it replaces, deliberately: it fires for THIS
+        // todo's fields, not for a new tag edge or a blocker's status. The browser
+        // that makes such a change repaints from its own request; another browser
+        // sees it on next load.
         while (!closed) {
-          await sendDetail(stream, id); // paint + repaint on any detail-neighborhood change
-          await watchEntityChanges(id, () => void sendDetail(stream, id).catch(() => {}), ac.signal);
+          await sendDetail(stream, id); // paint, then repaint per pushed snapshot
+          await watchEntity(id, () => void sendDetail(stream, id).catch(() => {}), ac.signal);
           if (!closed && !ac.signal.aborted) await new Promise((r) => setTimeout(r, 500));
         }
       });

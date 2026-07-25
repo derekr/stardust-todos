@@ -27,6 +27,7 @@ import {
   query,
   readEntity,
   readResults,
+  streamResults,
   transact,
 } from "./stardust.ts";
 import { sessionSchema } from "./schemas.ts";
@@ -289,6 +290,25 @@ export async function refresh(h: SessionHandle): Promise<void> {
 export async function readSnapshot(h: SessionHandle): Promise<SnapshotRow[]> {
   const rid = await ensureBoardReactor();
   return (await readResults(rid, { sid: h.sessionId })) as SnapshotRow[];
+}
+
+/**
+ * Watch this session's board. Stardust pushes the complete new result whenever the
+ * session's `rev` changes or a todo field in the reactor's top-level `where` moves,
+ * so the server does not have to notice anything itself.
+ *
+ * What it will NOT push: a write to an entity the reactor only reaches through a
+ * bound `exists` subquery — a new tag edge, verified, even when that edge changes
+ * which rows match. Treat the board as a snapshot that advances on rev and on
+ * direct field changes.
+ */
+export async function watchSnapshot(
+  h: SessionHandle,
+  onRows: (rows: SnapshotRow[]) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const rid = await ensureBoardReactor();
+  await streamResults(rid, (rows) => onRows(rows as SnapshotRow[]), signal, { sid: h.sessionId });
 }
 
 /**
