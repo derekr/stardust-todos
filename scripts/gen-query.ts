@@ -43,7 +43,9 @@ async function main() {
   // Merge fields across ALL schemas. field -> { types:Set, validators:Set, sources:Set }
   const reg = new Map<string, { types: Set<string>; vals: Set<string>; from: Set<string> }>();
   for (const u of list.schemas ?? []) {
-    const schema = await (await fetch(`${BASE}${u}`, { headers: { Accept: "application/schema+json" } })).json();
+    // `application/schema+json` is for SENDING a schema; reading one back needs a
+    // negotiated record profile, or 0.0.6 answers 406 with an empty body.
+    const schema = await (await fetch(`${BASE}${u}`, { headers: { Accept: "application/x-ndjson" } })).json();
     const title = String(schema.title ?? u);
     for (const [name, p] of Object.entries<any>(schema.properties ?? {})) {
       const e = reg.get(name) ?? { types: new Set(), vals: new Set(), from: new Set() };

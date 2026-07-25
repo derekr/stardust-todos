@@ -5,10 +5,10 @@
 // `ensureBoardReactor()` memoized in a module variable, so every restart minted
 // another live reactor.
 //
-// Reactors are therefore looked up by NAME, not by id. A tiny `reactorRef` entity
-// records (app, name) -> reactor, and provisioning is: find the ref, create the
-// reactor and its ref if absent, otherwise reconcile the stored body against the
-// definition here and PATCH only when they differ.
+// Reactors are therefore looked up by NAME, not by id (see registry.ts for the
+// marker mechanism, shared with the Todo schema). Provisioning is: find the ref,
+// create the reactor and its ref if absent, otherwise reconcile the stored body
+// against the definition here and PATCH only when they differ.
 //
 // Why not a fixed id? `POST /reactors/{id}` is atomic and idempotent (409
 // entity_exists), which makes "provision at a configured id" tempting — it is what
@@ -28,15 +28,12 @@ import {
   type EntityId,
   createReactor,
   patchReactor,
-  query,
   readReactor,
   readResults,
-  refId,
   streamResults,
-  transact,
 } from "./stardust.ts";
+import { lookupRef, putRef } from "./registry.ts";
 import { type QueryLiteral, type ResultOf, rowValidator } from "./typed-query.ts";
-import { APP } from "./tenancy.ts";
 
 export interface Provisioned {
   name: string;
@@ -56,20 +53,6 @@ function stable(v: unknown): string {
     .join(",")}}`;
 }
 
-/** The reactor previously provisioned under this name, if any. */
-async function lookup(name: string): Promise<EntityId | undefined> {
-  const rows = (await query({
-    find: ["?r", "?rid"],
-    where: [
-      ["?r", "kind", "reactorRef"],
-      ["?r", "app", APP],
-      ["?r", "name", name],
-      ["?r", "reactor", "?rid"],
-    ],
-  })) as [unknown, unknown][];
-  return rows.length ? refId(rows[0][1]) : undefined;
-}
-
 /**
  * Make the reactor named `name` exist and match `body`. Safe to call on every
  * boot: it writes only when something actually differs.
@@ -78,10 +61,10 @@ async function lookup(name: string): Promise<EntityId | undefined> {
  * separately from the body Stardust echoes back under `reactor`.
  */
 export async function ensureReactor(name: string, body: Record<string, unknown>): Promise<Provisioned> {
-  const existing = await lookup(name);
+  const existing = await lookupRef("reactorRef", name);
   if (existing === undefined) {
     const id = await createReactor(body);
-    await transact({ "#_ref": { kind: "reactorRef", app: APP, name, reactor: { "#": id } } });
+    await putRef("reactorRef", name, id);
     return { name, id, status: "created" };
   }
 

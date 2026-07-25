@@ -287,10 +287,17 @@ export async function createSchema(doc: unknown): Promise<{ schemaId: EntityId }
   return { schemaId: refId(rec.schemaId) };
 }
 
+/**
+ * Does this schema exist? 200 = yes.
+ *
+ * `application/schema+json` is the media type for SENDING a schema document, not
+ * for reading one back: 0.0.6 answers a read with `406 Not Acceptable` unless you
+ * negotiate a record profile. That 406 used to read as "missing" here, so every
+ * boot created ANOTHER Todo schema — five of them accumulated in the demo.
+ * A missing id answers 400, not 404.
+ */
 export async function readSchema(id: EntityId): Promise<{ status: number }> {
-  // Schema documents stay `application/schema+json` — an external media contract,
-  // not a record stream.
-  const res = await fetch(`${BASE}/schemas/${id}`, { headers: { Accept: "application/schema+json" } });
+  const res = await fetch(`${BASE}/schemas/${id}`, { headers: { Accept: NDJSON } });
   return { status: res.status };
 }
 

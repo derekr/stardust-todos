@@ -6,7 +6,9 @@ export type Instant = { "#utc": string };
 
 export interface SchemaFieldTypes {
   app: string;  // from Todo
+  author: Ref;  // from Todo
   done: boolean;  // from Todo
+  draft: boolean;  // from Todo
   due: Instant;  // from Todo
   lastActor: string;  // from Todo
   priority: "low" | "med" | "high";  // from Todo
@@ -18,7 +20,9 @@ export interface SchemaFieldTypes {
 
 export const schemaValidators = {
   app: (v) => typeof v === "string",
+  author: (v) => typeof (v as any)?.["#"] === "number",
   done: (v) => typeof v === "boolean",
+  draft: (v) => typeof v === "boolean",
   due: (v) => typeof (v as any)?.["#utc"] === "string",
   lastActor: (v) => typeof v === "string",
   priority: (v) => (["low","med","high"] as unknown[]).includes(v),

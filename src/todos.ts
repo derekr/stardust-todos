@@ -9,8 +9,9 @@
 //   2. reads  — the reactor's where-clause is pinned to the workspace server-side.
 //   3. writes — belongsTo() re-checks the fact before every mutation.
 
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import type { WorkspaceCtx } from "./workspace.ts";
+import { lookupRef, putRef } from "./registry.ts";
 import { APP } from "./tenancy.ts";
 import {
   type CheckLast,
@@ -69,6 +70,7 @@ interface TodoDoc {
   draft?: boolean; // draft = visible only to `author` until published
 }
 
+/** Legacy id cache — read once to adopt an existing schema, never written. */
 const STATE_FILE = new URL("../.state.json", import.meta.url);
 
 // Evolved schema. It has grown three times without a rewrite or downtime:
@@ -96,6 +98,7 @@ const TODO_SCHEMA = {
   additionalProperties: false,
 };
 
+const SCHEMA_NAME = "todo";
 let schemaIdCache: EntityId | null = null;
 
 async function readState(): Promise<{ schemaId?: EntityId }> {
@@ -106,12 +109,29 @@ async function readState(): Promise<{ schemaId?: EntityId }> {
   }
 }
 
-/** Create-or-reuse the Todo schema and GROW it in place to include `workspace`. */
+/**
+ * Create-or-reuse the Todo schema and GROW it in place.
+ *
+ * The id lives in Stardust as a `schemaRef` marker, not in a local file. It used
+ * to be cached in .state.json, which meant a missing file produced ANOTHER schema
+ * — the live demo collected five identical Todo schemas that way. A checkout that
+ * still has the old file gets adopted once (its id is recorded as the marker) so
+ * upgrading does not orphan the existing schema and its todos.
+ */
 export async function ensureTodoSchema(): Promise<EntityId> {
   if (schemaIdCache) return schemaIdCache;
-  const state = await readState();
 
-  let schemaId = state.schemaId;
+  let schemaId = await lookupRef("schemaRef", SCHEMA_NAME);
+  let adopted = false;
+  if (schemaId === undefined) {
+    // one-time migration: adopt the id the local state file remembers
+    const legacy = (await readState()).schemaId;
+    if (legacy && (await readSchema(legacy)).status === 200) {
+      schemaId = legacy;
+      adopted = true;
+    }
+  }
+
   if (schemaId && (await readSchema(schemaId)).status === 200) {
     // In-place evolution of an existing single-tenant schema: add `workspace`,
     // replace `required`. Merge-patch — existing todos are not migrated.
@@ -132,7 +152,9 @@ export async function ensureTodoSchema(): Promise<EntityId> {
     schemaId = (await createSchema(TODO_SCHEMA)).schemaId;
   }
 
-  await writeFile(STATE_FILE, JSON.stringify({ schemaId }, null, 2));
+  if (adopted || (await lookupRef("schemaRef", SCHEMA_NAME)) === undefined) {
+    await putRef("schemaRef", SCHEMA_NAME, schemaId);
+  }
   schemaIdCache = schemaId;
   return schemaId;
 }
