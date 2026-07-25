@@ -12,6 +12,7 @@ export interface SchemaFieldTypes {
   draft: boolean;  // from Todo
   due: Instant;  // from Todo
   facet: "status" | "priority" | "tag";  // from SessionFacet
+  group: "none" | "status" | "priority";  // from Session
   kind: unknown;  // from Grant, Session, SessionFacet
   lastActor: string;  // from Todo
   persona: Ref;  // from Grant
@@ -38,6 +39,7 @@ export const schemaValidators = {
   draft: (v) => typeof v === "boolean",
   due: (v) => typeof (v as any)?.["#utc"] === "string",
   facet: (v) => (["status","priority","tag"] as unknown[]).includes(v),
+  group: (v) => (["none","status","priority"] as unknown[]).includes(v),
   kind: () => true,
   lastActor: (v) => typeof v === "string",
   persona: (v) => typeof (v as any)?.["#"] === "number",
