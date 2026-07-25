@@ -15,6 +15,7 @@ npm install                       # installs @starfederation/datastar-sdk
 ./scripts/vendor-assets.sh        # datastar + IBM Plex into public/ (once)
 # point at a throwaway Stardust DB:
 export STARDUST_URL=http://localhost:1981
+npm run stardust:setup            # provision the named reactors
 ```
 
 The browser assets are vendored rather than pulled from a CDN: the page's content
@@ -22,8 +23,15 @@ arrives over the reactor stream, and a third-party script in front of that strea
 gates first paint. The web UI also server-renders the first board into the HTML,
 so nothing flashes in — Datastar morphs its first patch over identical markup.
 
-On first run the app creates a `Todo` JSON Schema and a list reactor in Stardust,
-then caches their ids in `.state.json` so later runs reuse them.
+On first run the app creates a `Todo` JSON Schema and caches its id in
+`.state.json` so later runs reuse it.
+
+Reactors are provisioned by NAME, not cached: `npm run stardust:setup` creates
+each one, or updates it if its definition has drifted, or leaves it alone —
+re-running is free. The app does the same check on boot, so the setup script is
+only about making a deploy fail there rather than on someone's first request.
+This matters because a reactor is stored state: the board reactor used to be
+created per process, so every restart left another live one behind.
 
 ## CLI
 

@@ -345,6 +345,23 @@ export async function createReactor(body: unknown): Promise<EntityId> {
   return refId(rec.reactorId);
 }
 
+/** A stored reactor document. The query body lives under `reactor`. */
+export interface ReactorDoc {
+  reactorId: Ref | number;
+  enabled?: boolean;
+  reactor: Record<string, unknown>;
+}
+
+
+export async function readReactor(id: EntityId): Promise<ReactorDoc> {
+  return one<ReactorDoc>("GET", `/reactors/${id}`);
+}
+
+/** Replace a stored reactor's body. Note: plain JSON — reactors reject merge-patch. */
+export async function patchReactor(id: EntityId, body: unknown): Promise<ReactorDoc> {
+  return one<ReactorDoc>("PATCH", `/reactors/${id}`, { body, contentType: "application/json" });
+}
+
 /**
  * Run a one-shot datalog query (find/where/...) without storing a reactor.
  * `Row` types the result: `query<[EntityId, string]>(...)` for find-tuples, or

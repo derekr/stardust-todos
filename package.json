@@ -8,6 +8,7 @@
     "web": "node src/server.ts",
     "cli": "node src/cli.ts",
     "seed": "node src/seed-demo.ts",
+    "stardust:setup": "node scripts/setup.ts",
     "fmt": "oxfmt src scripts",
     "fmt:check": "oxfmt --check src scripts",
     "lint": "oxlint src scripts",

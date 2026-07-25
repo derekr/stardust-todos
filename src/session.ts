@@ -20,7 +20,8 @@
 // stream re-emits when the session changes — a filter edit (setFilter) or an
 // explicit `refresh()`, both of which bump the session's `rev`.
 
-import { type EntityId, createReactor, deleteEntity, query, readResults, transact } from "./stardust.ts";
+import { type EntityId, deleteEntity, query, readResults, transact } from "./stardust.ts";
+import { ensureReactor } from "./reactors.ts";
 import type { Filter } from "./board.ts";
 import { APP } from "./tenancy.ts";
 
@@ -87,7 +88,7 @@ const tagSub = {
 // scalar fields (viewer/view/actor/tagActive/workspace) drive the filters, and its
 // `sf` facet entities drive the multi-select value-joins. Patching the session
 // (its `rev`) re-emits. Projects the fully-filtered, fully-shaped board rows.
-function canonicalBody(): unknown {
+export function canonicalBody(): Record<string, unknown> {
   return {
     enabled: true,
     find: ["?t"],
@@ -157,10 +158,17 @@ function canonicalBody(): unknown {
   };
 }
 
+/** The name this app provisions its board reactor under. */
+export const BOARD_REACTOR = "board";
+
 let reactorPromise: Promise<EntityId> | null = null;
-/** Create-or-reuse the single canonical board reactor (once per process). */
+/**
+ * The canonical board reactor, provisioned at its fixed id. Idempotent — it
+ * creates the reactor, updates it if `canonicalBody()` has changed since, or does
+ * nothing. Memoized so the check costs one round trip per process, not per read.
+ */
 export function ensureBoardReactor(): Promise<EntityId> {
-  return (reactorPromise ??= createReactor(canonicalBody()));
+  return (reactorPromise ??= ensureReactor(BOARD_REACTOR, canonicalBody()).then((r) => r.id));
 }
 
 /** Rewrite one facet's `sf` entities (empty = the full domain, i.e. "all"). */
