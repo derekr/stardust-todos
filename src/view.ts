@@ -1,6 +1,8 @@
 // Server-rendered HTML for the HOME/LIST screen — Gruvbox-dark mobile design.
-// Datastar (v1.0.2) patches #board, #filterbar (and the two count spans) over
-// the long-lived /stream SSE. All colors derive from the :root tokens.
+// Datastar (v1.0.2) patches #board, #filterbar (and the two count spans) over the
+// long-lived /s/<sid>/stream SSE. The sid is in the URL rather than a signal, so the
+// session a click belongs to is named by the request itself. Colors derive from the
+// :root tokens.
 
 import type { Todo, Priority, Status } from "./todos.ts";
 import type { Filter } from "./board.ts";

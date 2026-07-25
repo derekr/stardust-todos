@@ -1,9 +1,14 @@
 # todo-stardust
 
 A todo app backed by [Stardust](http://localhost:1980/docs/) facts, with **two frontends** —
-a CLI and a **Datastar** web UI — that stay in sync **live**. Both render the same
-Stardust *reactor* stream, so a change from either side (or another browser tab) shows up
-everywhere instantly.
+a CLI and a **Datastar** web UI. Both read a *reactor*, and Stardust pushes the new
+result when one changes, so a todo written from either side turns up in the other
+without anything polling. They do not share a reactor: the web board reads one
+canonical session reactor bound per browser, the CLI reads its workspace's own.
+
+Nothing in the app watches for changes. Every live update is a Stardust
+subscription re-emitting — see [AGENTS.md](./AGENTS.md) for what that does and does
+not cover.
 
 Written in TypeScript, run natively by Node 22+ (no build step). One dependency:
 the Datastar TS SDK (for the SSE wire format).
@@ -146,6 +151,10 @@ Highlights of the later stages:
   pushes the new result down the open record stream, so every connected client
   re-renders. This is exactly Datastar's
   CQRS pattern — long-lived read stream, short-lived command posts.
+- **The server holds no view state.** A browser's filter is facts on its own
+  `session` entity, read back per render, so two tabs filter independently and the
+  process keeps nothing. Writing a facet is what makes the reactor re-emit — there
+  is no revision counter and no refresh call.
 - **Two streams meet in the middle.** Stardust's reactor results arrive as an
   NDJSON **record stream** (0.0.6 dropped machine SSE) → the Node server →
   Datastar `patch-elements` SSE → the browser DOM. The server (`src/server.ts`,

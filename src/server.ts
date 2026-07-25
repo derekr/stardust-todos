@@ -1,6 +1,11 @@
 // Datastar web UI: workspace-aware, with Linear-style filtering/grouping/
 // aggregates (all powered by Stardust queries) and a dependency action menu.
 //
+// The board is per BROWSER: `/` mints a session and redirects to /s/<sid>, and that
+// session's facts ARE the filter state, so this process holds none. Live updates are
+// Stardust subscriptions — the bound reactor for the board, `GET /entities/{id}` for
+// the detail pane — not app code watching for changes.
+//
 //   node src/server.ts        # http://localhost:3000
 
 import http from "node:http";
@@ -107,12 +112,6 @@ process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 // read (correlated $exists projections), so there is nothing to materialize or
 // undo — the imperative worker is gone entirely.
 
-// One inner controller per stream iteration; aborted to force a re-render.
-const switchControllers = new Set<AbortController>();
-// Re-render every open board/detail stream. ALSO bump the session `rev` so the
-// canonical reactor re-emits to any terminal panes bound to this session — every
-// board-changing action (filter toggle, todo mutation) refreshes the live curl,
-// not just priority changes.
 /**
  * Point every live session at the current workspace + viewer.
  *

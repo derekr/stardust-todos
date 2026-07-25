@@ -16,7 +16,7 @@ interface XraySpec {
 const XRAY: Record<string, XraySpec> = {
   board: {
     title: "The board — ONE canonical reactor",
-    mech: "The board is not re-queried per render. A single stored reactor does everything server-side: it reads the session's own facts (viewer, view, tag-active, workspace) plus its `sf` facet children, derives blocked/overdue/effectiveStatus, applies EVERY filter, orders, and projects the finished row. Every browser reads that same reactor through a per-stream bind (?bind={sid …}), so one definition serves all sessions and the client only ever holds a reactor id and its sid — it cannot widen the scope. readSnapshot() is a point-in-time read; the stream re-emits when the session's `rev` changes.",
+    mech: "The board is not re-queried per render. A single stored reactor does everything server-side: it reads the session's own facts (viewer, view, tag-active, workspace) plus its `sf` facet children, derives blocked/overdue/effectiveStatus, applies EVERY filter, orders, and projects the finished row. Every browser reads that same reactor through a per-stream bind (?bind={sid …}), so one definition serves all sessions and the client only ever holds a reactor id and its sid — it cannot widen the scope. A session is per BROWSER, so two tabs hold two filters. readSnapshot() is a point-in-time read; the live stream re-emits whenever the RESULT changes — writing a facet, moving the viewer, or a todo field in the top-level `where`. There is no revision counter: the writes are the trigger.",
     code: `// One reactor, parameterized per stream by the session id:
 {
   find: ["?t"],
@@ -36,7 +36,8 @@ const XRAY: Record<string, XraySpec> = {
   then: { project: { id: "?t", effectiveStatus: "?eff",
                      blocked: "?blocked", /* … */ } },
 }
-// read it:  readResults(reactorId, { sid })   // ?bind={sid 574}`,
+// read it:   readResults(reactorId, { sid })     // ?bind={sid 574}
+// watch it:  streamResults(reactorId, onRows, signal, { sid })`,
     src: "src/session.ts · canonicalBody() + readSnapshot()",
   },
   counts: {
