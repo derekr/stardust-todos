@@ -43,9 +43,11 @@ export const KEYED_FIELDS = [
   "priority",
   // v4 derived fields. `effectiveStatus` is what the board's status facet will
   // value-join on and `prank` is what it will order by, so both are keys the
-  // moment that rewrite lands. `blocked` is here because it is matched as a
-  // constant by the reconciliation check, which is meant to stay cheap enough to
-  // run after every import.
+  // moment that rewrite lands. `blocked` is the borderline one and is listed
+  // honestly: `reconcileBlocked` reads it as a VAR, which the plain field path
+  // already covers for free, so nothing today keys on it. It is here for the
+  // filter the board will obviously grow (`[?t blocked true]`), and it is the one
+  // entry on this list to drop again if that never happens.
   "blocked",
   "effectiveStatus",
   "prank",
