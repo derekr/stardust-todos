@@ -46,8 +46,9 @@ export const emptyFilter: Filter = {
  * visibility, then an app-side residual tail for status/tags/views. That tail is
  * GONE: the session reactor applies every filter server-side over the stored
  * effective status, so `renderBoard` just renders `readSnapshot`. The snapshot is
- * the single source of truth, ordered by the stored priority ordinal. See
- * session.ts.)
+ * the single source of truth, ordered by the stored priority ordinal — and it is
+ * ONE PAGE of it, since the body carries `limit`/`offset`, so nothing here should
+ * treat those rows as the whole answer. See session.ts.)
  */
 
 export interface Counts {

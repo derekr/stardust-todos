@@ -125,6 +125,16 @@ the same missing bind can error or not depending on the DATA:
   present, an omitted `?viewer` returned the published row happily; adding a
   single DRAFT row made the identical read start erroring.
 
+**And a bind that matches NOTHING is fast, which is how a timing measurement
+lies.** `[?sess sid ?sid]` with a `?sid` no session carries binds nothing, so every
+clause after it joins against an empty set and the read returns `[]` immediately.
+Measured against a seeded 10,000-todo database: the board with a real sid takes
+about 180 seconds, and the same body with a made-up sid takes 17–93ms. That is not
+a fast query, it is no query — and it is exactly the range phase 2 recorded as
+evidence that "the app path is verified at 10,000". **When you time a bound read,
+assert the ROW COUNT in the same breath.** A read that returns nothing costs
+nothing, whatever it was supposed to be measuring.
+
 The invariant that always held is the useful one: **an omitted expression-only
 bind yields an error or a subset, never a superset.** So it is a real safety
 property but not a reliable "this argument is required" — do not treat an
@@ -157,6 +167,62 @@ docs are explicit that each one costs write work and storage.
 
 Worth knowing: reading a stored reactor with a bind costs about the same as the
 equivalent dry-run. A stored reactor is not a cache you read for free.
+
+## `limit` is a post-filter, and removing the subqueries did not change that
+
+This was tested again in phase 3, because it looked like it should have changed.
+Phase 1 measured `limit` as a post-filter while the board carried three correlated
+`exists` clauses, and the obvious reading was that the subqueries were the reason —
+a body with none of them ought to be able to stop after fifty rows. It cannot.
+Measured on 2,000 unindexed todos, against the plain body, unfiltered:
+
+| read | time |
+| --- | --- |
+| unlimited (1,941 rows) | 7.6s |
+| `limit 50` | 7.5s |
+| `limit 50 offset 1000` | 7.5s |
+| `find[[count ?t]]` over the identical `where` | 7.5s |
+
+Every number is the same read. The same four questions at 5,000 give 49.7s / 48.3s
+/ 48.7s / 47.9s, and at 10,000 they give 253s / 239s / 243s / 237s — `limit` is
+worth two to six percent, which is noise on a box that is doing anything else. (The
+2,000 row is from a quiet box and the other two are not; compare across a row, never
+down a column.)
+
+The engine evaluates the whole `where` and then discards rows; only the projection
+and the response get smaller. Three consequences worth carrying:
+
+- Paging bounds the RESPONSE, the render, and the memory a result set occupies. It
+  does not bound the query. The board is still O(corpus) per page view, and so are
+  the counts/blockers/tags reads beside it, which are not paged at all.
+- A count for a "showing 50 of N" pill costs a second full board. That is why the
+  pill says `50+`: the board asks for `PAGE_SIZE + 1` rows and spends the extra one
+  on "is there a next page", which is the only question the pager has.
+- `limit` and `offset` are BODY fields and refuse a bind — `limit ?n`, `offset
+  ?off` and `offset {#bind off}` are all `limit/offset must be number`. So a page is
+  part of the query TEXT and one stored reactor cannot serve every page. The split
+  taken here: page 0 is the provisioned reactor (every session opens there, and it
+  is the only page with a live subscription), and a deeper page is an ephemeral
+  reactor created for the read and deleted after it. Creating one is 31–44ms and
+  deleting it 21–38ms — under 1% of a 7.6s unindexed read, but more than double the
+  27ms the demo's indexed board costs, which is the whole reason page 0 is stored
+  rather than made the same way. It also consumes a BLOCK of entity ids: consecutive
+  board reactors came back 158 apart, because every clause is an entity, and
+  deleting the reactor does not return them.
+
+Also measured while establishing this: the plain board at 2,000 unindexed todos
+allocates about 400MB of transient heap per read, and at 10,000 it peaks around
+2.1GB and takes ~180s. Stardust is Go and treats allocation failure as fatal
+(`runtime: out of memory` and the process is gone), so a stress instance that runs
+out of room does not return an error — it dies mid-response and the client sees a
+socket close. One was OOM-killed at 5.4GB RSS during exactly this. Give a big
+stress instance room, and read `dmesg -T` before believing a stranger error.
+
+One more failure that is not the server's: Node's `fetch` gives up on a response
+BODY after five minutes and throws `TypeError: terminated` with a `BodyTimeoutError`
+cause. The tag body at 10,000 todos crosses that line, and an unhandled throw there
+cost a completed two-hour stress run its summary. Reads that can take minutes need
+their own error arm.
 
 ## The tension is the point — record it, don't resolve it silently
 

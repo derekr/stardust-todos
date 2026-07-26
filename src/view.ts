@@ -79,8 +79,11 @@ const facetChip = (sid: number, label: string, active: boolean, action: string, 
     count !== undefined ? `<span class="fc-n">${count}</span>` : ""
   }</button>`;
 
-/** The two count spans live in the title pill and are morphed there by id. */
-const cnum = (id: string, n: number) => `<span id="${id}" class="cnum">${n}</span>`;
+/** The two count spans live in the title pill and are morphed there by id. The
+ *  visible one is a STRING now: a paged board that has a next page shows "50+",
+ *  because the number it used to print would cost a second full evaluation of the
+ *  board's own `where` (measured at the same 7.5s the board costs) for a numeral. */
+const cnum = (id: string, n: number | string) => `<span id="${id}" class="cnum">${n}</span>`;
 
 /** "all·N" — N is the total shown (sum of the viewer-scoped status counts). */
 export const visibleTotal = (statusCounts: Record<string, number>): number =>
@@ -170,8 +173,35 @@ function row(t: Todo, blockers: Blocker[]): string {
   </a>`;
 }
 
+/**
+ * Prev/next for a paged board.
+ *
+ * Deliberately not a page count and not numbered jumps: both need a TOTAL, and the
+ * total is the expensive thing (a count over the board's `where` costs what the
+ * board costs). What the reader gets is what one extra row can honestly support —
+ * "there is more" and "you are on page N".
+ */
+export interface Pager {
+  sid: number;
+  page: number;
+  hasMore: boolean;
+}
+
+function pagerEl(p: Pager): string {
+  if (p.page === 0 && !p.hasMore) return ""; // one page: no controls at all
+  const btn = (label: string, to: number, on: boolean) =>
+    on
+      ? `<button class="pgbtn" data-on:click="@post('${B}/s/${p.sid}/page/${to}')">${label}</button>`
+      : `<button class="pgbtn" disabled>${label}</button>`;
+  return `<nav class="pager" data-xray="board">
+    ${btn("‹ prev", p.page - 1, p.page > 0)}
+    <span class="pgn">page ${p.page + 1}</span>
+    ${btn("next ›", p.page + 1, p.hasMore)}
+  </nav>`;
+}
+
 /** The board element on its own — shared by the SSE patch and the SSR shell. */
-export function boardEl(todos: Todo[], blockers: Map<number, Blocker[]>, f: Filter): string {
+export function boardEl(todos: Todo[], blockers: Map<number, Blocker[]>, f: Filter, pager?: Pager): string {
   const bl = (id: number) => blockers.get(id) ?? [];
   const rows = (items: Todo[]) => items.map((t) => row(t, bl(t.id))).join("");
 
@@ -205,13 +235,17 @@ export function boardEl(todos: Todo[], blockers: Map<number, Blocker[]>, f: Filt
     ).join("");
   }
 
-  return `<div id="board" data-xray="board">${body}</div>`;
+  return `<div id="board" data-xray="board">${body}${pager ? pagerEl(pager) : ""}</div>`;
 }
 
+/** What the title pill shows for "visible": the rows on this page, or `50+` when
+ *  the read-ahead row said there is another page. */
+export const visibleLabel = (shown: number, hasMore: boolean): string => (hasMore ? `${shown}+` : String(shown));
+
 /** The SSE payload: the board plus count-visible, morphed into the title pill. */
-export function boardFragment(todos: Todo[], blockers: Map<number, Blocker[]>, f: Filter): string {
-  return `${boardEl(todos, blockers, f)}
-  ${cnum("count-visible", todos.length)}`;
+export function boardFragment(todos: Todo[], blockers: Map<number, Blocker[]>, f: Filter, pager?: Pager): string {
+  return `${boardEl(todos, blockers, f, pager)}
+  ${cnum("count-visible", visibleLabel(todos.length, pager?.hasMore === true))}`;
 }
 
 // ---- Command palette (⌘K) + view-as (RBAC identity) ----------------------
@@ -290,7 +324,8 @@ export interface BoardView {
   sidebar: string;
   filterbar: string;
   board: string;
-  visible: number;
+  /** rows on THIS page — a string, because a further page renders as "50+". */
+  visible: string;
   total: number;
 }
 
@@ -377,6 +412,13 @@ export function page(sid: number, view?: BoardView): string {
       text-transform:uppercase;letter-spacing:.14em;color:var(--muted);margin:0 2px 4px;}
     .gcount{color:var(--faint);font-weight:500;}
     .rows{display:flex;flex-direction:column;}
+
+    /* 5b — pager (only rendered when there is more than one page) */
+    .pager{display:flex;align-items:center;justify-content:center;gap:14px;margin:22px 0 4px;}
+    .pgbtn{background:var(--elev);color:var(--fg);border:1px solid var(--line);border-radius:999px;
+      font-family:var(--mono);font-size:12px;padding:5px 13px;cursor:pointer;}
+    .pgbtn:disabled{color:var(--faint);opacity:.5;cursor:default;}
+    .pgn{font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.08em;}
 
     /* 6 — rows (edge-to-edge, hairline divider, no card) */
     .row{display:flex;align-items:center;gap:12px;padding:13px 2px;text-decoration:none;color:inherit;
@@ -545,7 +587,7 @@ export function page(sid: number, view?: BoardView): string {
     <!-- 2. title + visible·total (both spans morphed by SSE) -->
     <div class="titlerow">
       <h1 class="apptitle">Todos</h1>
-      <span class="countpill" data-xray="counts">${cnum("count-visible", view?.visible ?? 0)}<span class="ctdot">·</span>${cnum("count-total", view?.total ?? 0)}</span>
+      <span class="countpill" data-xray="counts">${cnum("count-visible", view?.visible ?? "0")}<span class="ctdot">·</span>${cnum("count-total", view?.total ?? 0)}</span>
     </div>
 
     <!-- 3. search (visual only — bound to $search, no endpoint yet) -->

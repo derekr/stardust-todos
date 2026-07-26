@@ -12,7 +12,7 @@ import { KEYED_FIELDS, ensureValueIndex } from "../src/indexes.ts";
 import { ensureSchema } from "../src/registry.ts";
 import { DECLARED } from "../src/queries.ts";
 import { DECLARED_SCHEMAS } from "../src/schemas.ts";
-import { BOARD_SHAPES, boardReactorName, canonicalBody } from "../src/session.ts";
+import { BOARD_SHAPES, boardReactorName, canonicalBody, pageWindow } from "../src/session.ts";
 import { ensureTodoSchema } from "../src/todos.ts";
 import { BASE } from "../src/stardust.ts";
 
@@ -22,10 +22,16 @@ import { BASE } from "../src/stardust.ts";
 // compiled out when the session does not need them, and a body that differs is a
 // different reactor. All four are provisioned here so the first browser to pick a
 // tag does not pay for creating one.
+//
+// What is provisioned is the FIRST PAGE of each shape. `limit`/`offset` refuse a
+// bind, so a page is part of the query text and a deeper one cannot be reached by
+// parameterising these; it is created for the read and deleted after (session.ts,
+// `boardTarget`). Page 0 is the page every session opens on and the only one with a
+// live subscription, so it is the one worth storing.
 const REACTORS: { name: string; provision: () => Promise<Provisioned> }[] = [
   ...BOARD_SHAPES.map((shape) => {
     const name = boardReactorName(shape);
-    return { name, provision: () => ensureReactor(name, canonicalBody(shape)) };
+    return { name, provision: () => ensureReactor(name, canonicalBody(shape, pageWindow(0))) };
   }),
   ...DECLARED.map((d) => ({ name: d.name, provision: () => d.provision() })),
 ];

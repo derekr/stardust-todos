@@ -117,6 +117,7 @@ commit; `jj log` is the record:
 | 3 | status, tags, dependencies | tags/deps as **edge entities**; graph joins |
 | 4 | derive-on-read | correlated `exists` bound to a var, so a DERIVED value is filterable |
 | 5 | the session reactor | ONE reactor computes effectiveStatus + every filter server-side |
+| 6 | it has to scale | derived facts recorded on WRITE; the board returns one PAGE |
 
 Highlights of the later stages:
 
@@ -134,6 +135,16 @@ Highlights of the later stages:
   again, written by the transaction that causes it (`refreshDerived`), and checked
   against the plain query by `reconcileBlocked`. Still no worker: the writer is the
   request that caused the change, not a process watching for work.
+- **The board is one page** (`src/session.ts`). `limit`/`offset` on the body, fifty
+  rows shown and a fifty-first read only to know whether there is a next page —
+  which is why the pill says `50+` rather than a total. Worth knowing what that did
+  and did not buy: `limit` is a POST-FILTER. At 2,000 unindexed todos the plain
+  board costs 7.6s unlimited, 7.5s with `limit 50`, and 7.5s for a bare count over
+  the same `where`, so paging bounds the response and the render, not the query,
+  and a "showing 50 of N" pill would have doubled the work of every page view.
+  `limit` also refuses a bind, so a page is part of the query text: page 1 is the
+  provisioned reactor and the only page with a live subscription, and a deeper page
+  is a reactor created for that read and deleted after it.
 - **Workspace switching in the web UI** (`src/server.ts`, `#wsbar`). One active
   workspace at a time; switching updates the server context and closes streams,
   and Datastar auto-reconnects to re-render against the new workspace.

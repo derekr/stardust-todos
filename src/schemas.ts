@@ -44,6 +44,7 @@ const SESSION_SCHEMA = {
     tagActive: { type: "boolean" },
     sid: { type: "number" }, // set to the session's own id after creation
     group: { type: "string", enum: ["none", "status", "priority"] }, // display-only grouping
+    page: { type: "number" }, // zero-based board page; the offset is page * PAGE_SIZE
   },
   required: ["kind", "workspace", "viewer", "view", "tagActive"],
   additionalProperties: false,

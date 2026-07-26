@@ -41,6 +41,23 @@
 //     quietly WRONG the moment the wall clock passed it, and had been wrong for
 //     weeks. A bind is stale for the life of one subscription instead of forever.
 //
+// The board returns ONE PAGE, not every matching row: `limit`/`offset` on the body,
+// fifty rows shown and a fifty-first read to know whether there is a next page.
+// Be precise about what that buys, because the obvious claim is wrong. `limit` is a
+// POST-FILTER: at 2,000 unindexed todos the plain body costs 7.6s unlimited, 7.5s
+// with `limit 50`, and 7.5s with `limit 50 offset 1000`, and a bare `find[[count
+// ?t]]` over the identical `where` costs the same 7.5s. Removing the correlated
+// subqueries in phase 1 did not turn `limit` into an early exit — the engine still
+// evaluates every clause and then throws rows away. So paging bounds the RESPONSE,
+// the render and the memory a result set occupies; it does not bound the query. The
+// query's cost is still the corpus, and that is the next thing to be honest about,
+// not something this change fixed.
+//
+// `limit` and `offset` are body fields and refuse a bind (`limit must be number`),
+// so one stored reactor cannot serve every page. Page 0 IS the stored reactor — it
+// is what every session opens on and the only page with a live subscription — and a
+// deeper page is an ephemeral reactor created for that read and deleted after it.
+//
 // Todos are a point-in-time SNAPSHOT: a one-shot read always recomputes, and the
 // live stream re-emits whenever the RESULT changes. There is no revision counter
 // and no explicit refresh: the facet rows and the session's scalars are top-level
@@ -57,7 +74,9 @@
 import {
   type Bind,
   type EntityId,
+  createReactor,
   createSchemaEntity,
+  deleteReactor,
   patchSchemaEntity,
   query,
   readEntity,
@@ -77,7 +96,39 @@ import { APP } from "./tenancy.ts";
 const STATUS_DOMAIN = ["todo", "doing", "blocked", "done"] as const;
 const PRIORITY_DOMAIN = ["low", "med", "high"] as const;
 
-export interface SnapshotRow {
+/**
+ * Rows per page. 51 are asked for and 50 are shown: the extra row is how the
+ * board knows there is a next page WITHOUT a second query.
+ *
+ * That is not a micro-optimisation, it is the whole reason the count pill says
+ * "50+" rather than a number. `find[[count ?t]]` over the board's own `where` was
+ * measured at 7.5s against 2,000 unindexed todos — the same 7.6s the board itself
+ * costs, because the count still evaluates every clause and only the projection is
+ * cheaper. A total therefore DOUBLES the work of every page view, which is a lot to
+ * pay for a numeral. The 51st row costs nothing and answers the only question the
+ * pager actually asks.
+ */
+export const PAGE_SIZE = 50;
+
+/**
+ * A page of the board, as the body expresses it.
+ *
+ * `limit` and `offset` are BODY fields, not bind vars — `limit ?n` is refused with
+ * `query: limit must be number`, and so is `offset ?off` and `{#bind off}`. So a
+ * window is part of the query TEXT, and one stored reactor cannot serve every page.
+ * See `boardTarget` for what this app does about that.
+ */
+export interface PageWindow {
+  limit: number;
+  offset: number;
+}
+
+/** The window a page index reads: one more row than it shows, to detect a next page. */
+export const pageWindow = (page: number): PageWindow => ({ limit: PAGE_SIZE + 1, offset: page * PAGE_SIZE });
+
+/** One board row as the reactor projects it. Reachable as `Snapshot["rows"][number]`
+ *  rather than exported: a caller wants the page, not a loose row type. */
+interface SnapshotRow {
   id: EntityId;
   title: string;
   status: string; // user intent, never "blocked"
@@ -92,6 +143,14 @@ export interface SnapshotRow {
 export interface SessionHandle {
   sessionId: EntityId;
   workspaceId: EntityId;
+}
+
+/** One page of the board: the rows to render, which page they are, and whether a
+ *  next one exists (the 51st row, never rendered). */
+export interface Snapshot {
+  rows: SnapshotRow[];
+  page: number;
+  hasMore: boolean;
 }
 
 /**
@@ -152,7 +211,12 @@ const tagSub = {
 // `shape` decides which of the two expensive clause groups the body carries; see the
 // file header. The plain body executes ZERO subqueries, which is what lets it answer
 // at 10,000 todos at all.
-export function canonicalBody(shape: BoardShape = PLAIN_SHAPE): Record<string, unknown> {
+// `window` is a REQUIRED argument with no default, and that is deliberate. A body
+// silently defaulting to "every matching row" is the shape of bug this phase exists
+// to prevent, and a body silently defaulting to page 0 would make an oracle that
+// compares against the whole corpus quietly compare against fifty rows. Passing
+// `null` means "no window" and has to be typed out.
+export function canonicalBody(shape: BoardShape, window: PageWindow | null): Record<string, unknown> {
   return {
     enabled: true,
     find: ["?t"],
@@ -227,6 +291,12 @@ export function canonicalBody(shape: BoardShape = PLAIN_SHAPE): Record<string, u
         : []),
     ],
     orderBy: ["?prank", "?title", "?t"],
+    // The window, if this body has one. `orderBy` ends with `?t`, so the order is
+    // TOTAL — which is what makes an offset mean the same thing on two reads.
+    // Without that last component two rows with equal (prank, title) could swap
+    // between reads, and a page boundary falling between them would drop one row
+    // and repeat the other; the harness's paging properties are what would catch it.
+    ...window,
     then: {
       project: {
         id: "?t",
@@ -262,7 +332,10 @@ export function ensureBoardReactor(shape: BoardShape = PLAIN_SHAPE): Promise<Ent
   const name = boardReactorName(shape);
   let pending = reactorIds.get(name);
   if (!pending) {
-    pending = ensureReactor(name, canonicalBody(shape)).then((r) => r.id);
+    // The PROVISIONED bodies are the first page. Page 0 is where every session
+    // starts, where the live subscription lives, and where the demo spends all of
+    // its time — so it is the page that must not pay for a reactor of its own.
+    pending = ensureReactor(name, canonicalBody(shape, pageWindow(0))).then((r) => r.id);
     reactorIds.set(name, pending);
   }
   return pending;
@@ -352,6 +425,10 @@ export async function setFilter(h: SessionHandle, f: Filter, actor: string): Pro
     group: f.group, // display-only, but per-session state, so it lives here too
     actor,
     tagActive: f.tags.length > 0,
+    // Any filter change returns to page 1. Keeping the offset would leave a reader
+    // on page 7 of a result that now has two pages, staring at an empty board that
+    // is not empty.
+    page: 0,
   });
   // `view` is an enum in the schema, so an unknown view is refused here rather
   // than silently producing a board that matches nothing.
@@ -367,19 +444,65 @@ export async function setFilter(h: SessionHandle, f: Filter, actor: string): Pro
  * `now` rides along for the overdue shape: wall-clock time cannot be a stored fact,
  * so the only honest place for it is the read.
  */
-async function boardTarget(h: SessionHandle): Promise<{ rid: EntityId; bind: Bind }> {
+async function boardTarget(h: SessionHandle): Promise<{ rid: EntityId; bind: Bind; page: number; owned: boolean }> {
   const e = await readEntity(h.sessionId);
   const shape: BoardShape = { tag: e.tagActive === true, overdue: e.view === "overdue" };
   const bind: Bind = { sid: h.sessionId };
   if (shape.overdue) bind.now = { "#utc": new Date().toISOString() };
-  return { rid: await ensureBoardReactor(shape), bind };
+  const page = Math.max(0, Math.trunc(Number(e.page ?? 0)));
+  // Page 0 is the provisioned reactor. A deeper page is a body Stardust has never
+  // been asked before, and it cannot be reached by parameterising the stored one:
+  // `limit`/`offset` refuse a bind. So it is created for this read and destroyed
+  // after it — `owned` says which of the two the caller is holding.
+  //
+  // The trade, measured on the box this runs on (2,000 unindexed todos): creating a
+  // window reactor is 31–44ms and deleting it 21–38ms, against a board read of
+  // 7.6s. Sixty-five milliseconds is under 1% there — but on the DEMO database the
+  // same board read is 27ms indexed, where it would be a 3x slowdown on every
+  // paint. That asymmetry is the whole argument for the split: the page everyone
+  // is on is stored, and only a deliberate navigation pays for a reactor.
+  //
+  // It costs entity IDS as well as time, and more than the reactors.ts note
+  // suggests: consecutive board reactors came back 158 ids apart, because every
+  // clause of this body is an entity too. Deleting the reactor does not give them
+  // back. That is affordable for a page click and would not be for a per-render
+  // reactor, which is the other half of why page 0 is provisioned once.
+  if (page === 0) return { rid: await ensureBoardReactor(shape), bind, page, owned: false };
+  // `enabled: false`, unlike the provisioned ones. An enabled reactor is a standing
+  // subscription the engine maintains, and this one exists for a single bound read
+  // — leaving it enabled asks the engine to evaluate the body with NO bind, which
+  // for the overdue shape is not merely wasted work but a query that cannot answer
+  // (`unbound input var ?now`). A disabled reactor still answers `/results`.
+  const body = { ...canonicalBody(shape, pageWindow(page)), enabled: false };
+  return { rid: await createReactor(body), bind, page, owned: true };
 }
 
-/** The current fully-filtered board snapshot — a one-shot read (always recomputes). */
-export async function readSnapshot(h: SessionHandle): Promise<SnapshotRow[]> {
-  const { rid, bind } = await boardTarget(h);
-  return (await readResults(rid, bind)) as SnapshotRow[];
+/**
+ * The current board PAGE — a one-shot read (always recomputes).
+ *
+ * The board no longer returns every matching row. It asks for `PAGE_SIZE + 1` and
+ * returns at most `PAGE_SIZE`, with the extra row spent on `hasMore` rather than
+ * shown. Note what `limit` does NOT buy: measured at 2,000 unindexed todos, the
+ * board costs 7.6s unlimited, 7.5s with `limit 50`, and 7.5s with `limit 50 offset
+ * 1000` — `limit` is a POST-FILTER, and removing every subquery from the body did
+ * not change that. What paging bounds is the response, the render and the memory
+ * the result set occupies, not the query.
+ */
+export async function readSnapshot(h: SessionHandle): Promise<Snapshot> {
+  const { rid, bind, page, owned } = await boardTarget(h);
+  try {
+    return paged(((await readResults(rid, bind)) as SnapshotRow[]) ?? [], page);
+  } finally {
+    if (owned) await deleteReactor(rid).catch((e) => console.error("page reactor:", e));
+  }
 }
+
+/** Cut the read-ahead row off a window and report it as `hasMore`. */
+const paged = (rows: SnapshotRow[], page: number): Snapshot => ({
+  rows: rows.slice(0, PAGE_SIZE),
+  page,
+  hasMore: rows.length > PAGE_SIZE,
+});
 
 /**
  * Watch this session's board. Stardust pushes the complete new result whenever the
@@ -408,11 +531,49 @@ export async function readSnapshot(h: SessionHandle): Promise<SnapshotRow[]> {
  */
 export async function watchSnapshot(
   h: SessionHandle,
-  onRows: (rows: SnapshotRow[]) => void,
+  onPage: (snap: Snapshot) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  const { rid, bind } = await boardTarget(h);
-  await streamResults(rid, (rows) => onRows(rows as SnapshotRow[]), signal, bind);
+  const { rid, bind, page, owned } = await boardTarget(h);
+  if (!owned) {
+    await streamResults(rid, (rows) => onPage(paged(rows as SnapshotRow[], page)), signal, bind);
+    return;
+  }
+  // A page past the first is NOT live, and this is where that is decided rather
+  // than hidden. Subscribing would mean holding an ephemeral reactor open for as
+  // long as a browser sits on page 7 — durable state whose lifetime is a scroll
+  // position, and a leak the moment the process dies with the tab still open.
+  // Deep pages are a snapshot: painted once, then still until the reader navigates.
+  // Making them live is what the page-set subscription is for; it is not this
+  // change, and pretending otherwise would be worse than saying so.
+  try {
+    onPage(paged(((await readResults(rid, bind)) as SnapshotRow[]) ?? [], page));
+  } finally {
+    await deleteReactor(rid).catch((e) => console.error("page reactor:", e));
+  }
+  await new Promise<void>((resolve) => {
+    if (signal.aborted) return resolve();
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+}
+
+/**
+ * Move a session to page `n`.
+ *
+ * The page is per-session state, so it is a fact on the session like every filter —
+ * two browsers on the same board are on their own pages and the server holds
+ * nothing. Unlike a filter it is NOT read by the board's `where` (an offset is body
+ * text, not a clause), so writing it cannot re-emit; the caller re-renders, and
+ * server.ts drops and re-opens the stream exactly as it does for a shape change.
+ */
+export async function setPage(h: SessionHandle, n: number): Promise<void> {
+  const r = await patchSchemaEntity(await sessionSchema(), h.sessionId, { page: Math.max(0, Math.trunc(n)) });
+  if (!r.ok) throw new Error(`page rejected: ${r.error.message}`);
+}
+
+/** The page a session is on. */
+export async function readPage(h: SessionHandle): Promise<number> {
+  return Math.max(0, Math.trunc(Number((await readEntity(h.sessionId)).page ?? 0)));
 }
 
 /**

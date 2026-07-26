@@ -47,15 +47,18 @@ import {
 import {
   BOARD_SHAPES,
   type SessionHandle,
+  type Snapshot,
   boardReactorName,
   boardShape,
   boardShapeKey,
   createSession,
   ensureBoardReactor,
   readFilter,
+  readPage,
   readSnapshot,
   retargetSession,
   setFilter,
+  setPage,
   watchSnapshot,
 } from "./session.ts";
 import { BASE, TxConflictError, lastTx, readEntity, readReactorRon, watchEntity } from "./stardust.ts";
@@ -63,6 +66,7 @@ import { DECLARED, blockedByTodo } from "./queries.ts";
 import { statusHistory } from "./history.ts";
 import {
   type BoardView,
+  type Pager,
   boardEl,
   boardFragment,
   filterBar,
@@ -70,6 +74,7 @@ import {
   page,
   palette,
   sidebar,
+  visibleLabel,
   visibleTotal,
 } from "./view.ts";
 import { type DetailOpts, type HistEntry, detailFragment, detailPage } from "./detail.ts";
@@ -253,23 +258,51 @@ const liveSessions = new Set<EntityId>();
 const boardStreams = new Map<EntityId, AbortController>();
 const boardGate = new Map<EntityId, Promise<void>>();
 
-/** Write a session's filter, moving its live stream if the body shape changed. */
-async function applyFilter(sid: EntityId, next: Filter, before?: Filter): Promise<void> {
-  const session = sessionOf(sid);
-  const moved = !before || boardShapeKey(boardShape(before)) !== boardShapeKey(boardShape(next));
-  if (!moved || !boardStreams.has(sid)) {
-    await setFilter(session, next, actorName());
+/** Drop this session's stream, run `write`, then let the loop re-open on whatever
+ *  the write moved it to. The gate is what stops the loop re-subscribing to the
+ *  body it just left and painting one frame from a reactor that no longer models
+ *  the question. */
+async function remount(sid: EntityId, write: () => Promise<void>): Promise<void> {
+  if (!boardStreams.has(sid)) {
+    await write();
     return;
   }
   let release!: () => void;
   boardGate.set(sid, new Promise<void>((r) => (release = r)));
   boardStreams.get(sid)?.abort();
   try {
-    await setFilter(session, next, actorName());
+    await write();
   } finally {
     boardGate.delete(sid);
     release();
   }
+}
+
+/** Write a session's filter, moving its live stream if the body shape changed. */
+async function applyFilter(sid: EntityId, next: Filter, before?: Filter): Promise<void> {
+  const session = sessionOf(sid);
+  const moved = !before || boardShapeKey(boardShape(before)) !== boardShapeKey(boardShape(next));
+  const write = () => setFilter(session, next, actorName());
+  // A filter write also resets the page (session.ts), so it always moves a session
+  // that was NOT on page 0 — the stream has to be re-opened on the stored reactor
+  // it is going back to.
+  if (!moved && (await readPage(session)) === 0) {
+    await write();
+    return;
+  }
+  await remount(sid, write);
+}
+
+/**
+ * Move a session to another page.
+ *
+ * Always a remount, never a re-emit: `offset` is body text, not a clause, so
+ * writing the page cannot invalidate anything. Page 0 re-opens on the provisioned
+ * reactor and is live; a deeper page paints once from a reactor made for that read
+ * (session.ts) and then holds still.
+ */
+async function applyPage(sid: EntityId, n: number): Promise<void> {
+  await remount(sid, () => setPage(sessionOf(sid), n));
 }
 
 /**
@@ -342,27 +375,41 @@ async function serveStatic(parts: string[], res: http.ServerResponse): Promise<v
 // canonical reactor applies EVERY filter (priority, status, tags, views) +
 // visibility + derivation server-side, so there is ONE read path feeding both the
 // SSE patches and the server-rendered first paint.
-async function boardData(session: SessionHandle, pushed?: Todo[]) {
+//
+// NOTE what paging does and does not bound here. The board is one page now, but the
+// three reads beside it are not: `aggregateCounts` tallies every visible row (that
+// is what the chips mean), and `blockerMap`/`availableTags` are whole-workspace
+// queries. So this function is still O(workspace) — paging bounded the board's
+// response and its render, not the cost of a page view. Saying so here because the
+// obvious next question is why the page is not fast yet.
+async function boardData(session: SessionHandle, pushed?: Snapshot) {
   const [snap, counts, tags, blockers] = await Promise.all([
     pushed ? Promise.resolve(pushed) : readSnapshot(session),
     aggregateCounts(ctx, viewPersona), // counts over the SAME visible set
     availableTags(ctx),
     blockerMap(ctx),
   ]);
-  return { todos: snap as unknown as Todo[], counts, tags, blockers }; // SnapshotRow is Todo-shaped
+  return { snap, todos: snap.rows as unknown as Todo[], counts, tags, blockers }; // SnapshotRow is Todo-shaped
 }
 
+/** The prev/next state for a rendered page. */
+const pagerOf = (session: SessionHandle, snap: Snapshot): Pager => ({
+  sid: session.sessionId,
+  page: snap.page,
+  hasMore: snap.hasMore,
+});
+
 // Render the filter bar + board over the stream, for ONE session. `pushed` is the
-// row set Stardust just emitted — passing it through avoids re-reading a snapshot
-// we were handed a moment ago.
-async function renderBoard(stream: any, session: SessionHandle, pushed?: Todo[]) {
-  const [{ todos, counts, tags, blockers }, filter] = await Promise.all([
+// page Stardust just emitted — passing it through avoids re-reading a snapshot we
+// were handed a moment ago.
+async function renderBoard(stream: any, session: SessionHandle, pushed?: Snapshot) {
+  const [{ snap, todos, counts, tags, blockers }, filter] = await Promise.all([
     boardData(session, pushed),
     readFilter(session),
   ]);
   const sid = session.sessionId;
   stream.patchElements(filterBar(sid, filter, counts.status, counts.priority, tags));
-  stream.patchElements(boardFragment(todos, blockers, filter));
+  stream.patchElements(boardFragment(todos, blockers, filter, pagerOf(session, snap)));
   stream.patchElements(sidebar(sid, filter, counts.status)); // desktop rail (hidden < 900px)
 }
 
@@ -370,12 +417,15 @@ async function renderBoard(stream: any, session: SessionHandle, pushed?: Todo[])
 // page. Datastar morphs its first patch over identical markup, so this is purely
 // additive — nothing downstream changes.
 async function boardView(session: SessionHandle): Promise<BoardView> {
-  const [{ todos, counts, tags, blockers }, filter] = await Promise.all([boardData(session), readFilter(session)]);
+  const [{ snap, todos, counts, tags, blockers }, filter] = await Promise.all([
+    boardData(session),
+    readFilter(session),
+  ]);
   return {
     sidebar: sidebar(session.sessionId, filter, counts.status),
     filterbar: filterBarEl(session.sessionId, filter, counts.status, counts.priority, tags),
-    board: boardEl(todos, blockers, filter),
-    visible: todos.length,
+    board: boardEl(todos, blockers, filter, pagerOf(session, snap)),
+    visible: visibleLabel(todos.length, snap.hasMore),
     total: visibleTotal(counts.status),
   };
 }
@@ -507,8 +557,7 @@ const server = http.createServer(async (req, res) => {
           boardStreams.set(sid, inner);
           await watchSnapshot(
             session,
-            (rows) =>
-              void renderBoard(stream, session, rows as unknown as Todo[]).catch((e) => console.error("render:", e)),
+            (snap) => void renderBoard(stream, session, snap).catch((e) => console.error("render:", e)),
             inner.signal,
           );
           // Only a client close aborts inner now. A dropped upstream stream (idle
@@ -542,6 +591,21 @@ const server = http.createServer(async (req, res) => {
       // `before` is what decides whether this write moves the session to another
       // board body — a tag going on or off, or the overdue view opening or closing.
       await applyFilter(sid, filter, before);
+      noopStream(req, res);
+      return;
+    }
+
+    // Paging: /s/<sid>/page/<n>. The page is a fact on the session like every
+    // filter, so the server holds nothing and two browsers page independently.
+    if (seg[0] === "s" && seg[2] === "page" && method === "POST") {
+      const sid = sidIn(seg);
+      const n = Number(seg[3]);
+      if (sid === null || !Number.isFinite(n) || n < 0) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("not found");
+        return;
+      }
+      await applyPage(sid, n);
       noopStream(req, res);
       return;
     }

@@ -423,6 +423,18 @@ export async function patchReactor(id: EntityId, body: unknown): Promise<Reactor
 }
 
 /**
+ * Remove a stored reactor (204). Needed because `limit`/`offset` are body fields
+ * and refuse a bind, so a page past the first cannot be a stored reactor read with
+ * a different argument — it is a reactor of its own, made for one read. A reactor
+ * is durable state, so the read has to take it away again or every page view
+ * leaves one behind.
+ */
+export async function deleteReactor(id: EntityId): Promise<void> {
+  const { status, error } = await req("DELETE", `/reactors/${id}`);
+  if (error) throw new StardustError(error, status);
+}
+
+/**
  * Run a one-shot datalog query (find/where/...) without storing a reactor.
  * `Row` types the result: `query<[EntityId, string]>(...)` for find-tuples, or
  * `query<Pick<Todo, "title" | "status">>(...)` for a `then.project` shape.

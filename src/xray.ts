@@ -35,8 +35,8 @@ interface XraySpec {
 
 const XRAY: Record<string, XraySpec> = {
   board: {
-    title: "The board — one reactor, no subqueries",
-    mech: "The board is not re-queried per render, and it derives nothing per row. A stored reactor reads the session's own facts (viewer, view, workspace) plus its `sf` facet children, JOINS the stored blocked/effectiveStatus/prank the write paths recorded, applies EVERY filter, orders and projects the finished row. Every browser reads it through a per-stream bind (?bind={sid …}), so one definition serves all sessions and the client only ever holds a reactor id and its sid — it cannot widen the scope. It used to compute effectiveStatus with a correlated `exists` per row; that shares a 10,000-execution budget with the whole query, so the board hard-FAILED past a few thousand todos. Joining a stored fact is a scan, so this body answers at 10,000 and beyond. Two clauses cannot be cheap and are compiled OUT when unused: the tag filter (still one `exists`, because a plain join would return a two-label todo twice) and `overdue` (wall-clock, so `now` is a per-read bind) — one provisioned reactor per shape, and the server re-opens the stream when a filter moves a session between them. readSnapshot() is a point-in-time read; the live stream re-emits whenever the RESULT changes. There is no revision counter: the writes are the trigger.",
+    title: "The board — one reactor, no subqueries, one page",
+    mech: 'The board is not re-queried per render, and it derives nothing per row. A stored reactor reads the session\'s own facts (viewer, view, workspace) plus its `sf` facet children, JOINS the stored blocked/effectiveStatus/prank the write paths recorded, applies EVERY filter, orders and projects the finished row. Every browser reads it through a per-stream bind (?bind={sid …}), so one definition serves all sessions and the client only ever holds a reactor id and its sid — it cannot widen the scope. It used to compute effectiveStatus with a correlated `exists` per row; that shares a 10,000-execution budget with the whole query, so the board hard-FAILED past a few thousand todos. Joining a stored fact is a scan, so this body answers at 10,000 and beyond. It also returns ONE PAGE — `limit 51 offset 0` on the body, fifty rows shown and a fifty-first read only to know whether a next page exists, which is why the pill says "50+" instead of a number. Be precise about what that bought: `limit` is a POST-FILTER, measured at 2,000 unindexed todos as 7.6s unlimited and 7.5s with `limit 50` — and a bare count over the same `where` costs the same 7.5s, which is why the pill does not just count. Paging bounds the response, the render and the memory a result set occupies; it does not bound the query. And `limit`/`offset` refuse a bind (`limit must be number`), so a page is part of the query TEXT: page 1 is this stored reactor, and a deeper page is an ephemeral reactor created for that read and deleted after it — which is also why only page 1 is live. Two clauses cannot be cheap and are compiled OUT when unused: the tag filter (still one `exists`, because a plain join would return a two-label todo twice) and `overdue` (wall-clock, so `now` is a per-read bind) — one provisioned reactor per shape, and the server re-opens the stream when a filter moves a session between them. readSnapshot() is a point-in-time read; the live stream re-emits whenever the RESULT changes. There is no revision counter: the writes are the trigger.',
     code: `// One body per shape. This is the plain one — zero subqueries:
 {
   find: ["?t"],
@@ -53,11 +53,14 @@ const XRAY: Record<string, XraySpec> = {
     ["?fs", "facet", "status"], ["?fs", "value", "?eff"],   // value-join
   ],
   orderBy: ["?prank", "?title", "?t"],   // high→med→low, then a total order
+  limit: 51, offset: 0,                  // one page — 50 shown, 1 read-ahead
   then: { project: { id: "?t", effectiveStatus: "?eff",
                      blocked: "?blocked", /* … */ } },
 }
 // the overdue shape swaps the view filter for plain clauses + a bind:
 //   ["?t", "due", "?due"], ["<", "?due", "?now"]
+// page 2+ is the same body with offset 50, 100, … — NOT a bind, so it is a
+// reactor made for that one read and deleted after it.
 
 // read it:   readResults(reactorId, { sid })     // ?bind={sid 574}
 // watch it:  streamResults(reactorId, onRows, signal, { sid })`,

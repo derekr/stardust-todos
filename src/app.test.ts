@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 
 import { visibleTo } from "./derive.ts";
 import { effectiveStatus } from "./board.ts";
-import { PLAIN_SHAPE, boardReactorName, boardShape, canonicalBody } from "./session.ts";
+import { PAGE_SIZE, PLAIN_SHAPE, boardReactorName, boardShape, canonicalBody, pageWindow } from "./session.ts";
 import { validators } from "./field-registry.ts";
 import { validationPlan } from "./typed-query.ts";
 
@@ -31,7 +31,7 @@ test("effectiveStatus prefers the STORED fact, and computes it otherwise", () =>
 });
 
 test("the plain board body executes NO subqueries and joins the stored fields", () => {
-  const body = canonicalBody(PLAIN_SHAPE) as { where: unknown[]; orderBy: string[] };
+  const body = canonicalBody(PLAIN_SHAPE, null) as { where: unknown[]; orderBy: string[] };
   const json = JSON.stringify(body.where);
   assert.equal(json.includes("exists"), false); // the whole point of phase 2
   assert.equal(json.includes("cond"), false);
@@ -47,11 +47,29 @@ test("the plain board body executes NO subqueries and joins the stored fields", 
 
 test("the shaped bodies add exactly the clause they are named for", () => {
   const clauses = (s: Parameters<typeof canonicalBody>[0]) =>
-    JSON.stringify((canonicalBody(s) as { where: unknown[] }).where);
+    JSON.stringify((canonicalBody(s, null) as { where: unknown[] }).where);
   assert.equal(clauses({ tag: true, overdue: false }).includes("exists"), true);
   assert.equal(clauses({ tag: false, overdue: true }).includes("exists"), false); // plain clauses
   assert.equal(clauses({ tag: false, overdue: true }).includes('["<","?due","?now"]'), true);
   assert.equal(clauses(PLAIN_SHAPE).includes("?due"), false);
+});
+
+test("a page window is limit/offset on the body, and asks for one row too many", () => {
+  // The 51st row is what tells the pager there is a next page. A query that
+  // returned exactly PAGE_SIZE could not distinguish "a full page" from "the end",
+  // and the alternative — counting — costs a second full evaluation of the board.
+  assert.deepEqual(pageWindow(0), { limit: PAGE_SIZE + 1, offset: 0 });
+  assert.deepEqual(pageWindow(3), { limit: PAGE_SIZE + 1, offset: 3 * PAGE_SIZE });
+
+  const windowed = canonicalBody(PLAIN_SHAPE, pageWindow(2)) as Record<string, unknown>;
+  assert.equal(windowed.limit, PAGE_SIZE + 1);
+  assert.equal(windowed.offset, 2 * PAGE_SIZE);
+  // and no window means no window — the oracle in scripts/stress reads this body
+  const unpaged = canonicalBody(PLAIN_SHAPE, null) as Record<string, unknown>;
+  assert.equal("limit" in unpaged, false);
+  assert.equal("offset" in unpaged, false);
+  // offset paging is only meaningful over a TOTAL order; ?t is the tiebreaker
+  assert.deepEqual((windowed as { orderBy: string[] }).orderBy, ["?prank", "?title", "?t"]);
 });
 
 test("boardShape/boardReactorName name one reactor per shape", () => {

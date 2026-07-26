@@ -14,6 +14,9 @@
 //   5. write paths — do they still agree after an adversarial write sequence?
 //   6. the clock  — does `overdue` answer for NOW, or for a literal frozen into the
 //                   reactor when it was provisioned? (It was the latter, for weeks.)
+//   7. paging     — do the WINDOWS of a body tile the body? The board returns one
+//                   page now, so "the board agrees with the spec" only means
+//                   something if the pages a reader walks add up to it.
 // Plus timings, because a query that is right at 10k and unusable at 1M is a bug —
 // including the tag body, which is the one that still runs a subquery and so is the
 // one that still has a ceiling.
@@ -37,7 +40,7 @@
 // when a single `refreshDerived` call is removed, which is the only evidence that
 // the property is load-bearing rather than decorative.
 
-import { type BoardShape, canonicalBody } from "../../src/session.ts";
+import { type BoardShape, PAGE_SIZE, type PageWindow, canonicalBody, pageWindow } from "../../src/session.ts";
 import { BASE as APP_BASE, readEntity } from "../../src/stardust.ts";
 import { addTodo, reconcileBlocked, removeTodo, setDone, setStatus, toggleTodo } from "../../src/todos.ts";
 import { addDependency, removeDependency } from "../../src/features.ts";
@@ -83,7 +86,11 @@ const full: Facets = {
   actor: "Owner",
 };
 
-let nextSid = 900_000;
+// A `sid` selects a session by VALUE, so two session entities carrying the same one
+// are both matched and every row comes back twice. A fixed base collides with itself
+// the second time the harness is pointed at a database it already ran against — so
+// the base is the clock, and a re-run is a different run.
+let nextSid = 900_000 + (Date.now() % 90_000_000);
 let lastError = "";
 
 async function main() {
@@ -342,17 +349,113 @@ async function main() {
   ok("a todo due three days ago is overdue", !!od && od.rows.some((r) => r.id === recent), `#${recent}`);
   ok("a todo due next month is not", !!od && !od.rows.some((r) => r.id === future), `#${future}`);
 
-  // ---- 7. performance ----------------------------------------------------
+  // ---- 7. paging ---------------------------------------------------------
+  //
+  // The board returns ONE PAGE now, so "does the board agree with the spec" is no
+  // longer enough: the question is whether the pages a reader walks through add up
+  // to the answer the oracle checked. Three properties say they do, and they are
+  // the ones that catch an unstable sort — which is why `orderBy` ends with the
+  // entity id. Without that tiebreaker two rows with equal (prank, title) may come
+  // back in either order, and a page boundary falling between them silently drops
+  // one row and repeats the other. Neither the oracle nor the count would notice;
+  // this does.
+  //
+  // Run against a narrow facet set AND the unfiltered board, because the narrow one
+  // fits in a page or two and would never exercise a boundary at all.
+  console.log("\n\x1b[1mpaging (windows of the same body must tile it)\x1b[0m");
+  for (const [label, f] of [
+    ["narrow facets", hi],
+    ["unfiltered board", full],
+  ] as const) {
+    const sid = await sessionFor(f);
+    const ref = await board(f, sid); // the unwindowed body — the reference
+    if (!ref) {
+      ok(`${label}: reference read`, false, lastError);
+      continue;
+    }
+    const refIds = ref.rows.map((r) => r.id);
+    const total = refIds.length;
+    // Four-ish tiles rather than `total / PAGE_SIZE` pages: the property is about
+    // boundaries, not about page count, and a full walk of the unfiltered board at
+    // 10,000 rows would be two hundred reads of a query that takes minutes.
+    const size = Math.max(PAGE_SIZE, Math.ceil(total / 4));
+    const pages: BoardRow[][] = [];
+    let refused = false;
+    for (let offset = 0; offset < total; offset += size) {
+      const rows = await windowRows(f, sid, { limit: size, offset });
+      if (!rows) {
+        refused = true;
+        break;
+      }
+      pages.push(rows);
+    }
+    if (refused) {
+      ok(`${label}: every page reads`, false, lastError);
+      continue;
+    }
+
+    const flat = pages.flatMap((p) => p.map((r) => r.id));
+    ok(
+      `${label}: concat(pages) == the unpaginated result, IN ORDER`,
+      same(flat, refIds),
+      `${pages.length} pages of ${size} · ${flat.length.toLocaleString()} vs ${total.toLocaleString()}`,
+    );
+    // Stated separately from the concatenation because they fail differently and a
+    // one-line diagnosis is worth two extra assertions: an overlap means a boundary
+    // repeated a row, a drop means it skipped one.
+    const seen = new Set<number>();
+    let overlap = 0;
+    for (const id of flat) {
+      if (seen.has(id)) overlap++;
+      seen.add(id);
+    }
+    ok(`${label}: pages do not overlap`, overlap === 0, `${overlap} repeated row(s)`);
+    ok(
+      `${label}: pages drop nothing`,
+      seen.size === total,
+      `${seen.size.toLocaleString()} distinct of ${total.toLocaleString()}`,
+    );
+
+    // Past the end is EMPTY, not an error and not a wrapped page. The pager offers
+    // "next" from a read-ahead row, so it should never ask — but a stale click can,
+    // and the answer has to be a blank board rather than a 500.
+    const past = await windowRows(f, sid, { limit: size, offset: total + size });
+    ok(
+      `${label}: paging past the end returns empty`,
+      !!past && past.length === 0,
+      past ? `${past.length} rows` : lastError,
+    );
+
+    // And the window the APP actually uses: PAGE_SIZE + 1, offset page*PAGE_SIZE.
+    for (const page of [0, 1]) {
+      if (page * PAGE_SIZE >= total) continue;
+      const rows = await windowRows(f, sid, pageWindow(page));
+      const want = refIds.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE + 1);
+      ok(
+        `${label}: the app's own window for page ${page + 1}`,
+        !!rows &&
+          same(
+            rows.map((r) => r.id),
+            want,
+          ),
+        rows ? `${rows.length} rows (${PAGE_SIZE} shown + read-ahead)` : lastError,
+      );
+    }
+  }
+
+  // ---- 8. performance ----------------------------------------------------
   console.log("\n\x1b[1mperformance\x1b[0m");
+  const size = (r: { bytes: number }, unit: number, suffix: string) =>
+    r.bytes < 0
+      ? `\x1b[33mnot returned\x1b[0m — ${lastError}`
+      : `${(r.bytes / unit).toFixed(unit === 1024 ? 0 : 1)}${suffix}`;
   const wide = await raw(full, await sessionFor(full));
   console.log(
-    `  unfiltered board   ${String(wide.ms).padStart(6)}ms   ${(wide.bytes / 1048576).toFixed(1)}MB   ` +
+    `  unfiltered board   ${String(wide.ms).padStart(6)}ms   ${size(wide, 1048576, "MB")}   ` +
       `expected ${expectedCount(N, full, NOW).toLocaleString()} rows`,
   );
   const narrowPerf = await raw(hi, sidHi);
-  console.log(
-    `  narrow slice       ${String(narrowPerf.ms).padStart(6)}ms   ${(narrowPerf.bytes / 1024).toFixed(0)}KB`,
-  );
+  console.log(`  narrow slice       ${String(narrowPerf.ms).padStart(6)}ms   ${size(narrowPerf, 1024, "KB")}`);
 
   // The tag body is the one that still runs a correlated `exists`, so it still has a
   // ceiling: roughly "however many rows reach the clause", which is why it is placed
@@ -370,6 +473,32 @@ async function main() {
         : `  ${label.padEnd(18)} \x1b[33mrefused\x1b[0m — ${lastError}`,
     );
   }
+
+  // What a window COSTS, which is the number that decided the shape of the phase.
+  // The hypothesis going in was that `limit` would finally terminate early now that
+  // the body runs zero subqueries. It does not: these three lines come back within
+  // noise of each other, and so does a bare count over the identical `where`. So
+  // `limit` is a post-filter, paging bounds the response and not the query, and a
+  // count for the pill would double the work of every page view. That last number
+  // is why the count pill says "50+".
+  const sidPerf = await sessionFor(full);
+  for (const [label, w] of [
+    ["unlimited", null],
+    [`limit ${PAGE_SIZE}`, { limit: PAGE_SIZE, offset: 0 }],
+    [`limit ${PAGE_SIZE} offset 5000`, { limit: PAGE_SIZE, offset: 5000 }],
+  ] as [string, PageWindow | null][]) {
+    const t0 = Date.now();
+    const rows = w ? await windowRows(full, sidPerf, w) : (await board(full, sidPerf))?.rows;
+    console.log(
+      `  ${label.padEnd(22)} ${String(Date.now() - t0).padStart(6)}ms   ${(rows?.length ?? 0).toLocaleString()} rows`,
+    );
+  }
+  // The count a "showing 50 of N" pill would need: the board's OWN `where`, with
+  // the projection replaced by a tally. It has to be that query — a count over the
+  // todo facts alone omits the session joins, the facet value-joins and the
+  // visibility `or`, and comes back in milliseconds, which would be a comforting
+  // and completely wrong number.
+  console.log(`  ${"count over the same".padEnd(22)} ${await countLikeTheBoard(full, sidPerf)}`);
 
   console.log(`\n${failures ? `\x1b[31m${failures} failing\x1b[0m` : "\x1b[32mall green\x1b[0m"}\n`);
   process.exit(failures ? 1 : 0);
@@ -463,7 +592,11 @@ async function createReactors(): Promise<void> {
     const res = await fetch(`${BASE}/reactors`, {
       method: "POST",
       headers: H,
-      body: JSON.stringify(canonicalBody(shape)),
+      // UNWINDOWED, deliberately: these four are the oracle's reference, and every
+      // assertion above compares against the whole expected set. The app reads a
+      // page of this same body; that the pages tile this result exactly is a
+      // property, and it is asserted below rather than assumed here.
+      body: JSON.stringify(canonicalBody(shape, null)),
     });
     const text = await res.text();
     if (!res.ok) throw new Error(`reactor: ${res.status} ${text.slice(0, 200)}`);
@@ -473,29 +606,140 @@ async function createReactors(): Promise<void> {
   console.log(`\x1b[1mboard reactors\x1b[0m ${[...rids.entries()].map(([k, v]) => `${k} #${v}`).join("  ")}\n`);
 }
 
-/** The results URL for a configuration: the right body, and `now` when it needs one. */
-function resultsUrl(f: Facets, sid: number): string {
+/**
+ * The results request for a configuration: the right body, and `now` when it needs
+ * one. Returned as URL *and* bind, because a refusal has to be reported with the
+ * exact wire form that provoked it.
+ *
+ * That is not decoration. A `ron: invalid #utc payload at byte 0` at 10,000 rows
+ * cost most of a day, because the message describes what the engine thinks it
+ * RECEIVED and the harness only printed the message — so every hypothesis about
+ * what had been SENT was unfalsifiable. Whatever fails next, it should fail with
+ * its request attached.
+ */
+function resultsReq(f: Facets, sid: number): { url: string; bind: string; rid: number } {
   const shape = shapeOf(f);
   const bind = shape.overdue ? `{sid ${sid} now {#utc '${new Date(NOW).toISOString()}'}}` : `{sid ${sid}}`;
-  return `${BASE}/reactors/${rids.get(shapeKey(shape))}/results?max=1&bind=${encodeURIComponent(bind)}`;
+  const rid = rids.get(shapeKey(shape))!;
+  return { rid, bind, url: `${BASE}/reactors/${rid}/results?max=1&bind=${encodeURIComponent(bind)}` };
 }
 
 async function raw(f: Facets, sid: number): Promise<{ ms: number; bytes: number }> {
   const t0 = Date.now();
-  const res = await fetch(resultsUrl(f, sid), { headers: { Accept: "application/x-ndjson" } });
-  let bytes = 0;
-  for await (const chunk of res.body!) bytes += (chunk as Uint8Array).length;
-  return { ms: Date.now() - t0, bytes };
+  try {
+    const res = await fetch(resultsReq(f, sid).url, { headers: { Accept: "application/x-ndjson" } });
+    let bytes = 0;
+    for await (const chunk of res.body!) bytes += (chunk as Uint8Array).length;
+    return { ms: Date.now() - t0, bytes };
+  } catch (e) {
+    lastError = describe(e);
+    return { ms: Date.now() - t0, bytes: -1 };
+  }
+}
+
+/**
+ * A fetch that did not come back, in one line.
+ *
+ * Node's fetch gives up on a response BODY after five minutes and throws
+ * `TypeError: terminated` with a `BodyTimeoutError` cause — which reads like the
+ * server died and does not mean that. The tag body at 10,000 todos crosses that
+ * line, and an unhandled throw there cost a completed two-hour run its summary, so
+ * every board read here reports a refusal instead of ending the process.
+ */
+function describe(e: unknown): string {
+  const err = e as { message?: string; cause?: { name?: string; message?: string } };
+  const cause = err?.cause?.name ?? err?.cause?.message;
+  return `${err?.message ?? String(e)}${cause ? ` (${cause})` : ""}`;
+}
+
+/**
+ * One WINDOW of the same body — the app's paged read, done the app's way.
+ *
+ * A window cannot be a bind (`limit must be number`), so it is a reactor of its
+ * own, made for this read and deleted after it. That is what the app does for any
+ * page but the first, so testing paging means creating reactors here too.
+ */
+async function windowRows(f: Facets, sid: number, w: PageWindow): Promise<BoardRow[] | null> {
+  const shape = shapeOf(f);
+  const res = await fetch(`${BASE}/reactors`, {
+    method: "POST",
+    headers: H,
+    // `enabled: false` for the same reason the app does it (session.ts): a reactor
+    // made for one bound read should not also be asked to evaluate itself unbound.
+    body: JSON.stringify({ ...canonicalBody(shape, w), enabled: false }),
+  });
+  const rec = JSON.parse((await res.text()).trim().split("\n")[0]!);
+  if (rec["stardust/error"]) {
+    lastError = `${rec.message} · window limit ${w.limit} offset ${w.offset}`;
+    return null;
+  }
+  const rid = typeof rec.reactorId === "object" ? rec.reactorId["#"] : rec.reactorId;
+  const bind = shape.overdue ? `{sid ${sid} now {#utc '${new Date(NOW).toISOString()}'}}` : `{sid ${sid}}`;
+  const url = `${BASE}/reactors/${rid}/results?max=1&bind=${encodeURIComponent(bind)}`;
+  try {
+    let parsed: any;
+    try {
+      const r = await fetch(url, { headers: { Accept: "application/x-ndjson" } });
+      parsed = JSON.parse((await r.text()).trim().split("\n")[0] ?? "[]");
+    } catch (e) {
+      parsed = { "stardust/error": true, message: describe(e) };
+    }
+    if (parsed && parsed["stardust/error"]) {
+      lastError = `${parsed.message}\n        sent ${url}\n        bind ${bind}`;
+      console.log(`\x1b[31m  refused\x1b[0m ${lastError}`);
+      return null;
+    }
+    return parsed as BoardRow[];
+  } finally {
+    // A reactor is durable state. A harness that leaves one behind per page read
+    // is a harness that changes the database it is measuring.
+    await fetch(`${BASE}/reactors/${rid}`, { method: "DELETE", headers: { Accept: "application/x-ndjson" } });
+  }
+}
+
+/** What a total for the count pill would cost: the board's body, counting instead
+ *  of projecting. Reported as a string so the caller just prints it. */
+async function countLikeTheBoard(f: Facets, sid: number): Promise<string> {
+  const shape = shapeOf(f);
+  const { orderBy: _o, then: _t, ...rest } = canonicalBody(shape, null) as Record<string, unknown>;
+  const res = await fetch(`${BASE}/reactors`, {
+    method: "POST",
+    headers: H,
+    body: JSON.stringify({ ...rest, find: [["count", "?t"]], enabled: false }),
+  });
+  const rec = JSON.parse((await res.text()).trim().split("\n")[0]!);
+  if (rec["stardust/error"]) return `refused — ${rec.message}`;
+  const rid = typeof rec.reactorId === "object" ? rec.reactorId["#"] : rec.reactorId;
+  const bind = shape.overdue ? `{sid ${sid} now {#utc '${new Date(NOW).toISOString()}'}}` : `{sid ${sid}}`;
+  const t0 = Date.now();
+  try {
+    const r = await fetch(`${BASE}/reactors/${rid}/results?max=1&bind=${encodeURIComponent(bind)}`, {
+      headers: { Accept: "application/x-ndjson" },
+    });
+    const rows = JSON.parse((await r.text()).trim().split("\n")[0] ?? "[]");
+    const n = Array.isArray(rows) ? (rows[0]?.[0] ?? 0) : -1;
+    return `${String(Date.now() - t0).padStart(6)}ms   ${Number(n).toLocaleString()} matching`;
+  } finally {
+    await fetch(`${BASE}/reactors/${rid}`, { method: "DELETE", headers: { Accept: "application/x-ndjson" } });
+  }
 }
 
 /** null when the engine refused the query — recorded as a failure, not a crash. */
 async function board(f: Facets, sid: number): Promise<{ rows: BoardRow[]; ms: number } | null> {
+  const { url, bind } = resultsReq(f, sid);
   const t0 = Date.now();
-  const res = await fetch(resultsUrl(f, sid), { headers: { Accept: "application/x-ndjson" } });
-  const text = await res.text();
-  const parsed = JSON.parse(text.trim().split("\n")[0] ?? "[]");
+  let parsed: any;
+  try {
+    const res = await fetch(url, { headers: { Accept: "application/x-ndjson" } });
+    parsed = JSON.parse((await res.text()).trim().split("\n")[0] ?? "[]");
+  } catch (e) {
+    parsed = { "stardust/error": true, message: describe(e) };
+  }
   if (parsed && parsed["stardust/error"]) {
-    lastError = String(parsed.message);
+    // Loud, immediate, and with the request attached — the console line is the
+    // record, since `lastError` is only read by whichever assertion asked.
+    lastError = `${parsed.message}\n        sent ${url}\n        bind ${bind}`;
+    console.log(`\x1b[31m  refused after ${Date.now() - t0}ms\x1b[0m ${lastError}`);
     return null;
   }
   return { rows: parsed as BoardRow[], ms: Date.now() - t0 };
