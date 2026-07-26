@@ -25,44 +25,23 @@ import { APP } from "./tenancy.ts";
 /** The one visibility rule, with the viewer left as a per-read bind. */
 const VISIBLE = visibleTo("?viewer");
 
-/** An OPEN blocker exists for ?t. Same predicate as derive.ts openBlockerExists,
- *  in the form a reactor needs: bound to a var so `cond`/`project` can use it,
- *  rather than the `$exists` directive a dry-run projection takes.
+/** Effective status + priority of every viewer-visible todo — the filter chips.
  *
- *  There is now a STORED `blocked` field carrying the same answer (todos.ts), and
- *  it is what the board will read once it is rewritten. This correlated form stays
- *  here for now ON PURPOSE: while both exist, the derived answer and the recorded
- *  one can be compared, which is the only cheap way to prove the write paths are
- *  keeping their promise. */
-const OPEN_BLOCKER = {
-  capture: { t: "?t" },
-  find: ["?e"],
-  where: [
-    ["?e", "kind", "dep"],
-    ["?e", "todo", "?t"],
-    ["?e", "blocker", "?b"],
-    ["?b", "status", "?bs"],
-    ["!=", "?bs", "done"],
-  ],
-} as const;
-
-/** Status + priority of every viewer-visible todo, with blocked derived per row.
- *  The effective-status tally is folded app-side — a correlated `exists` is not a
- *  groupable field. The stored `effectiveStatus` now is, which is the shape of the
- *  rewrite this reactor is waiting on. */
+ *  This used to bind a correlated `exists` over the dep graph per row and let the
+ *  app fold `blocked` into an effective status afterwards. It shared the board's
+ *  problem exactly (one subquery execution per candidate row, against a budget of
+ *  10,000 for the whole query) and it is fixed the same way: `effectiveStatus` is a
+ *  stored fact, so this is an ordinary join and the tally is a plain count. */
 export const counts = define("board-counts", {
-  find: ["?t", "?status", "?priority"],
+  find: ["?t", "?eff", "?priority"],
   where: [
     ["?t", "app", APP],
     ["?t", "workspace", "?ws"],
-    ["?t", "status", "?status"],
+    ["?t", "effectiveStatus", "?eff"],
     ["?t", "priority", "?priority"],
     ...VISIBLE,
-    // bind the correlated exists to a var, then project the var — inlining a bare
-    // `exists` into an expression runs it UNCORRELATED (true for every row).
-    [["exists", OPEN_BLOCKER], "?blocked"],
   ],
-  then: { project: { status: "?status", priority: "?priority", blocked: "?blocked" } },
+  then: { project: { effectiveStatus: "?eff", priority: "?priority" } },
 } as const);
 
 /** Every dependency edge in the workspace: todo -> blocker (+ its title/status). */

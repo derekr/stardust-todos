@@ -35,9 +35,9 @@ interface XraySpec {
 
 const XRAY: Record<string, XraySpec> = {
   board: {
-    title: "The board — ONE canonical reactor",
-    mech: "The board is not re-queried per render. A single stored reactor does everything server-side: it reads the session's own facts (viewer, view, tag-active, workspace) plus its `sf` facet children, derives blocked/overdue/effectiveStatus, applies EVERY filter, orders, and projects the finished row. Every browser reads that same reactor through a per-stream bind (?bind={sid …}), so one definition serves all sessions and the client only ever holds a reactor id and its sid — it cannot widen the scope. A session is per BROWSER, so two tabs hold two filters. readSnapshot() is a point-in-time read; the live stream re-emits whenever the RESULT changes — writing a facet, moving the viewer, or a todo field in the top-level `where`. There is no revision counter: the writes are the trigger.",
-    code: `// One reactor, parameterized per stream by the session id:
+    title: "The board — one reactor, no subqueries",
+    mech: "The board is not re-queried per render, and it derives nothing per row. A stored reactor reads the session's own facts (viewer, view, workspace) plus its `sf` facet children, JOINS the stored blocked/effectiveStatus/prank the write paths recorded, applies EVERY filter, orders and projects the finished row. Every browser reads it through a per-stream bind (?bind={sid …}), so one definition serves all sessions and the client only ever holds a reactor id and its sid — it cannot widen the scope. It used to compute effectiveStatus with a correlated `exists` per row; that shares a 10,000-execution budget with the whole query, so the board hard-FAILED past a few thousand todos. Joining a stored fact is a scan, so this body answers at 10,000 and beyond. Two clauses cannot be cheap and are compiled OUT when unused: the tag filter (still one `exists`, because a plain join would return a two-label todo twice) and `overdue` (wall-clock, so `now` is a per-read bind) — one provisioned reactor per shape, and the server re-opens the stream when a filter moves a session between them. readSnapshot() is a point-in-time read; the live stream re-emits whenever the RESULT changes. There is no revision counter: the writes are the trigger.",
+    code: `// One body per shape. This is the plain one — zero subqueries:
 {
   find: ["?t"],
   where: [
@@ -45,48 +45,54 @@ const XRAY: Record<string, XraySpec> = {
     ["?sess", "viewer", "?viewer"], ["?sess", "view", "?view"],
     ["?t", "workspace", "?ws"], ["?t", "status", "?status"], /* … */
 
-    // derive, then filter on the derived value — all in the reactor:
-    [["exists", depSub], "?blocked"],
-    [["cond", ["and", "?blocked", ["!=", "?status", "done"]],
-              "blocked", true, "?status"], "?eff"],
+    // the derived facts, JOINED — recorded by the write that caused them:
+    ["?t", "blocked", "?blocked"],
+    ["?t", "effectiveStatus", "?eff"],
+    ["?t", "prank", "?prank"],
     ["or", ["=", "?draft", false], ["=", "?author", "?viewer"]],
     ["?fs", "facet", "status"], ["?fs", "value", "?eff"],   // value-join
   ],
-  orderBy: ["?priority", "?title"],
+  orderBy: ["?prank", "?title", "?t"],   // high→med→low, then a total order
   then: { project: { id: "?t", effectiveStatus: "?eff",
                      blocked: "?blocked", /* … */ } },
 }
+// the overdue shape swaps the view filter for plain clauses + a bind:
+//   ["?t", "due", "?due"], ["<", "?due", "?now"]
+
 // read it:   readResults(reactorId, { sid })     // ?bind={sid 574}
 // watch it:  streamResults(reactorId, onRows, signal, { sid })`,
     src: "src/session.ts · canonicalBody() + readSnapshot()",
-    reactors: [{ name: "board", bind: "{sid 1519}" }],
+    reactors: [
+      { name: "board", bind: "{sid 1519}" },
+      { name: "board-overdue", bind: "{sid 1519 now {#utc '2026-07-26T00:00:00Z'}}" },
+    ],
   },
   counts: {
     title: "Counts — a viewer-scoped tally",
-    mech: "aggregateCounts() runs over the viewer-VISIBLE set — the same visibility rule as the board, so a draft you can't see can't leak into the numbers — but deliberately NOT narrowed by the active facets, which is why the chips can show what you'd get if you picked them. It projects {status, priority, blocked} per visible todo; the effective-status tally is a tiny app-side fold (blocked isn't a groupable stored field). It used to be a dry-run replanned on every render; it is now a STORED reactor read with the workspace and viewer supplied as per-read binds, so one reactor serves every workspace.",
+    mech: "aggregateCounts() runs over the viewer-VISIBLE set — the same visibility rule as the board, so a draft you can't see can't leak into the numbers — but deliberately NOT narrowed by the active facets, which is why the chips can show what you'd get if you picked them. It projects {effectiveStatus, priority} per visible todo and the tally is a plain app-side count. It used to bind a correlated `exists` per row to get `blocked` and fold an effective status out of it here, which put this read under the board's own 10,000-execution ceiling for a number in a chip; the effective status is a stored fact now, so this is an ordinary join. A `groupBy` aggregate would finally be possible and is deliberately not used: the chips want every value present, including the zeroes.",
     code: `// declared once (src/queries.ts) — ?ws and ?viewer are left unbound:
 export const counts = define("board-counts", {
-  find: ["?t", "?status", "?priority"],
+  find: ["?t", "?eff", "?priority"],
   where: [
     ["?t", "app", "todo-app"], ["?t", "workspace", "?ws"],
-    ["?t", "status", "?status"], ["?t", "priority", "?priority"],
+    ["?t", "effectiveStatus", "?eff"],     // stored, not derived
+    ["?t", "priority", "?priority"],
     ...visibleTo("?viewer"),
-    [["exists", OPEN_BLOCKER], "?blocked"],   // bind, then project
   ],
-  then: { project: { status: "?status", priority: "?priority",
-                     blocked: "?blocked" } },
+  then: { project: { effectiveStatus: "?eff",
+                     priority: "?priority" } },
 });
 
 // read it, scoped per call — ?bind={ws {# 12} viewer {# 7}}:
 await counts.read({ ws: {"#": ctx.workspaceId},
                     viewer: {"#": viewerPersonaId} });
-// then tally effectiveStatus(row) + priority app-side`,
+// then count them — the group key arrives already decided`,
     src: "src/queries.ts · counts · src/board.ts · aggregateCounts()",
     reactors: [{ name: "board-counts", bind: "{ws {# 12} viewer {# 7}}" }],
   },
   blocked: {
     title: "Blocked — recorded by the write that causes it",
-    mech: 'Blocked-ness used to be derived on every read: a CORRELATED exists over the dep graph, bound to a variable so cond/or/and could filter on it — `[["exists", depSub], "?blocked"]`. That is still how this board computes the flag you are looking at, and it does not scale, because Stardust executes a correlated subquery ONCE PER ROW against a budget of 10,000 executions shared by the entire query: the board fails outright past a few thousand todos, and costs 15.7s unindexed at 2,000. The uncorrelated form of the same question — one scan for every todo with a not-done blocker — is about 10ms for a whole workspace. So `blocked` is now also a STORED fact, and the rule for keeping it true is that the transaction which causes a change records the consequence: a status write patches its dependents, adding a dep edge writes the flag in the SAME transaction as the edge. That is not a cache. Facts are the log, so writing the consequence is recording it, at the moment it happened and with a causation id naming the write that caused it. What it costs is the guarantee: correctness used to be a property of the query, and is now a property of every write path going through one choke point — so there is a reconciliation check that asks the plain query and reports any row that disagrees.',
+    mech: 'Blocked-ness used to be derived on every read: a CORRELATED exists over the dep graph, bound to a variable so cond/or/and could filter on it — `[["exists", depSub], "?blocked"]`. It does not scale, because Stardust executes a correlated subquery ONCE PER ROW against a budget of 10,000 executions shared by the entire query: the board failed outright past a few thousand todos and cost 15.7s unindexed at 2,000, and `limit` cannot help because it is a post-filter. The uncorrelated form of the same question — one scan for every todo with a not-done blocker — is about 10ms for a whole workspace. So `blocked` is a STORED fact now, and the flag you are looking at was JOINED, not computed: the board reads `[?t blocked ?blocked]`. The rule for keeping it true is that the transaction which causes a change records the consequence — a status write patches its dependents, adding a dep edge writes the flag in the SAME transaction as the edge. That is not a cache. Facts are the log, so writing the consequence is recording it, at the moment it happened and with a causation id naming the write that caused it. What it costs is the guarantee: correctness used to be a property of the query, and is now a property of every write path going through one choke point — so there is a reconciliation check that asks the plain query and reports any row that disagrees.',
     code: `// the plain question, once for the whole workspace (~10ms):
 find: ["?t"],
 where: [["?d", "kind", "dep"], ["?d", "todo", "?t"],
@@ -103,8 +109,11 @@ await transact({
 await refreshDerived(await dependentsOf(id), causingTx);
 
 // the guard for what this gives up — stored vs the plain query:
-await reconcileBlocked()   // [] means every write path kept its promise`,
-    src: "src/todos.ts · refreshDerived() + reconcileBlocked() · src/session.ts · depSub (what the board still derives)",
+await reconcileBlocked()   // [] means every write path kept its promise
+
+// and the board just reads it back:
+["?t", "blocked", "?blocked"], ["?t", "effectiveStatus", "?eff"]`,
+    src: "src/todos.ts · refreshDerived() + reconcileBlocked() · src/session.ts · canonicalBody() (which now joins them)",
     reactors: [{ name: "board", bind: "{sid 1519}" }],
   },
   visibility: {

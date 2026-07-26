@@ -5,8 +5,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { openBlockerExists, visibleTo } from "./derive.ts";
+import { visibleTo } from "./derive.ts";
 import { effectiveStatus } from "./board.ts";
+import { PLAIN_SHAPE, boardReactorName, boardShape, canonicalBody } from "./session.ts";
 import { validators } from "./field-registry.ts";
 import { validationPlan } from "./typed-query.ts";
 
@@ -18,19 +19,47 @@ test("visibleTo builds the published-OR-mine predicate (bound scalars + expressi
   ]);
 });
 
-test("openBlockerExists is a correlated $exists (capture binds the outer var)", () => {
-  const d = openBlockerExists("?t") as { $exists: { capture: Record<string, string>; where: unknown[] } };
-  assert.equal(d.$exists.capture.t, "?t");
-  assert.deepEqual(d.$exists.where[0], ["?e", "kind", "dep"]);
-  assert.deepEqual(d.$exists.where.at(-1), ["!=", "?bs", "done"]);
-});
-
-test("effectiveStatus: blocked is derived, done wins over blocked", () => {
+test("effectiveStatus prefers the STORED fact, and computes it otherwise", () => {
+  // what every reactor projects now — the row already carries the answer
+  assert.equal(effectiveStatus({ status: "todo", blocked: true, effectiveStatus: "blocked" }), "blocked");
+  assert.equal(effectiveStatus({ status: "doing", blocked: false, effectiveStatus: "doing" }), "doing");
+  // the fallback, for a row the caller assembled itself (the detail page)
   assert.equal(effectiveStatus({ status: "todo", blocked: true }), "blocked");
   assert.equal(effectiveStatus({ status: "todo", blocked: false }), "todo");
-  assert.equal(effectiveStatus({ status: "doing", blocked: true }), "blocked");
   assert.equal(effectiveStatus({ status: "done", blocked: true }), "done"); // done wins
   assert.equal(effectiveStatus({ status: "todo" }), "todo"); // undefined blocked
+});
+
+test("the plain board body executes NO subqueries and joins the stored fields", () => {
+  const body = canonicalBody(PLAIN_SHAPE) as { where: unknown[]; orderBy: string[] };
+  const json = JSON.stringify(body.where);
+  assert.equal(json.includes("exists"), false); // the whole point of phase 2
+  assert.equal(json.includes("cond"), false);
+  for (const field of ["blocked", "effectiveStatus", "prank"]) {
+    assert.ok(
+      body.where.some((c) => Array.isArray(c) && c[0] === "?t" && c[1] === field),
+      `joins ${field}`,
+    );
+  }
+  // ascending prank is high→med→low; ?t breaks ties that ?title does not
+  assert.deepEqual(body.orderBy, ["?prank", "?title", "?t"]);
+});
+
+test("the shaped bodies add exactly the clause they are named for", () => {
+  const clauses = (s: Parameters<typeof canonicalBody>[0]) =>
+    JSON.stringify((canonicalBody(s) as { where: unknown[] }).where);
+  assert.equal(clauses({ tag: true, overdue: false }).includes("exists"), true);
+  assert.equal(clauses({ tag: false, overdue: true }).includes("exists"), false); // plain clauses
+  assert.equal(clauses({ tag: false, overdue: true }).includes('["<","?due","?now"]'), true);
+  assert.equal(clauses(PLAIN_SHAPE).includes("?due"), false);
+});
+
+test("boardShape/boardReactorName name one reactor per shape", () => {
+  const of = (tags: string[], view: "all" | "overdue") => boardReactorName(boardShape({ tags, view }));
+  assert.equal(of([], "all"), "board");
+  assert.equal(of(["alpha"], "all"), "board-tag");
+  assert.equal(of([], "overdue"), "board-overdue");
+  assert.equal(of(["alpha"], "overdue"), "board-overdue-tag");
 });
 
 test("schema-generated validators accept valid values and reject drift", () => {

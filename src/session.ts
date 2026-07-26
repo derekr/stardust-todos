@@ -1,27 +1,45 @@
 // A "search session" that lives in Stardust — the SINGLE source of truth.
 //
-// The filter state is facts (a `session` entity + `sf` facet child entities);
-// ONE canonical reactor computes effectiveStatus (blocked-aware) and applies
-// EVERY filter — priority, status(effective), tags, the derived views
-// (ready/overdue/mine/done), and viewer visibility — entirely server-side, then
-// projects the fully-shaped, fully-filtered board rows. Clients read that snapshot
-// and render it; there is no app-side filtering layer. Each session reads the one
-// reactor via a per-stream bind (`?bind={sid …}`).
+// The filter state is facts (a `session` entity + `sf` facet child entities); ONE
+// canonical reactor applies EVERY filter — priority, status(effective), tags, the
+// derived views (ready/overdue/mine/done), and viewer visibility — entirely
+// server-side, then projects the fully-shaped, fully-filtered board rows. Clients
+// read that snapshot and render it; there is no app-side filtering layer. Each
+// session reads the reactor via a per-stream bind (`?bind={sid …}`).
 //
-// NOTE: as of the v4 schema there ARE stored `blocked`/`effectiveStatus` facts,
-// maintained by the write paths in todos.ts, because a correlated `exists` shares a
-// 10,000-execution budget across the whole query and so caps this board at a few
-// thousand todos. This reactor deliberately still derives its own — until it is
-// rewritten to read the stored fields, the two answers exist side by side and can
-// be compared, which is how the write paths are held honest (`reconcileBlocked`).
+// The board no longer DERIVES anything per row. `blocked`, `effectiveStatus` and
+// `prank` are stored facts, written by the transaction that causes them (todos.ts,
+// `refreshDerived`), so this body JOINS them — `[?t effectiveStatus ?eff]` where it
+// used to run a correlated `exists` and then a `cond` over the result. That is what
+// phase 1 was for: a correlated subquery is executed once per candidate ROW against
+// a budget of 10,000 executions shared by the ENTIRE query, so the three of them
+// here did not degrade past a few thousand todos, they hard-failed — and `limit`
+// cannot rescue it, being a post-filter that neither reduces executions nor raises
+// the ceiling. Measured unindexed: the board refused outright at 5,000 and 10,000
+// todos before this change, and answers both now.
 //
-// The key that makes derived-value filtering possible in a reactor: BIND a
-// correlated `exists` subquery to a variable — `[[exists {…}] ?blocked]` — then
-// `?blocked` is an ordinary per-row boolean usable in `cond`/`or`/`and`. (A bare
-// `exists` inlined into an expression runs UNCORRELATED and silently returns true
-// for every row — always bind-then-use.) effectiveStatus is then
-// `[[cond [and ?blocked [!= ?status done]] "blocked" true ?status] ?eff]`, and the
-// status filter is a value-join of the session's facts onto `?eff`.
+// Ordering is `orderBy [?prank ?title ?t]`. `prank` is the priority ORDINAL
+// (high 0, med 1, low 2), so ascending is high→med→low; the board used to order by
+// the priority STRING, which is alphabetical nonsense (high, low, med). `?t` is the
+// final tiebreaker — real titles are not unique, and only a total order keeps an
+// offset from dropping and repeating rows.
+//
+// TWO clauses stay expensive, and each is compiled OUT of the body when it is not
+// needed: `canonicalBody(shape)`, one provisioned reactor per shape.
+//
+//   * The TAG filter is the one surviving correlated `exists`, so it keeps a
+//     ceiling of its own — "however many rows reach it", measured at about 10,000.
+//     It cannot become a plain join: a todo carrying two selected labels would come
+//     back twice (the harness caught exactly that). So it stays a bound `exists`, it
+//     sits LAST where the fewest rows reach it, and a session with no tag selected
+//     does not carry it at all.
+//   * `overdue` compares against WALL-CLOCK time, so no write can ever be the
+//     moment it changes and it cannot be a stored fact. It is plain clauses
+//     (`[?t due ?due] [< ?due ?now]`) in the `overdue` shape, with `now` supplied as
+//     a per-read BIND. It used to be a correlated `exists` holding a literal
+//     `{#utc 2026-07-11…}` baked in when the reactor was provisioned — which went
+//     quietly WRONG the moment the wall clock passed it, and had been wrong for
+//     weeks. A bind is stale for the life of one subscription instead of forever.
 //
 // Todos are a point-in-time SNAPSHOT: a one-shot read always recomputes, and the
 // live stream re-emits whenever the RESULT changes. There is no revision counter
@@ -30,8 +48,14 @@
 // directly — retracting a status facet with no other write pushed 7 rows -> 3, and
 // putting it back pushed 3 -> 7, while a bump of a counter field pushed nothing at
 // all because the result had not changed.
+//
+// What shaping the body per session costs: a filter change can move a session onto
+// a DIFFERENT reactor, and an open subscription cannot follow it. The server drops
+// and re-opens the stream when the shape changes (server.ts, `applyFilter`). That is
+// the price of not carrying two subqueries that are dead most of the time.
 
 import {
+  type Bind,
   type EntityId,
   createSchemaEntity,
   patchSchemaEntity,
@@ -47,21 +71,20 @@ import { ensureReactor } from "./reactors.ts";
 import type { Filter } from "./board.ts";
 import { APP } from "./tenancy.ts";
 
-// EFFECTIVE status (blocked-aware); the status facet filters on this. Priorities
-// as stored. Empty facet = "all" (materialized — an absent join matches nothing).
+// The status facet filters on the STORED `effectiveStatus`, so "blocked" is one of
+// its values. Priorities as stored. Empty facet = "all" (materialized — an absent
+// join matches nothing).
 const STATUS_DOMAIN = ["todo", "doing", "blocked", "done"] as const;
 const PRIORITY_DOMAIN = ["low", "med", "high"] as const;
-const NOW_ISO = "2026-07-11T00:00:00Z"; // fixed demo "now" for overdue (matches board.ts)
 
 export interface SnapshotRow {
   id: EntityId;
   title: string;
-  status: string; // stored status
+  status: string; // user intent, never "blocked"
   priority: string;
-  effectiveStatus: string; // derived by THIS reactor (blocked overrides, done wins)
+  effectiveStatus: string; // STORED (todos.ts, refreshDerived) — joined, not derived
   done: boolean;
-  blocked: boolean; // derived by THIS reactor ($exists); also a stored fact — see the header
-  overdue: boolean; // DERIVED ($exists: not-done + due < now)
+  blocked: boolean; // STORED — ditto
   draft?: boolean;
   lastActor?: string;
 }
@@ -71,27 +94,41 @@ export interface SessionHandle {
   workspaceId: EntityId;
 }
 
-const depSub = {
-  capture: { t: "?t" },
-  find: ["?e"],
-  where: [
-    ["?e", "kind", "dep"],
-    ["?e", "todo", "?t"],
-    ["?e", "blocker", "?b"],
-    ["?b", "status", "?bs"],
-    ["!=", "?bs", "done"],
-  ],
-};
-const overdueSub = {
-  capture: { t: "?t" },
-  find: ["?due"],
-  where: [
-    ["?t", "due", "?due"],
-    ["<", "?due", { "#utc": NOW_ISO }],
-    ["?t", "status", "?st"],
-    ["!=", "?st", "done"],
-  ],
-};
+/**
+ * Which expensive clauses a board body carries.
+ *
+ * Both are false for the common case and both cost a real ceiling when true, so the
+ * body is compiled per shape and each shape is provisioned as its own named reactor
+ * rather than every session paying for clauses it does not use.
+ */
+export interface BoardShape {
+  /** the session has ≥1 tag selected — adds the one remaining correlated `exists` */
+  tag: boolean;
+  /** view=overdue — adds the wall-clock `due < ?now` clauses, and needs a `now` bind */
+  overdue: boolean;
+}
+
+/** The plain body: no subqueries at all. */
+export const PLAIN_SHAPE: BoardShape = { tag: false, overdue: false };
+
+/** The shape a Filter needs. The session's own facts say the same thing; this is the
+ *  app-side form, for a caller that is already holding the filter. */
+export const boardShape = (f: Pick<Filter, "tags" | "view">): BoardShape => ({
+  tag: f.tags.length > 0,
+  overdue: f.view === "overdue",
+});
+
+/** Two shapes are the same subscription target iff they name the same reactor. */
+export const boardShapeKey = (s: BoardShape): string => `${s.overdue}|${s.tag}`;
+
+/** Every board body this app provisions (`npm run stardust:setup`). */
+export const BOARD_SHAPES: readonly BoardShape[] = [
+  PLAIN_SHAPE,
+  { tag: true, overdue: false },
+  { tag: false, overdue: true },
+  { tag: true, overdue: true },
+];
+
 const tagSub = {
   capture: { t: "?t", sess: "?sess" },
   find: ["?e"],
@@ -106,12 +143,16 @@ const tagSub = {
   ],
 };
 
-// The ONE canonical board reactor. A session is selected by its `sid` (bind); its
-// scalar fields (viewer/view/actor/tagActive/workspace) drive the filters, and its
-// `sf` facet entities drive the multi-select value-joins. Every one of those is a
+// The canonical board reactor. A session is selected by its `sid` (bind); its scalar
+// fields (viewer/view/actor/tagActive/workspace) drive the filters, and its `sf`
+// facet entities drive the multi-select value-joins. Every one of those is a
 // top-level clause, so writing any of them re-emits — no revision counter needed.
 // Projects the fully-filtered, fully-shaped board rows.
-export function canonicalBody(): Record<string, unknown> {
+//
+// `shape` decides which of the two expensive clause groups the body carries; see the
+// file header. The plain body executes ZERO subqueries, which is what lets it answer
+// at 10,000 todos at all.
+export function canonicalBody(shape: BoardShape = PLAIN_SHAPE): Record<string, unknown> {
   return {
     enabled: true,
     find: ["?t"],
@@ -121,7 +162,6 @@ export function canonicalBody(): Record<string, unknown> {
       ["?sess", "viewer", "?viewer"],
       ["?sess", "view", "?view"],
       ["?sess", "actor", "?actor"],
-      ["?sess", "tagActive", "?tagActive"],
       ["?sess", "workspace", "?ws"],
       // base todo facts
       ["?t", "app", APP],
@@ -133,10 +173,10 @@ export function canonicalBody(): Record<string, unknown> {
       ["?t", "draft", "?draft"],
       ["?t", "author", "?author"],
       ["?t", "lastActor", "?lastActor"],
-      // derived booleans (bind exists → correlated per-row var) + effectiveStatus
-      [["exists", depSub], "?blocked"],
-      [["exists", overdueSub], "?overdue"],
-      [["cond", ["and", "?blocked", ["!=", "?status", "done"]], "blocked", true, "?status"], "?eff"],
+      // the derived facts, JOINED — recorded by the write that caused them
+      ["?t", "blocked", "?blocked"],
+      ["?t", "effectiveStatus", "?eff"],
+      ["?t", "prank", "?prank"], // the ordering key (high 0, med 1, low 2)
       // viewer visibility (published OR authored by viewer)
       ["or", ["=", "?draft", false], ["=", "?author", "?viewer"]],
       // priority filter (value-join)
@@ -144,25 +184,49 @@ export function canonicalBody(): Record<string, unknown> {
       ["?fp", "session", "?sess"],
       ["?fp", "facet", "priority"],
       ["?fp", "value", "?priority"],
-      // status filter (value-join on the DERIVED effective status)
+      // status filter (value-join on the STORED effective status)
       ["?fs", "kind", "sf"],
       ["?fs", "session", "?sess"],
       ["?fs", "facet", "status"],
       ["?fs", "value", "?eff"],
-      // tag filter: bind "has a selected tag", keep unless a tag filter is active
-      [["exists", tagSub], "?hasTag"],
-      ["or", ["not", "?tagActive"], "?hasTag"],
-      // derived-view filter (single-select), all over BOUND vars
-      [
-        "or",
-        ["=", "?view", "all"],
-        ["and", ["=", "?view", "ready"], ["=", "?eff", "todo"]],
-        ["and", ["=", "?view", "overdue"], "?overdue"],
-        ["and", ["=", "?view", "done"], ["=", "?eff", "done"]],
-        ["and", ["=", "?view", "mine"], ["=", "?lastActor", "?actor"]],
-      ],
+      // derived-view filter (single-select), all over BOUND vars.
+      //
+      // `overdue` is not one of them: it needs `?due` bound by a fact clause, and a
+      // fact clause cannot be conditional — joining `due` would silently drop every
+      // todo that has no due date. So the overdue shape REPLACES the `or` with the
+      // plain clauses plus a guard, and every other view keeps the `or` without an
+      // overdue branch. Reading the wrong shape therefore returns NOTHING rather
+      // than something wrong.
+      ...(shape.overdue
+        ? [
+            ["=", "?view", "overdue"],
+            ["?t", "due", "?due"],
+            ["<", "?due", "?now"], // ?now supplied per read — wall clock is not a fact
+            ["!=", "?status", "done"],
+          ]
+        : [
+            [
+              "or",
+              ["=", "?view", "all"],
+              ["and", ["=", "?view", "ready"], ["=", "?eff", "todo"]],
+              ["and", ["=", "?view", "done"], ["=", "?eff", "done"]],
+              ["and", ["=", "?view", "mine"], ["=", "?lastActor", "?actor"]],
+            ],
+          ]),
+      // Tag filter, LAST: the one correlated `exists` left, so it runs against the
+      // smallest row set the rest of the body can hand it. `tagActive` is read here
+      // too, which keeps this body correct (if not cheap) when the last tag chip is
+      // deselected — so clearing the filter cannot flash an empty board while the
+      // stream is moving back to the plain shape.
+      ...(shape.tag
+        ? [
+            ["?sess", "tagActive", "?tagActive"],
+            [["exists", tagSub], "?hasTag"],
+            ["or", ["not", "?tagActive"], "?hasTag"],
+          ]
+        : []),
     ],
-    orderBy: ["?priority", "?title"],
+    orderBy: ["?prank", "?title", "?t"],
     then: {
       project: {
         id: "?t",
@@ -172,7 +236,6 @@ export function canonicalBody(): Record<string, unknown> {
         effectiveStatus: "?eff",
         done: "?done",
         blocked: "?blocked",
-        overdue: "?overdue",
         draft: "?draft",
         lastActor: "?lastActor",
       },
@@ -180,17 +243,29 @@ export function canonicalBody(): Record<string, unknown> {
   };
 }
 
-/** The name this app provisions its board reactor under. */
-export const BOARD_REACTOR = "board";
+/** The name of the PLAIN board body — and the prefix the others extend. It stays
+ *  `board` so the x-ray card and its "copy as RON" keep naming the one people read. */
+const BOARD_REACTOR = "board";
 
-let reactorPromise: Promise<EntityId> | null = null;
+/** The provisioned name for a shape: `board`, `board-tag`, `board-overdue`, … */
+export const boardReactorName = (s: BoardShape): string =>
+  `${BOARD_REACTOR}${s.overdue ? "-overdue" : ""}${s.tag ? "-tag" : ""}`;
+
+const reactorIds = new Map<string, Promise<EntityId>>();
 /**
- * The canonical board reactor, provisioned at its fixed id. Idempotent — it
- * creates the reactor, updates it if `canonicalBody()` has changed since, or does
- * nothing. Memoized so the check costs one round trip per process, not per read.
+ * The board reactor for `shape`, provisioned under its name. Idempotent — it
+ * creates the reactor, updates it if `canonicalBody(shape)` has changed since, or
+ * does nothing. Memoized per shape, so the check costs one round trip per process
+ * rather than one per read.
  */
-export function ensureBoardReactor(): Promise<EntityId> {
-  return (reactorPromise ??= ensureReactor(BOARD_REACTOR, canonicalBody()).then((r) => r.id));
+export function ensureBoardReactor(shape: BoardShape = PLAIN_SHAPE): Promise<EntityId> {
+  const name = boardReactorName(shape);
+  let pending = reactorIds.get(name);
+  if (!pending) {
+    pending = ensureReactor(name, canonicalBody(shape)).then((r) => r.id);
+    reactorIds.set(name, pending);
+  }
+  return pending;
 }
 
 /**
@@ -283,10 +358,27 @@ export async function setFilter(h: SessionHandle, f: Filter, actor: string): Pro
   if (!r.ok) throw new Error(`filter rejected: ${r.error.message}`);
 }
 
+/**
+ * The reactor and the binds this session's board needs right now.
+ *
+ * The shape is a function of the session's OWN facts, so it is read from Stardust
+ * rather than passed in — the session is the source of truth for its filter, and a
+ * caller that guessed wrong would read a body that does not model its question.
+ * `now` rides along for the overdue shape: wall-clock time cannot be a stored fact,
+ * so the only honest place for it is the read.
+ */
+async function boardTarget(h: SessionHandle): Promise<{ rid: EntityId; bind: Bind }> {
+  const e = await readEntity(h.sessionId);
+  const shape: BoardShape = { tag: e.tagActive === true, overdue: e.view === "overdue" };
+  const bind: Bind = { sid: h.sessionId };
+  if (shape.overdue) bind.now = { "#utc": new Date().toISOString() };
+  return { rid: await ensureBoardReactor(shape), bind };
+}
+
 /** The current fully-filtered board snapshot — a one-shot read (always recomputes). */
 export async function readSnapshot(h: SessionHandle): Promise<SnapshotRow[]> {
-  const rid = await ensureBoardReactor();
-  return (await readResults(rid, { sid: h.sessionId })) as SnapshotRow[];
+  const { rid, bind } = await boardTarget(h);
+  return (await readResults(rid, bind)) as SnapshotRow[];
 }
 
 /**
@@ -307,14 +399,20 @@ export async function readSnapshot(h: SessionHandle): Promise<SnapshotRow[]> {
  * "subqueries don't invalidate": it is specifically the tag path. Treat the board as
  * a snapshot that advances on its own filter writes, on field writes, and on
  * dependency changes.
+ *
+ * A second gap arrives with the shaped body: this subscription is pinned to ONE
+ * reactor, and a filter change can move the session to another. The caller has to
+ * drop and re-open when `boardShape` changes — server.ts does, in `applyFilter`.
+ * The `now` bind is likewise fixed for the life of the subscription, so an overdue
+ * board that stays open past midnight is stale until something re-opens it.
  */
 export async function watchSnapshot(
   h: SessionHandle,
   onRows: (rows: SnapshotRow[]) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  const rid = await ensureBoardReactor();
-  await streamResults(rid, (rows) => onRows(rows as SnapshotRow[]), signal, { sid: h.sessionId });
+  const { rid, bind } = await boardTarget(h);
+  await streamResults(rid, (rows) => onRows(rows as SnapshotRow[]), signal, bind);
 }
 
 /**

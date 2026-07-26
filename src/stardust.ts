@@ -433,18 +433,26 @@ export async function query<Row = unknown>(body: unknown): Promise<Row[]> {
   return (await one<Row[]>("POST", "/reactors/dry-run", { body })) ?? [];
 }
 
+/** An instant, for a var compared against a UTC field (`["<", "?due", "?now"]`).
+ *  A quoted string is NOT interchangeable: the engine refuses it with `invalid
+ *  argument type for <`, which is the good failure — a bind cannot be the wrong
+ *  type quietly. */
+type Utc = { "#utc": string };
+
 /** Values a reactor var can be bound to at read time. A `Ref` binds an entity —
  *  which is how a query scoped by `[?t workspace ?ws]` is parameterized per read. */
-export type Bind = Record<string, string | number | Ref>;
+export type Bind = Record<string, string | number | Ref | Utc>;
 
 /** Render a bind override as a RON object for the `?bind=` results param:
  *  `{ sid: 42 }` → `{sid 42}`, `{ v: "x" }` → `{v 'x'}`, `{ ws: {"#":12} }` →
- *  `{ws {# 12}}`. Per-subscription bind lets ONE stored reactor serve many
- *  parameterizations, so a scoped query needs one reactor, not one per scope. */
+ *  `{ws {# 12}}`, `{ now: {"#utc": iso} }` → `{now {#utc 'iso'}}`. Per-subscription
+ *  bind lets ONE stored reactor serve many parameterizations, so a scoped query
+ *  needs one reactor, not one per scope. */
 function ronBind(bind: Bind): string {
-  const lit = (v: string | number | Ref): string => {
+  const lit = (v: string | number | Ref | Utc): string => {
     if (typeof v === "number") return String(v);
     if (typeof v === "string") return `'${v}'`;
+    if ("#utc" in v) return `{#utc '${v["#utc"]}'}`;
     return `{# ${refId(v)}}`;
   };
   return `{${Object.entries(bind)

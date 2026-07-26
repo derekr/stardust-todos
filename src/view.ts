@@ -34,7 +34,8 @@ const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replac
 
 // Design groups the board by effectiveStatus in this fixed order; only non-empty
 // groups render. "blocked" is never a value of `status` (which is user intent) —
-// it only ever appears as an effectiveStatus.
+// it only ever appears as an effectiveStatus, which the board projects as a STORED
+// fact rather than deriving per row.
 const STATUS_ORDER: Status[] = ["todo", "doing", "blocked", "done"];
 const GROUP_LABEL: Record<Status, string> = {
   todo: "TODO",
@@ -149,7 +150,7 @@ export function filterBar(
 // ---- Board (grouped by effectiveStatus) ----------------------------------
 
 function row(t: Todo, blockers: Blocker[]): string {
-  const eff = effectiveStatus(t); // "blocked" is derived, not stored
+  const eff = effectiveStatus(t); // a stored fact the board projects — never a value of `status`
   const isBlocked = eff === "blocked";
   const firstBlocker = blockers.find((b) => b.status !== "done"); // show the first OPEN blocker
   return `<a href="${B}/todo/${t.id}" class="row ${t.done ? "done" : ""} ${isBlocked ? "blocked" : ""}">

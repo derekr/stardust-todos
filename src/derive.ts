@@ -1,51 +1,21 @@
-// Derive-on-read directives — the declarative replacement for the imperative
-// workflow worker.
+// The query fragments the reads share — one definition, injected everywhere.
 //
-// Each is a CORRELATED `$exists` subquery for a reactor/query `then.project`.
-// It's evaluated once per projected row (the `capture` map binds the outer var
-// into the subquery — keys omit the leading "?"), and it's 0-safe: a row with
-// no match still appears, projected as `false`.
+// This file used to be the derive-on-read catalog: correlated `$exists`
+// subqueries, evaluated once per projected row, that replaced an imperative
+// workflow worker. The shape worked; the claim that came with it did not.
+// "Computed on every READ, so it never needs writing back" is true and was still
+// the wrong trade for `blocked`, because a correlated subquery is executed PER ROW
+// against a 10,000-execution budget shared by the whole query — so the board did
+// not degrade above a few thousand todos, it failed outright. That derivation moved
+// to the WRITE path and is stored (todos.ts, `refreshDerived`); the board and the
+// counts reactor now JOIN `blocked`/`effectiveStatus`/`prank` instead of computing
+// them, and the correlated open-blocker fragment that lived here is gone with them.
 //
-// The shape survives; the claim that came with it did not. "Computed on every
-// READ, so it never needs writing back" is true and was still the wrong trade for
-// `blocked`: a correlated subquery is executed PER ROW against a 10,000-execution
-// budget shared by the whole query, so it fails outright above ~5,000 todos. That
-// derivation now happens on the WRITE path and is stored (todos.ts,
-// `refreshDerived`). What survives here is the honest limit that made the write
-// path necessary — Stardust will not reactively drive a join-derived state back
-// when the condition ceases, so the app has to record it deliberately. `overdue`
-// stays derived on read for a different reason: it compares against `now`, which
-// is not a fact, so no write could ever be the moment it changes.
-
-/**
- * The correlated "open blocker" subquery — "≥1 dependency on a not-done blocker",
- * correlated on `todoVar` via `capture`. This is the `$exists` PROJECTION form,
- * used by dry-runs; src/queries.ts carries the same predicate in the bind-to-a-var
- * form a reactor needs. (A bare fact `not`/multi-clause join can't express this; only a
- * captured subquery correlates per-row. Verified against 0.0.4: as a standalone
- * `where` clause `exists`/`notExists` correlates correctly, but the same subquery
- * does NOT correlate nested inside a `cond`/expression or a `scalar` — so this
- * stays a top-level clause.)
- */
-function openBlockerSubquery(todoVar: string): object {
-  const key = todoVar.slice(1); // "?t" -> "t"
-  return {
-    capture: { [key]: todoVar },
-    find: ["?e"],
-    where: [
-      ["?e", "kind", "dep"],
-      ["?e", "todo", todoVar],
-      ["?e", "blocker", "?b"],
-      ["?b", "status", "?bs"],
-      ["!=", "?bs", "done"],
-    ],
-  };
-}
-
-/** $exists projection directive: TRUE iff `todoVar` has ≥1 not-done blocker. */
-export function openBlockerExists(todoVar: string): object {
-  return { $exists: openBlockerSubquery(todoVar) };
-}
+// The one derivation that can never move to a write is `overdue`, and it is not
+// here either: it compares against `now`, so no write is ever the moment it
+// changes, and it is plain clauses with `now` as a per-read BIND in the board's
+// overdue body (session.ts). What is left is visibility, which is not derived from
+// the graph at all — it is a predicate over two fields of the row itself.
 
 // ---------------------------------------------------------------------------
 // Row-level visibility. Stardust does NOT do authorization (auth only proves

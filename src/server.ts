@@ -35,10 +35,21 @@ import type { EntityId } from "./stardust.ts";
 import { createPersona, createWorkspace, ensureUser, grantAccess, listPersonas, roleOf } from "./tenancy.ts";
 import { authorizeCommand, ensureCommandCatalog, visibleCommands } from "./commands.ts";
 import { addDependency, removeDependency, tagsOf } from "./features.ts";
-import { aggregateCounts, availableTags, blockerMap, effectiveStatus, emptyFilter, todoOptions } from "./board.ts";
 import {
-  BOARD_REACTOR,
+  type Filter,
+  aggregateCounts,
+  availableTags,
+  blockerMap,
+  effectiveStatus,
+  emptyFilter,
+  todoOptions,
+} from "./board.ts";
+import {
+  BOARD_SHAPES,
   type SessionHandle,
+  boardReactorName,
+  boardShape,
+  boardShapeKey,
   createSession,
   ensureBoardReactor,
   readFilter,
@@ -94,9 +105,17 @@ import {
 function runnableBinds(name: string, from: { sid?: string; todo?: string }): Record<string, string> {
   const ws = `{# ${ctx.workspaceId}}`;
   const viewer = `{# ${ctx.personaId}}`;
+  // Every board shape takes `sid`; the overdue ones also take `now`, because
+  // wall-clock time is the one input that cannot be a fact. Pasting one of those
+  // without it fails with `unbound input var ?now` rather than answering wrongly —
+  // the same fail-closed shape as the command gate's ?rank.
+  if (BOARD_SHAPES.some((s) => boardReactorName(s) === name)) {
+    if (!from.sid) return {};
+    const binds: Record<string, string> = { sid: from.sid };
+    if (name.includes("overdue")) binds.now = `{#utc '${new Date().toISOString()}'}`;
+    return binds;
+  }
   switch (name) {
-    case BOARD_REACTOR:
-      return from.sid ? { sid: from.sid } : {};
     case "board-counts":
     case "todo-options":
       return { ws, viewer };
@@ -122,7 +141,7 @@ function withBindClause(body: string, binds: Record<string, string>): string {
   return `bind {${pairs.map(([k, v]) => `${k} ${v}`).join(" ")}}\n${body}`;
 }
 
-const RON_EXPORTABLE = new Set<string>([BOARD_REACTOR, ...DECLARED.map((d) => d.name)]);
+const RON_EXPORTABLE = new Set<string>([...BOARD_SHAPES.map(boardReactorName), ...DECLARED.map((d) => d.name)]);
 
 const PORT = Number(process.env.PORT ?? 3000);
 
@@ -218,6 +237,41 @@ const sessionOf = (sessionId: EntityId): SessionHandle => ({ sessionId, workspac
 /** sids with a live stream, so a write can nudge every open board to re-emit. */
 const liveSessions = new Set<EntityId>();
 
+// ---- Following a session onto a different board body ------------------------
+//
+// The board is no longer ONE reactor: the tag `exists` and the wall-clock overdue
+// clauses are compiled out of the body when the session does not need them, so a
+// filter change can move a session to a differently-shaped reactor (session.ts).
+// A subscription is pinned to the reactor it opened on and cannot follow.
+//
+// So a filter write that changes the SHAPE drops the stream and re-opens it, in
+// that order: `boardStreams` is the open subscription, `boardGate` holds the
+// re-open until the write has landed. Without the gate the loop races the write,
+// re-subscribes to the body it just left, and paints one frame from a reactor that
+// no longer models the question. Same-shape writes — most of them — do not touch
+// this at all; the reactor re-emits on its own, which is still the contract.
+const boardStreams = new Map<EntityId, AbortController>();
+const boardGate = new Map<EntityId, Promise<void>>();
+
+/** Write a session's filter, moving its live stream if the body shape changed. */
+async function applyFilter(sid: EntityId, next: Filter, before?: Filter): Promise<void> {
+  const session = sessionOf(sid);
+  const moved = !before || boardShapeKey(boardShape(before)) !== boardShapeKey(boardShape(next));
+  if (!moved || !boardStreams.has(sid)) {
+    await setFilter(session, next, actorName());
+    return;
+  }
+  let release!: () => void;
+  boardGate.set(sid, new Promise<void>((r) => (release = r)));
+  boardStreams.get(sid)?.abort();
+  try {
+    await setFilter(session, next, actorName());
+  } finally {
+    boardGate.delete(sid);
+    release();
+  }
+}
+
 /**
  * Move every live session to the current workspace + viewer, resetting its
  * filter. Needed because a session stores its own scope as facts: without this a
@@ -227,9 +281,11 @@ const liveSessions = new Set<EntityId>();
 async function rescope(): Promise<void> {
   await retargetAll();
   // A different workspace has different tags and todos, so the old filter is
-  // meaningless there — unlike a "view as" switch, which keeps it.
+  // meaningless there — unlike a "view as" switch, which keeps it. The reset can
+  // land on any shape, so it goes through applyFilter with no `before`: treat it as
+  // a move and re-open the stream.
   for (const sid of liveSessions) {
-    await setFilter(sessionOf(sid), { ...emptyFilter }, actorName()).catch((e) => console.error("rescope filter:", e));
+    await applyFilter(sid, { ...emptyFilter }).catch((e) => console.error("rescope filter:", e));
   }
 }
 
@@ -437,6 +493,7 @@ const server = http.createServer(async (req, res) => {
       req.on("close", () => {
         closed = true;
         liveSessions.delete(sid);
+        boardStreams.delete(sid);
         inner?.abort();
       });
       ServerSentEventGenerator.stream(req, res, async (stream) => {
@@ -445,7 +502,9 @@ const server = http.createServer(async (req, res) => {
         // a todo field in its top-level `where` moves, and each emission is rendered
         // as-is. Nothing here decides what is relevant — the query already did.
         while (!closed) {
+          await boardGate.get(sid); // a shape change is mid-write; re-open after it
           inner = new AbortController();
+          boardStreams.set(sid, inner);
           await watchSnapshot(
             session,
             (rows) =>
@@ -473,13 +532,16 @@ const server = http.createServer(async (req, res) => {
       const session = sessionOf(sid);
       // Read-modify-write against THIS session: the filter is not server state,
       // so a toggle starts from what Stardust currently holds for this browser.
-      const filter = await readFilter(session);
+      const before = await readFilter(session);
+      const filter = { ...before };
       if (facet === "status") filter.status = toggle(filter.status, value as Status);
       else if (facet === "priority") filter.priority = toggle(filter.priority, value as Priority);
       else if (facet === "tag") filter.tags = toggle(filter.tags, value);
       else if (facet === "view") filter.view = filter.view === (value as any) ? "all" : (value as any);
       else if (facet === "group") filter.group = value as any;
-      await setFilter(session, filter, actorName());
+      // `before` is what decides whether this write moves the session to another
+      // board body — a tag going on or off, or the overdue view opening or closing.
+      await applyFilter(sid, filter, before);
       noopStream(req, res);
       return;
     }

@@ -74,8 +74,9 @@ export function effectiveStatus(k: number): string {
   return blocked(k) && r.status !== "done" ? "blocked" : r.status;
 }
 
-/** Derived: past due and not finished. `now` is a PARAMETER — that is the point. */
-export function overdue(k: number, now: number): boolean {
+/** Derived: past due and not finished. `now` is a PARAMETER — that is the point,
+ *  and it is what the board's frozen `{#utc …}` literal was not. */
+function overdue(k: number, now: number): boolean {
   const r = row(k);
   return r.due !== null && r.due < now && r.status !== "done";
 }

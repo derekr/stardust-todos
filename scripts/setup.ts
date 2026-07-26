@@ -12,14 +12,21 @@ import { KEYED_FIELDS, ensureValueIndex } from "../src/indexes.ts";
 import { ensureSchema } from "../src/registry.ts";
 import { DECLARED } from "../src/queries.ts";
 import { DECLARED_SCHEMAS } from "../src/schemas.ts";
-import { BOARD_REACTOR, canonicalBody } from "../src/session.ts";
+import { BOARD_SHAPES, boardReactorName, canonicalBody } from "../src/session.ts";
 import { ensureTodoSchema } from "../src/todos.ts";
 import { BASE } from "../src/stardust.ts";
 
-// The board reactor is provisioned directly (it is hand-written, not a declared
-// query); everything else provisions itself from the query catalog.
+// The board reactors are provisioned directly (they are hand-written, not declared
+// queries); everything else provisions itself from the query catalog. There is one
+// board body per SHAPE — the tag `exists` and the wall-clock `overdue` clauses are
+// compiled out when the session does not need them, and a body that differs is a
+// different reactor. All four are provisioned here so the first browser to pick a
+// tag does not pay for creating one.
 const REACTORS: { name: string; provision: () => Promise<Provisioned> }[] = [
-  { name: BOARD_REACTOR, provision: () => ensureReactor(BOARD_REACTOR, canonicalBody()) },
+  ...BOARD_SHAPES.map((shape) => {
+    const name = boardReactorName(shape);
+    return { name, provision: () => ensureReactor(name, canonicalBody(shape)) };
+  }),
   ...DECLARED.map((d) => ({ name: d.name, provision: () => d.provision() })),
 ];
 
@@ -40,7 +47,7 @@ async function main() {
   }
   for (const r of REACTORS) {
     const { id, status } = await r.provision();
-    console.log(`  ${MARK[status]}  ${r.name.padEnd(12)} #${id}`);
+    console.log(`  ${MARK[status]}  ${r.name.padEnd(18)} #${id}`);
   }
   // Value indexes last: they are policy over fields the reactors above match on,
   // and a rebuild reads canonical facts, so there is nothing to gain by doing it
