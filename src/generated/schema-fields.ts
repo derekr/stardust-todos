@@ -8,14 +8,17 @@ export interface SchemaFieldTypes {
   actor: string;  // from Session
   app: string;  // from Todo
   author: Ref;  // from Todo
+  blocked: boolean;  // from Todo
   done: boolean;  // from Todo
   draft: boolean;  // from Todo
   due: Instant;  // from Todo
+  effectiveStatus: "todo" | "doing" | "blocked" | "done";  // from Todo
   facet: "status" | "priority" | "tag";  // from SessionFacet
   group: "none" | "status" | "priority";  // from Session
   kind: unknown;  // from Grant, Session, SessionFacet
   lastActor: string;  // from Todo
   persona: Ref;  // from Grant
+  prank: number;  // from Todo
   priority: "low" | "med" | "high";  // from Todo
   project: Ref;  // from Todo
   role: "owner" | "member";  // from Grant
@@ -34,14 +37,17 @@ export const schemaValidators = {
   actor: (v) => typeof v === "string",
   app: (v) => typeof v === "string",
   author: (v) => typeof (v as any)?.["#"] === "number",
+  blocked: (v) => typeof v === "boolean",
   done: (v) => typeof v === "boolean",
   draft: (v) => typeof v === "boolean",
   due: (v) => typeof (v as any)?.["#utc"] === "string",
+  effectiveStatus: (v) => (["todo","doing","blocked","done"] as unknown[]).includes(v),
   facet: (v) => (["status","priority","tag"] as unknown[]).includes(v),
   group: (v) => (["none","status","priority"] as unknown[]).includes(v),
   kind: () => true,
   lastActor: (v) => typeof v === "string",
   persona: (v) => typeof (v as any)?.["#"] === "number",
+  prank: (v) => typeof v === "number",
   priority: (v) => (["low","med","high"] as unknown[]).includes(v),
   project: (v) => typeof (v as any)?.["#"] === "number",
   role: (v) => (["owner","member"] as unknown[]).includes(v),

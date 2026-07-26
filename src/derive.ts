@@ -6,11 +6,16 @@
 // into the subquery — keys omit the leading "?"), and it's 0-safe: a row with
 // no match still appears, projected as `false`.
 //
-// Why this eliminates the worker: blocked-ness is computed on every READ, so it
-// never needs to be written back OR undone. The one thing
-// Stardust can't do — reactively drive a join-derived state BACK when the
-// condition ceases (no correlated antijoin in `where`, no reactor auto-retract)
-// — simply never comes up, because nothing is materialized in the first place.
+// The shape survives; the claim that came with it did not. "Computed on every
+// READ, so it never needs writing back" is true and was still the wrong trade for
+// `blocked`: a correlated subquery is executed PER ROW against a 10,000-execution
+// budget shared by the whole query, so it fails outright above ~5,000 todos. That
+// derivation now happens on the WRITE path and is stored (todos.ts,
+// `refreshDerived`). What survives here is the honest limit that made the write
+// path necessary — Stardust will not reactively drive a join-derived state back
+// when the condition ceases, so the app has to record it deliberately. `overdue`
+// stays derived on read for a different reason: it compares against `now`, which
+// is not a fact, so no write could ever be the moment it changes.
 
 /**
  * The correlated "open blocker" subquery — "≥1 dependency on a not-done blocker",

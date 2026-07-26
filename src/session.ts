@@ -5,8 +5,15 @@
 // EVERY filter — priority, status(effective), tags, the derived views
 // (ready/overdue/mine/done), and viewer visibility — entirely server-side, then
 // projects the fully-shaped, fully-filtered board rows. Clients read that snapshot
-// and render it; there is no app-side filtering layer and no materialized derived
-// facts. Each session reads the one reactor via a per-stream bind (`?bind={sid …}`).
+// and render it; there is no app-side filtering layer. Each session reads the one
+// reactor via a per-stream bind (`?bind={sid …}`).
+//
+// NOTE: as of the v4 schema there ARE stored `blocked`/`effectiveStatus` facts,
+// maintained by the write paths in todos.ts, because a correlated `exists` shares a
+// 10,000-execution budget across the whole query and so caps this board at a few
+// thousand todos. This reactor deliberately still derives its own — until it is
+// rewritten to read the stored fields, the two answers exist side by side and can
+// be compared, which is how the write paths are held honest (`reconcileBlocked`).
 //
 // The key that makes derived-value filtering possible in a reactor: BIND a
 // correlated `exists` subquery to a variable — `[[exists {…}] ?blocked]` — then
@@ -51,9 +58,9 @@ export interface SnapshotRow {
   title: string;
   status: string; // stored status
   priority: string;
-  effectiveStatus: string; // DERIVED server-side (blocked overrides, done wins)
+  effectiveStatus: string; // derived by THIS reactor (blocked overrides, done wins)
   done: boolean;
-  blocked: boolean; // DERIVED ($exists over the dep graph)
+  blocked: boolean; // derived by THIS reactor ($exists); also a stored fact — see the header
   overdue: boolean; // DERIVED ($exists: not-done + due < now)
   draft?: boolean;
   lastActor?: string;

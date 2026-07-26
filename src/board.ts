@@ -8,12 +8,15 @@
 
 import type { WorkspaceCtx } from "./workspace.ts";
 import type { Priority, Status, Todo } from "./todos.ts";
+import { effectiveStatusOf } from "./todos.ts";
 import { type EntityId, refId } from "./stardust.ts";
 import { blockers, counts, todoPicker, workspaceTags } from "./queries.ts";
 
-/** Effective display status: "blocked" is DERIVED (not stored). `done` wins. */
+/** Effective display status for a row that carries a blocked flag. `done` wins.
+ *  The rule itself lives in todos.ts, next to the write paths that STORE its
+ *  result — one definition, whether it is being rendered or being recorded. */
 export const effectiveStatus = (t: Pick<Todo, "status" | "blocked">): Status =>
-  t.blocked && t.status !== "done" ? "blocked" : t.status;
+  effectiveStatusOf(t.status, t.blocked === true);
 
 type DerivedView = "all" | "ready" | "overdue" | "mine" | "done";
 type GroupBy = "none" | "status" | "priority";

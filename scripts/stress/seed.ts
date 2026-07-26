@@ -5,7 +5,7 @@
 // echoes a before/after patch for every entity, so a big batch also returns a
 // megabyte we immediately throw away — that, not the write, is the ceiling.
 
-import { row } from "./model.ts";
+import { blocked, effectiveStatus, prank, row } from "./model.ts";
 
 const H = { Accept: "application/x-ndjson", "Content-Type": "application/json" };
 
@@ -62,6 +62,13 @@ export async function seed(base: string, n: number, batchSize = 5000, log = cons
         draft: r.draft,
         author: { "#": r.byOwner ? owner : member },
         lastActor: r.lastActor,
+        // The derived fields, written WITH the row rather than backfilled after
+        // it. The dep edges arrive later in this same seed, but the generator
+        // already knows which ones it is going to write, so the consequence is
+        // known before the cause — the same position the app's write paths are in.
+        blocked: blocked(off + i),
+        effectiveStatus: effectiveStatus(off + i),
+        prank: prank(off + i),
       };
       if (r.due !== null) t.due = { "#utc": new Date(r.due).toISOString() };
       patch[`#_t${i}`] = t;

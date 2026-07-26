@@ -15,8 +15,9 @@ async function main() {
   const read = await addTodo(ctx, "Read the Stardust docs", "low");
   await setStatus(ctx, read, "doing");
 
-  // A dependency chain — the later steps derive as "blocked" (correlated $exists
-  // over the dep graph). Blocked rows can't be toggled until their blockers finish.
+  // A dependency chain — the later steps are "blocked". addDependency writes the
+  // edge and the resulting `blocked`/`effectiveStatus` in the SAME transaction, so
+  // the seed leaves the derived facts correct without a second pass.
   const design = await addTodo(ctx, "① Design landing page", "high");
   const build = await addTodo(ctx, "② Build landing page", "high");
   const qa = await addTodo(ctx, "③ QA landing page", "med");
@@ -37,7 +38,7 @@ async function main() {
   await addTodo(gctx, "Eggs", "med");
   await addTodo(gctx, "Sourdough", "low");
 
-  console.log("seeded. (blocked-ness is derived on read — no worker to run.)");
+  console.log("seeded. (blocked-ness is recorded by the writes that cause it — no worker to run.)");
   console.log("Default workspace: 3 standalone + a 4-step blocked chain.");
   console.log("Groceries workspace: 3 items.");
 }

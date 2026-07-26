@@ -27,7 +27,13 @@ const VISIBLE = visibleTo("?viewer");
 
 /** An OPEN blocker exists for ?t. Same predicate as derive.ts openBlockerExists,
  *  in the form a reactor needs: bound to a var so `cond`/`project` can use it,
- *  rather than the `$exists` directive a dry-run projection takes. */
+ *  rather than the `$exists` directive a dry-run projection takes.
+ *
+ *  There is now a STORED `blocked` field carrying the same answer (todos.ts), and
+ *  it is what the board will read once it is rewritten. This correlated form stays
+ *  here for now ON PURPOSE: while both exist, the derived answer and the recorded
+ *  one can be compared, which is the only cheap way to prove the write paths are
+ *  keeping their promise. */
 const OPEN_BLOCKER = {
   capture: { t: "?t" },
   find: ["?e"],
@@ -41,7 +47,9 @@ const OPEN_BLOCKER = {
 } as const;
 
 /** Status + priority of every viewer-visible todo, with blocked derived per row.
- *  The effective-status tally is folded app-side (blocked is not a stored field). */
+ *  The effective-status tally is folded app-side — a correlated `exists` is not a
+ *  groupable field. The stored `effectiveStatus` now is, which is the shape of the
+ *  rewrite this reactor is waiting on. */
 export const counts = define("board-counts", {
   find: ["?t", "?status", "?priority"],
   where: [
@@ -104,16 +112,21 @@ export const tagsOfTodo = define("todo-tags", {
   then: { project: { label: "?label" } },
 } as const);
 
-/** Titles of the todos that depend on ONE todo (the reverse dependency edge). */
+/** The todos that depend on ONE todo (the reverse dependency edge).
+ *
+ *  The detail page wants the titles; the write path wants the IDS, because these
+ *  are exactly the rows whose stored `blocked` a status write to `?todo` changes
+ *  (`dependentsOf` in todos.ts). `?t` is bound in subject position by the title
+ *  clause, so it projects as a bare id rather than a ref. */
 export const blockedByTodo = define("todo-blocks", {
-  find: ["?bt"],
+  find: ["?t", "?bt"],
   where: [
     ["?d", "kind", "dep"],
     ["?d", "blocker", "?todo"],
     ["?d", "todo", "?t"],
     ["?t", "title", "?bt"],
   ],
-  then: { project: { title: "?bt" } },
+  then: { project: { id: "?t", title: "?bt" } },
 } as const);
 
 // ---------------------------------------------------------------------------

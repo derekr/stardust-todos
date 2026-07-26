@@ -85,23 +85,26 @@ await counts.read({ ws: {"#": ctx.workspaceId},
     reactors: [{ name: "board-counts", bind: "{ws {# 12} viewer {# 7}}" }],
   },
   blocked: {
-    title: "Blocked — derived on read, not stored",
-    mech: "There is no stored 'blocked' status — it's a CORRELATED exists over the dependency graph, recomputed on every read. In the board reactor it is BOUND to a variable first: `[[\"exists\", depSub], \"?blocked\"]` makes ?blocked an ordinary per-row boolean that cond/or/and can then use — which is what makes filtering on a DERIVED value possible server-side. (Inlining a bare exists into an expression instead runs it UNCORRELATED, silently true for every row: always bind, then use.) Because it's never materialized it never needs un-writing — finishing a blocker just makes the next read derive false. That is why this app has no background worker.",
-    code: `const depSub = {
-  capture: { t: "?t" },                 // correlate to the outer row
-  find: ["?e"],
-  where: [
-    ["?e", "kind", "dep"], ["?e", "todo", "?t"],
-    ["?e", "blocker", "?b"], ["?b", "status", "?bs"],
-    ["!=", "?bs", "done"],              // an OPEN blocker
-  ],
-};
+    title: "Blocked — recorded by the write that causes it",
+    mech: 'Blocked-ness used to be derived on every read: a CORRELATED exists over the dep graph, bound to a variable so cond/or/and could filter on it — `[["exists", depSub], "?blocked"]`. That is still how this board computes the flag you are looking at, and it does not scale, because Stardust executes a correlated subquery ONCE PER ROW against a budget of 10,000 executions shared by the entire query: the board fails outright past a few thousand todos, and costs 15.7s unindexed at 2,000. The uncorrelated form of the same question — one scan for every todo with a not-done blocker — is about 10ms for a whole workspace. So `blocked` is now also a STORED fact, and the rule for keeping it true is that the transaction which causes a change records the consequence: a status write patches its dependents, adding a dep edge writes the flag in the SAME transaction as the edge. That is not a cache. Facts are the log, so writing the consequence is recording it, at the moment it happened and with a causation id naming the write that caused it. What it costs is the guarantee: correctness used to be a property of the query, and is now a property of every write path going through one choke point — so there is a reconciliation check that asks the plain query and reports any row that disagrees.',
+    code: `// the plain question, once for the whole workspace (~10ms):
+find: ["?t"],
+where: [["?d", "kind", "dep"], ["?d", "todo", "?t"],
+        ["?d", "blocker", "?b"], ["?b", "status", "?bs"],
+        ["!=", "?bs", "done"]],
 
-// bind it, then use it — in the reactor's where clause:
-[["exists", depSub], "?blocked"],
-[["cond", ["and", "?blocked", ["!=", "?status", "done"]],
-          "blocked", true, "?status"], "?eff"],   // done beats blocked`,
-    src: "src/session.ts · depSub (board) · src/queries.ts · OPEN_BLOCKER (counts)",
+// adding an edge: cause and consequence in ONE transaction
+await transact({
+  "#_e": { kind: "dep", todo: {"#": todoId}, blocker: {"#": blockerId} },
+  [todoId]: { blocked: true, effectiveStatus: "blocked" },
+});
+
+// a status write moves its DEPENDENTS, so they are refreshed with it:
+await refreshDerived(await dependentsOf(id), causingTx);
+
+// the guard for what this gives up — stored vs the plain query:
+await reconcileBlocked()   // [] means every write path kept its promise`,
+    src: "src/todos.ts · refreshDerived() + reconcileBlocked() · src/session.ts · depSub (what the board still derives)",
     reactors: [{ name: "board", bind: "{sid 1519}" }],
   },
   visibility: {
@@ -129,20 +132,22 @@ await counts.read({ ws: {"#": wsId}, viewer: {"#": personaId} });`,
   "detail-meta": {
     title: "Metadata — assembled from facts",
     mech: "detailData() composes the detail from facts and small queries: readEntity for the todo, tagsOf for tags, blockerMap for blockers, and a reverse-dependency query for the 'Blocks' row (which todos depend on this one). No joins baked into a table — each field is a fact or a scoped query.",
-    code: `// "Blocks" = titles of todos that depend on THIS one (reverse edge),
+    code: `// "Blocks" = the todos that depend on THIS one (reverse edge),
 // declared once and read with the todo bound per call:
 export const blockedByTodo = define("todo-blocks", {
-  find: ["?bt"],
+  find: ["?t", "?bt"],
   where: [
     ["?d", "kind", "dep"],
     ["?d", "blocker", "?todo"],       // this todo is the blocker
     ["?d", "todo", "?t"],
     ["?t", "title", "?bt"],
   ],
-  then: { project: { title: "?bt" } },
+  then: { project: { id: "?t", title: "?bt" } },
 });
 
-await blockedByTodo.read({ todo: {"#": id} });`,
+await blockedByTodo.read({ todo: {"#": id} });
+// the detail page takes the titles; the write path takes the ids —
+// they are the rows whose stored 'blocked' a status write here moves.`,
     src: "src/server.ts · detailData()",
     reactors: [{ name: "todo-blocks", bind: "{todo {# 729}}" }],
   },

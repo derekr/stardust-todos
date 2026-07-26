@@ -55,11 +55,18 @@ export function row(k: number): Row {
 /** A due date comfortably in the past for any plausible run date. */
 const DUE_PAST = Date.UTC(2020, 0, 1);
 
-/** Derived: an OPEN blocker exists. */
-function blocked(k: number): boolean {
+/** Derived: an OPEN blocker exists. Exported because the corpus is now written
+ *  WITH its consequences — the generator knows them, so `seed.ts` stores them. */
+export function blocked(k: number): boolean {
   const b = row(k).blockedBy;
   return b !== null && row(b).status !== "done";
 }
+
+/** Priority as an ORDINAL (high 0, med 1, low 2) — the key an ordering should use.
+ *  `PRIORITY.indexOf` is the reverse of it and stays that way, so the two cannot be
+ *  confused: this is the spec for the stored `prank` field, that is the rank the
+ *  ordering assertion reads. */
+export const prank = (k: number): number => ({ high: 0, med: 1, low: 2 })[row(k).priority];
 
 /** Derived: blocked overrides the stored status, but `done` beats blocked. */
 export function effectiveStatus(k: number): string {

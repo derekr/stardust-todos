@@ -41,6 +41,14 @@ export const KEYED_FIELDS = [
   "blocker",
   "status",
   "priority",
+  // v4 derived fields. `effectiveStatus` is what the board's status facet will
+  // value-join on and `prank` is what it will order by, so both are keys the
+  // moment that rewrite lands. `blocked` is here because it is matched as a
+  // constant by the reconciliation check, which is meant to stay cheap enough to
+  // run after every import.
+  "blocked",
+  "effectiveStatus",
+  "prank",
   "scope",
   "cmdId",
   "label",

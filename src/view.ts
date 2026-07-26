@@ -32,8 +32,9 @@ const FONT_PRELOADS = (() => {
 /** Minimal HTML escaper for any user-authored text (titles, tags, blockers). */
 const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-// Design groups the board by effectiveStatus in this fixed order; only
-// non-empty groups render. "blocked" is DERIVED (effectiveStatus), never stored.
+// Design groups the board by effectiveStatus in this fixed order; only non-empty
+// groups render. "blocked" is never a value of `status` (which is user intent) —
+// it only ever appears as an effectiveStatus.
 const STATUS_ORDER: Status[] = ["todo", "doing", "blocked", "done"];
 const GROUP_LABEL: Record<Status, string> = {
   todo: "TODO",

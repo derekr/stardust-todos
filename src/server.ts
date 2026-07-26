@@ -21,6 +21,7 @@ import {
   backfillActor,
   ensureDemoDrafts,
   migrateBlockedStatus,
+  migrateDerivedFields,
   migrateVisibilityFields,
   publishTodo,
   removeTodo,
@@ -134,6 +135,13 @@ await ensureCommandCatalog();
 await backfillActor(); // give pre-existing todos a lastActor so the board projection is complete
 await migrateBlockedStatus(); // blocked-ness is derived now — revert any legacy stored "blocked" rows
 await migrateVisibilityFields(ctx.personaId); // give legacy todos author + draft:false so visibility binds
+// v4: blocked/effectiveStatus/prank are STORED now, written by the transaction
+// that causes them. Todos written before that change carry none, and a reader that
+// matches on a field a row has never been written skips the row silently rather
+// than erroring — so the backfill is what keeps the change invisible. Idempotent:
+// it computes the answer and writes only the rows that differ, so a second boot
+// writes nothing.
+await migrateDerivedFields();
 const OWNER_PERSONA = ctx.personaId;
 const demoUser = await ensureUser("default@local");
 if (!(await listPersonas(demoUser)).some((p) => p.name === "Teammate")) {
@@ -152,9 +160,11 @@ const actorName = () => (viewPersona === MEMBER_PERSONA ? "Teammate" : "Owner");
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
-// No durable-workflow worker: blocked-ness and project rollup are DERIVED on
-// read (correlated $exists projections), so there is nothing to materialize or
-// undo — the imperative worker is gone entirely.
+// Still no durable-workflow worker, and now for a sharper reason than "nothing is
+// materialized". `blocked` IS materialized again — but by the request that causes
+// it, inside the same write path, not by a process watching for work to do. A
+// worker would be a second writer racing the first; the choke point (todos.ts,
+// patchTodo/refreshDerived) is one writer that already knows what changed.
 
 /**
  * Point every live session at the current workspace + viewer.

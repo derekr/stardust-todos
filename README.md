@@ -125,11 +125,15 @@ Highlights of the later stages:
   questions are plain datalog joins rather than array gymnastics. Due dates are
   Stardust instants, queried with a field predicate (`[< ?due {#utc now}]`) in
   the session reactor's `overdue` subquery.
-- **Derived state, no worker** (`src/session.ts`, `src/derive.ts`). Blocked-ness
-  and the derived views used to be materialized onto `status` by a background
-  worker reacting to the transaction bus. They are now DERIVED on read by a
-  correlated `exists` bound to a variable inside the board reactor, so nothing
-  ever needs un-writing and the worker was deleted outright.
+- **Derived state, no worker** (`src/session.ts`, `src/derive.ts`, `src/todos.ts`).
+  Blocked-ness and the derived views used to be materialized onto `status` by a
+  background worker reacting to the transaction bus. They became DERIVED on read by
+  a correlated `exists` bound to a variable inside the board reactor — and for
+  `blocked` that has since been reversed, because a correlated subquery runs per
+  row against a budget of 10,000 executions shared by the whole query. It is stored
+  again, written by the transaction that causes it (`refreshDerived`), and checked
+  against the plain query by `reconcileBlocked`. Still no worker: the writer is the
+  request that caused the change, not a process watching for work.
 - **Workspace switching in the web UI** (`src/server.ts`, `#wsbar`). One active
   workspace at a time; switching updates the server context and closes streams,
   and Datastar auto-reconnects to re-render against the new workspace.

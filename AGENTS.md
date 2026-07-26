@@ -53,7 +53,10 @@ holds it. What that has already removed:
   one reactor serves every workspace, viewer and todo.
 
 Derived state especially: prefer computing on read (a correlated `exists` bound to
-a variable) over materialising a field and then having to un-write it.
+a variable) over materialising a field and then having to un-write it — but read
+the entry on `blocked` in the tension section before you apply that to a field
+whose subquery runs per row. That is the one place this rule has been reversed,
+and it was reversed by measurement.
 
 ## What a subscription pushes, and what it does not
 
@@ -181,6 +184,28 @@ worth reading before you re-litigate one:
   longer than the `project()` they replaced. It was taken for the fail-closed
   bind and for one definition serving menu and write boundary, NOT for brevity —
   the same trade as promoting the per-render queries. Expect it again.
+- Derive-on-read vs materialise, for `blocked`: REVERSED, and this is the entry
+  that contradicts the advice at the top of this file. A correlated `exists` is
+  executed once per candidate row, and Stardust caps TOTAL subquery executions at
+  10,000 per query as ONE SHARED BUDGET — so the board does not degrade past a few
+  thousand todos, it hard-fails, and it already costs 15.7s unindexed at 2,000. The
+  same question asked without correlation ("which todos have a not-done blocker")
+  is one scan, ~10ms for a whole workspace. So the derivation moved to the write
+  path: `blocked`, `effectiveStatus` and `prank` are stored fields, and the rule is
+  that the transaction which causes a change records the consequence — the dep edge
+  and the flag land in ONE transact, a status write patches its dependents with the
+  causing tx as their causation id. This is not a cache; facts are the log, so
+  recording a consequence is what the log is for.
+
+  What it gives up, precisely: the invariant moved from "guaranteed by the query"
+  to "guaranteed by write discipline plus a reconciliation check". Every path that
+  can change the answer must go through `refreshDerived` — that is why the write
+  paths are funnelled through `patchTodo` and why `addDependency`/`removeDependency`
+  /`removeTodo` are the only other doors. `reconcileBlocked()` asks the plain query
+  and reports every row that disagrees; it is ~10ms, so run it in tests and after
+  an import. A writeback reactor cannot take this job: verified in both directions,
+  `then.patch` does not fire on a dep edge being added OR retracted, only on a write
+  to the blocker's own `status`, so a todo left `blocked:true` stays wrong forever.
 - The role HIERARCHY is still TypeScript (`roleRank`: any < member < owner). The
   app turns a role into a rank and Stardust compares it, so half of "who may do
   what" is still a deploy away. Making ranks facts is the obvious next step and
