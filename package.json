@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "A todo app backed by Stardust — with a CLI and a Datastar web UI, both live via reactor SSE.",
+  "description": "A todo app backed by Stardust \u2014 with a CLI and a Datastar web UI, both live via reactor SSE.",
   "scripts": {
     "web": "node src/server.ts",
     "cli": "node src/cli.ts",
@@ -17,7 +17,8 @@
     "check": "oxfmt --check src scripts && oxlint src scripts && tsgo --noEmit && knip && node --test 'src/**/*.test.ts'",
     "typecheck": "tsgo --noEmit",
     "gen:query": "node scripts/gen-query.ts",
-    "knip": "knip"
+    "knip": "knip",
+    "stress": "node scripts/stress/run.ts"
   },
   "dependencies": {
     "@starfederation/datastar-sdk": "^1.0.0"

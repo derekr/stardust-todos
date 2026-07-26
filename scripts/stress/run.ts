@@ -18,8 +18,8 @@
 // board at a million rows is a ~200MB response, so it is measured, never parsed.
 
 import { canonicalBody } from "../../src/session.ts";
-import { PRIORITY, STATUS, type Facets, effectiveStatus, expectedCount, expectedSet, overdue, row } from "./model.ts";
-import { type Seeded, seed, session } from "./seed.ts";
+import { PRIORITY, STATUS, type Facets, effectiveStatus, expectedCount, expectedSet, overdue } from "./model.ts";
+import { seed, session } from "./seed.ts";
 
 const BASE = process.env.STARDUST_URL ?? "http://127.0.0.1:3095";
 const H = { Accept: "application/x-ndjson", "Content-Type": "application/json" };
@@ -34,7 +34,9 @@ const N = (() => {
 let failures = 0;
 function ok(name: string, pass: boolean, detail = "") {
   if (!pass) failures++;
-  console.log(`  ${pass ? "\x1b[32mPASS\x1b[0m" : "\x1b[31mFAIL\x1b[0m"}  ${name}${detail ? `  \x1b[2m${detail}\x1b[0m` : ""}`);
+  console.log(
+    `  ${pass ? "\x1b[32mPASS\x1b[0m" : "\x1b[31mFAIL\x1b[0m"}  ${name}${detail ? `  \x1b[2m${detail}\x1b[0m` : ""}`,
+  );
 }
 
 interface BoardRow {
@@ -109,8 +111,14 @@ async function main() {
   ok("no duplicate ids", new Set(rHi.rows.map((r) => r.id)).size === rHi.rows.length, `${rHi.rows.length} rows`);
 
   const rLo = (await board(rid, sidLo))!;
-  ok("a session sees only its own filter", rLo.rows.every((r) => r.priority === "low"));
-  ok("...and the other still sees only its own", rHi.rows.every((r) => r.priority === "high"));
+  ok(
+    "a session sees only its own filter",
+    rLo.rows.every((r) => r.priority === "low"),
+  );
+  ok(
+    "...and the other still sees only its own",
+    rHi.rows.every((r) => r.priority === "high"),
+  );
 
   const rBoth = (await board(rid, sidBoth))!;
   const setBoth = new Set(rBoth.rows.map(kOf));
@@ -135,7 +143,10 @@ async function main() {
   ] as const) {
     const sid = await sessionFor(f);
     const got = await board(rid, sid);
-    if (!got) { ok(label, false, lastError); continue; }
+    if (!got) {
+      ok(label, false, lastError);
+      continue;
+    }
     const want = new Set(expectedSet(N, f, NOW));
     const gotK = new Set(got.rows.map(kOf));
     const missing = [...want].filter((k) => !gotK.has(k));
@@ -184,7 +195,9 @@ async function main() {
       `expected ${expectedCount(N, full, NOW).toLocaleString()} rows`,
   );
   const narrowPerf = await raw(rid, sidHi);
-  console.log(`  narrow slice       ${String(narrowPerf.ms).padStart(6)}ms   ${(narrowPerf.bytes / 1024).toFixed(0)}KB`);
+  console.log(
+    `  narrow slice       ${String(narrowPerf.ms).padStart(6)}ms   ${(narrowPerf.bytes / 1024).toFixed(0)}KB`,
+  );
 
   console.log(`\n${failures ? `\x1b[31m${failures} failing\x1b[0m` : "\x1b[32mall green\x1b[0m"}\n`);
   process.exit(failures ? 1 : 0);

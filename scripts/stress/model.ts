@@ -10,10 +10,9 @@
 
 export const PRIORITY = ["low", "med", "high"] as const;
 export const STATUS = ["todo", "doing", "blocked", "done"] as const;
-export const TAGS = ["alpha", "beta"] as const;
 
-export type Priority = (typeof PRIORITY)[number];
-export type Status = (typeof STATUS)[number];
+type Priority = (typeof PRIORITY)[number];
+type Status = (typeof STATUS)[number];
 
 /** A todo as the generator defines it, before any derivation. */
 export interface Row {
@@ -54,10 +53,10 @@ export function row(k: number): Row {
 }
 
 /** A due date comfortably in the past for any plausible run date. */
-export const DUE_PAST = Date.UTC(2020, 0, 1);
+const DUE_PAST = Date.UTC(2020, 0, 1);
 
 /** Derived: an OPEN blocker exists. */
-export function blocked(k: number): boolean {
+function blocked(k: number): boolean {
   const b = row(k).blockedBy;
   return b !== null && row(b).status !== "done";
 }
@@ -91,7 +90,7 @@ export interface Facets {
  * Visibility first (a draft is yours or invisible), then the facet joins, then the
  * single-select view. Ordering is asserted separately.
  */
-export function onBoard(k: number, f: Facets, now: number): boolean {
+function onBoard(k: number, f: Facets, now: number): boolean {
   const r = row(k);
   const visible = !r.draft || r.byOwner === f.viewerIsOwner;
   if (!visible) return false;

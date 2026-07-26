@@ -39,7 +39,9 @@ export async function seed(base: string, n: number, batchSize = 5000, log = cons
     "#_owner": { kind: "persona", name: "Owner" },
     "#_member": { kind: "persona", name: "Member" },
   });
-  const workspace = ids.ws!, owner = ids.owner!, member = ids.member!;
+  const workspace = ids.ws!,
+    owner = ids.owner!,
+    member = ids.member!;
   log(`  workspace #${workspace}  owner #${owner}  member #${member}`);
 
   const idByK = new Int32Array(n);
@@ -67,7 +69,8 @@ export async function seed(base: string, n: number, batchSize = 5000, log = cons
     const got = await tx(base, patch);
     for (let i = 0; i < size; i++) idByK[off + i] = got[`t${i}`]!;
     if ((off / batchSize) % 20 === 0 || off + size >= n) {
-      const done = off + size, secs = (Date.now() - t0) / 1000;
+      const done = off + size,
+        secs = (Date.now() - t0) / 1000;
       log(`  todos ${done.toLocaleString()}/${n.toLocaleString()}  ${Math.round(done / secs).toLocaleString()}/s`);
     }
   }
@@ -97,7 +100,15 @@ export async function seed(base: string, n: number, batchSize = 5000, log = cons
 export async function session(
   s: Seeded,
   sid: number,
-  f: { status: readonly string[]; priority: readonly string[]; tags: readonly string[]; tagActive: boolean; view: string; viewerIsOwner: boolean; actor: string },
+  f: {
+    status: readonly string[];
+    priority: readonly string[];
+    tags: readonly string[];
+    tagActive: boolean;
+    view: string;
+    viewerIsOwner: boolean;
+    actor: string;
+  },
 ): Promise<number> {
   const ids = await tx(s.base, {
     "#_s": {
@@ -116,7 +127,7 @@ export async function session(
 }
 
 /** Replace a session's facets in ONE transaction, as writeFacets() does. */
-export async function setFacets(
+async function setFacets(
   s: Seeded,
   sessionId: number,
   f: { status: readonly string[]; priority: readonly string[]; tags: readonly string[] },
