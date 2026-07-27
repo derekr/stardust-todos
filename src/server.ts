@@ -42,7 +42,6 @@ import {
 } from "./todos.ts";
 import { type WorkspaceCtx, defaultWorkspace, openWorkspace } from "./workspace.ts";
 import { lookupRef } from "./registry.ts";
-import type { EntityId } from "./stardust.ts";
 import { createPersona, createWorkspace, ensureUser, grantAccess, listPersonas, roleOf } from "./tenancy.ts";
 import { authorizeCommand, ensureCommandCatalog, visibleCommands } from "./commands.ts";
 import { addDependency, removeDependency, tagsOf } from "./features.ts";
@@ -51,7 +50,16 @@ import { type BoardScope, boardQuery, readSnapshot } from "./board-query.ts";
 import { type BoardState, FilterError, decodeFilter } from "./filter.ts";
 import { BASE, TxConflictError, lastTx, readEntity, readReactorRon, watchEntity } from "./stardust.ts";
 import { DECLARED, blockedByTodo, pageRows } from "./queries.ts";
-import { leasePageSet, releasePageSet, watchPage, writePageSet } from "./pageset.ts";
+import {
+  type PageSet,
+  frameKey,
+  leasePageSet,
+  pooledPageSets,
+  recoverPool,
+  releasePageSet,
+  showPage,
+  watchPage,
+} from "./pageset.ts";
 import { statusHistory } from "./history.ts";
 import {
   type BoardView,
@@ -213,9 +221,6 @@ const repaintAll = () => {
   for (const b of openBoards) b.repaint();
 };
 
-/** Page-sets with a stream behind them, so /page.json can offer a real bind. */
-const livePageSets = new Set<EntityId>();
-
 // ---- Vendored static assets ------------------------------------------------
 // `public/` is populated by scripts/vendor-assets.sh. Names are content-pinned
 // (a version or a font hash), so they can be cached hard.
@@ -258,15 +263,17 @@ async function serveStatic(parts: string[], res: http.ServerResponse): Promise<v
 // queries. So this function is still O(workspace) — paging bounded the board's
 // response and its render, not the cost of a page view. Saying so here because the
 // obvious next question is why the page is not fast yet.
-async function boardData(state: BoardState, pgset: EntityId | null, tags: string[]) {
+async function boardData(state: BoardState, pgset: PageSet | null, tags: string[]) {
   const [snap, counts, blockers] = await Promise.all([
     readSnapshot(boardQuery(scopeNow(), state.filter), state.page),
     aggregateCounts(ctx, viewPersona), // counts over the SAME visible set
     blockerMap(ctx),
   ]);
   // Record what this stream is now looking at, so the page subscription follows it.
+  // Costs nothing at all when the rows have not moved: `showPage` diffs against
+  // what this process last wrote to those slots and sends no transaction.
   if (pgset !== null)
-    await writePageSet(
+    await showPage(
       pgset,
       snap.rows.map((r) => r.id),
     );
@@ -276,12 +283,17 @@ async function boardData(state: BoardState, pgset: EntityId | null, tags: string
 // Render the filter bar + board over the stream, for ONE open board. The filter
 // arrives with the stream's own URL and does not change for its lifetime — a
 // different filter is a different stream — so it is captured once and passed down.
-async function renderBoard(stream: any, state: BoardState, pgset: EntityId) {
+async function renderBoard(stream: any, state: BoardState, pgset: PageSet): Promise<string> {
   const tags = await availableTags(ctx);
   const { snap, todos, counts, blockers } = await boardData(state, pgset, tags);
   stream.patchElements(filterBar(state, counts.status, counts.priority, tags));
-  stream.patchElements(boardFragment(todos, blockers, state.filter, { state, hasMore: snap.hasMore }, pgset));
+  stream.patchElements(boardFragment(todos, blockers, state.filter, { state, hasMore: snap.hasMore }, pgset.id));
   stream.patchElements(sidebar(state, counts.status)); // desktop rail (hidden < 900px)
+  // The emission this render's own page-set write is about to provoke, described in
+  // the subscription's own terms. Returning it is what lets the stream loop drop the
+  // echo instead of reading the whole board a second time to discover it changed
+  // nothing.
+  return frameKey(snap.rows);
 }
 
 // The same board, rendered into the initial HTML so the first paint is the real
@@ -400,13 +412,13 @@ const server = http.createServer(async (req, res) => {
     // nothing to bind.
     if (url === "/page.json" && method === "GET") {
       const rid = await pageRows.id();
-      const open = [...livePageSets];
+      const open = pooledPageSets();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify(
           {
             reactorId: rid,
-            openPageSets: open,
+            idlePageSets: open,
             page: `curl -N -H 'Accept: application/x-ndjson' -G --data-urlencode 'bind={ps {# ${open[0] ?? "<open a board first>"}}}' "${BASE}/reactors/${rid}/results"`,
             transactions: `curl -N -H 'Accept: application/x-ndjson' "${BASE}/events/bus/stardust/transactions"`,
           },
@@ -429,7 +441,6 @@ const server = http.createServer(async (req, res) => {
       // for — a session entity outlived the tab that made it, and the demo had 84
       // of them for twelve todos.
       const pgset = await leasePageSet();
-      livePageSets.add(pgset);
       let closed = false;
       let inner: AbortController | null = null;
       const board = { repaint: () => {} };
@@ -437,21 +448,49 @@ const server = http.createServer(async (req, res) => {
         closed = true;
         inner?.abort();
         openBoards.delete(board);
-        livePageSets.delete(pgset);
-        void releasePageSet(pgset).catch((e) => console.error("page-set release:", e));
+        releasePageSet(pgset); // in memory: closing a stream writes nothing
       });
       ServerSentEventGenerator.stream(req, res, async (stream) => {
-        const paint = () => void renderBoard(stream, state, pgset).catch((e) => console.error("render:", e));
+        // What the page-set currently names, as `page-rows` would project it. An
+        // emission matching this is one the render itself caused, or a write that
+        // changed nothing this page can show — either way there is nothing to
+        // repaint. It is the app's own result-equality suppression, over exactly the
+        // fields the subscription is sensitive to, so nothing a reader would have
+        // seen can be dropped by it.
+        let painted = "";
+        const paint = () =>
+          void renderBoard(stream, state, pgset)
+            .then((k) => {
+              painted = k;
+            })
+            .catch((e) => console.error("render:", e));
         board.repaint = paint;
         openBoards.add(board);
         while (!closed) {
           inner = new AbortController();
+          // Paint BEFORE subscribing. The page-set has to be written for the
+          // subscription to be about anything, and writing it invalidates the
+          // reactor — so subscribing first meant an empty first emission, a full
+          // render, and then an echo that triggered a second identical render. One
+          // board read per stream instead of two.
+          await renderBoard(stream, state, pgset)
+            .then((k) => {
+              painted = k;
+            })
+            .catch((e) => console.error("render:", e));
           // Subscribe to the PAGE, not the whole filtered set. The reactor is an
           // invalidation signal rather than a data source: it fires when a row on
           // screen changes, and the render re-reads the page properly so ordering
           // and shape come from one place. Edits to rows NOT on the page are
           // silent — membership moves only when the app rewrites the page-set.
-          await watchPage(pgset, paint, inner.signal);
+          await watchPage(
+            pgset,
+            (rows) => {
+              if (frameKey(rows) === painted) return; // our own echo
+              paint();
+            },
+            inner.signal,
+          );
           // Only a client close aborts inner now. A dropped upstream stream (idle
           // timeout) did NOT abort → back off before resubscribing.
           if (!closed && !inner.signal.aborted) await new Promise((r) => setTimeout(r, 500));
@@ -784,7 +823,10 @@ server.listen(PORT, async () => {
   // per open stream, so there is no id to print until a board is open — the bind
   // below takes one from /page.json.
   const rid = await pageRows.id();
-  console.log(`\n  page reactor ${rid}`);
+  // A restart used to abandon its page-sets and mint fresh ones per stream. The
+  // pool is discoverable — `kind pgset` is a query — so it is adopted instead.
+  const pooled = await recoverPool();
+  console.log(`\n  page reactor ${rid} · ${pooled} page-set(s) recovered`);
   console.log(
     `  page     :  curl -N -H 'Accept: application/x-ndjson' -G --data-urlencode 'bind={ps {# <pgset>}}' "${BASE}/reactors/${rid}/results"`,
   );
