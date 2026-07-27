@@ -14,7 +14,7 @@
 
 import type { Todo, Priority, Status } from "./todos.ts";
 import { type BoardState, type Filter, boardHref, encodeFilter, toggled } from "./filter.ts";
-import type { Blocker } from "./board.ts";
+import type { Blocker, Counts } from "./board.ts";
 import { effectiveStatus } from "./board.ts";
 import type { ProjectedCommand } from "./commands.ts";
 import { xrayAssets } from "./xray.ts";
@@ -96,19 +96,33 @@ const facetChip = (s: BoardState, label: string, active: boolean, facet: string,
  *  board's own `where` (measured at the same 7.5s the board costs) for a numeral. */
 const cnum = (id: string, n: number | string) => `<span id="${id}" class="cnum">${n}</span>`;
 
-/** "all·N" — N is the total shown (sum of the viewer-scoped status counts). */
-export const visibleTotal = (statusCounts: Record<string, number>): number =>
-  Object.values(statusCounts).reduce((a, b) => a + b, 0);
+/**
+ * A tally the render does not have YET.
+ *
+ * Every count on this page — the chips, the sidebar and the total in the title
+ * pill — comes from one whole-workspace read, and it is the slowest thing a board
+ * waits on: 127ms against 49ms for the fifty rows, at 10,003 todos, and it cannot
+ * be narrowed, because "how many are there" is not a question fifty rows can
+ * answer. So the render no longer waits for it. `null` means the numbers are still
+ * being counted, and every count-bearing element already had an "unknown" state,
+ * because the tag chips have never carried one.
+ *
+ * The total is the one place that shows something rather than nothing, because its
+ * span is morphed by id and has to exist to be morphed into.
+ */
+const PENDING = "…";
+
+/** "all·N" — N is the total shown (sum of the viewer-scoped status counts), or
+ *  `undefined` while the tally is still in flight. */
+const visibleTotal = (counts: Counts | null): number | undefined =>
+  counts === null ? undefined : Object.values(counts.status).reduce((a, b) => a + b, 0);
 
 /** The filter bar element on its own — shared by the SSE patch and the SSR shell. */
-export function filterBarEl(
-  state: BoardState,
-  statusCounts: Record<string, number>,
-  priorityCounts: Record<string, number>,
-  tags: string[],
-): string {
+export function filterBarEl(state: BoardState, counts: Counts | null, tags: string[]): string {
   const f = state.filter;
-  const total = visibleTotal(statusCounts);
+  const total = visibleTotal(counts);
+  const statusCounts = counts?.status;
+  const priorityCounts = counts?.priority;
 
   const views =
     viewChip(state, "all", f.view === "all", "all", total) +
@@ -117,10 +131,10 @@ export function filterBarEl(
     viewChip(state, "mine", f.view === "mine", "mine");
 
   const statuses = STATUS_ORDER.map((s) =>
-    facetChip(state, STATUS_LABEL[s], f.status.includes(s), "status", s, statusCounts[s] ?? 0),
+    facetChip(state, STATUS_LABEL[s], f.status.includes(s), "status", s, statusCounts && (statusCounts[s] ?? 0)),
   ).join("");
   const prios = PRIOS.map((p) =>
-    facetChip(state, p, f.priority.includes(p), "priority", p, priorityCounts[p] ?? 0),
+    facetChip(state, p, f.priority.includes(p), "priority", p, priorityCounts && (priorityCounts[p] ?? 0)),
   ).join("");
   const tagChips = tags.map((t) => facetChip(state, `#${t}`, f.tags.includes(t), "tag", t)).join("");
   const groups = (["status", "priority", "none"] as const)
@@ -148,14 +162,9 @@ export function filterBarEl(
  * span that Datastar morphs into the title pill by id. boardFragment owns
  * count-visible the same way.
  */
-export function filterBar(
-  state: BoardState,
-  statusCounts: Record<string, number>,
-  priorityCounts: Record<string, number>,
-  tags: string[],
-): string {
-  return `${filterBarEl(state, statusCounts, priorityCounts, tags)}
-  ${cnum("count-total", visibleTotal(statusCounts))}`;
+export function filterBar(state: BoardState, counts: Counts | null, tags: string[]): string {
+  return `${filterBarEl(state, counts, tags)}
+  ${cnum("count-total", visibleTotal(counts) ?? PENDING)}`;
 }
 
 // ---- Board (grouped by effectiveStatus) ----------------------------------
@@ -308,15 +317,16 @@ const sbView = (s: BoardState, label: string, active: boolean, view: string, cou
     <span class="sb-txt">${esc(label)}</span>${count !== undefined ? `<span class="sb-n">${count}</span>` : ""}
   </a>`;
 
-const sbStatus = (state: BoardState, s: Status, active: boolean, count: number) =>
+const sbStatus = (state: BoardState, s: Status, active: boolean, count?: number) =>
   `<a class="sb-item ${active ? "on" : ""}" href="${chipHref(state, "status", s)}">
     <span class="sb-dot p-${s === "blocked" ? "high" : s === "doing" ? "med" : s === "done" ? "done" : "low"}"></span>
-    <span class="sb-txt">${esc(STATUS_LABEL[s])}</span><span class="sb-n">${count}</span>
+    <span class="sb-txt">${esc(STATUS_LABEL[s])}</span>${count === undefined ? "" : `<span class="sb-n">${count}</span>`}
   </a>`;
 
-export function sidebar(state: BoardState, statusCounts: Record<string, number>): string {
+export function sidebar(state: BoardState, counts: Counts | null): string {
   const f = state.filter;
-  const total = Object.values(statusCounts).reduce((a, b) => a + b, 0);
+  const total = visibleTotal(counts);
+  const statusCounts = counts?.status;
   return `<aside id="sidebar">
     <div class="sb-brand">Todos<span class="sb-ws">· Default</span></div>
     <button class="sb-add" data-on:click="$addOpen = true; $error = ''">＋ New task</button>
@@ -327,7 +337,7 @@ export function sidebar(state: BoardState, statusCounts: Record<string, number>)
       ${sbView(state, "Overdue", f.view === "overdue", "overdue")}
       ${sbView(state, "Mine", f.view === "mine", "mine")}
       <div class="sb-label">status</div>
-      ${STATUS_ORDER.map((s) => sbStatus(state, s, f.status.includes(s), statusCounts[s] ?? 0)).join("")}
+      ${STATUS_ORDER.map((s) => sbStatus(state, s, f.status.includes(s), statusCounts && (statusCounts[s] ?? 0))).join("")}
     </nav>
     <div class="sb-foot">
       <div class="sb-valabel">view as</div>
@@ -351,7 +361,8 @@ export interface BoardView {
   board: string;
   /** rows on THIS page — a string, because a further page renders as "50+". */
   visible: string;
-  total: number;
+  /** the whole-workspace tally, or undefined while it is still being counted */
+  total?: number;
 }
 
 export function page(state: BoardState, view?: BoardView): string {
@@ -617,7 +628,7 @@ export function page(state: BoardState, view?: BoardView): string {
     <!-- 2. title + visible·total (both spans morphed by SSE) -->
     <div class="titlerow">
       <h1 class="apptitle">Todos</h1>
-      <span class="countpill" data-xray="counts">${cnum("count-visible", view?.visible ?? "0")}<span class="ctdot">·</span>${cnum("count-total", view?.total ?? 0)}</span>
+      <span class="countpill" data-xray="counts">${cnum("count-visible", view?.visible ?? "0")}<span class="ctdot">·</span>${cnum("count-total", view?.total ?? PENDING)}</span>
     </div>
 
     <!-- 3. search (visual only — bound to $search, no endpoint yet) -->

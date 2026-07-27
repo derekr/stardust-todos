@@ -54,6 +54,8 @@ const XRAY: Record<string, XraySpec> = {
 
     ["=", "?priority", "high"],                        // was 4 clauses
     ["or", ["=", "?eff", "todo"], ["=", "?eff", "doing"]],  // was 4 clauses
+    // …and NOTHING at all for a facet with everything selected: an
+    // or over the whole domain cannot remove a row.  85ms -> 54ms
     ["=", "?eff", "todo"],                 // ?v=ready, chosen at compile time
 
     // ?tag=design,launch — the todo's OWN labels, bound once per row,
@@ -93,26 +95,26 @@ await reconcileTags()   // [] means the two still agree
   },
   counts: {
     title: "Counts — a viewer-scoped tally",
-    mech: "aggregateCounts() runs over the viewer-VISIBLE set — the same visibility rule as the board, so a draft you can't see can't leak into the numbers — but deliberately NOT narrowed by the active facets, which is why the chips can show what you'd get if you picked them. It projects {effectiveStatus, priority} per visible todo and the tally is a plain app-side count. It used to bind a correlated `exists` per row to get `blocked` and fold an effective status out of it here, which put this read under the board's own 10,000-execution ceiling for a number in a chip; the effective status is a stored fact now, so this is an ordinary join. A `groupBy` aggregate would finally be possible and is deliberately not used: the chips want every value present, including the zeroes.",
-    code: `// declared once (src/queries.ts) — ?ws and ?viewer are left unbound:
-export const counts = define("board-counts", {
-  find: ["?t", "?eff", "?priority"],
+    mech: "aggregateCounts() runs over the viewer-VISIBLE set — the same visibility rule as the board, so a draft you can't see can't leak into the numbers — but deliberately NOT narrowed by the active facets, which is why the chips can show what you'd get if you picked them. It projects {effectiveStatus, priority} per visible todo and the tally is a plain app-side count. It used to bind a correlated `exists` per row to get `blocked` and fold an effective status out of it here, which put this read under the board's own 10,000-execution ceiling for a number in a chip; the effective status is a stored fact now, so this is an ordinary join. It is grouped in the ENGINE by (effectiveStatus, priority) — eleven rows out of 9,947 — and the app folds those into the two tallies the chips want, because the chips want every value present including the zeroes. It was a STORED reactor read with `ws` and `viewer` as BINDS and it is a dry-run with both spelled as literals, which is the whole of why this page got faster: at 10,003 todos the identical body costs 197ms through the stored reactor, 194ms as a dry-run with the binds still in it, and 132ms with the literals — the workspace bind ~28ms and the viewer bind ~51ms, isolated four ways and reproduced in both orders. Reading a stored reactor is not what costs; a value the planner only learns at read time is. This is the largest read left on the board and it is the one that has to be whole-workspace: \"how many are there\" cannot be answered from fifty rows.",
+    code: `// a dry-run, built per read. This WAS a stored reactor taking
+// ?ws and ?viewer as binds; the body is the same and the two
+// literals are worth 197ms -> 132ms at ten thousand todos:
+{
+  find: ["?eff", "?priority", ["count", "?t"]],
   where: [
-    ["?t", "app", "todo-app"], ["?t", "workspace", "?ws"],
-    ["?t", "effectiveStatus", "?eff"],     // stored, not derived
+    ["?t", "app", "todo-app"],
+    ["?t", "workspace", {"#": 12}],      // was ?ws  (~28ms)
+    ["?t", "effectiveStatus", "?eff"],   // stored, not derived
     ["?t", "priority", "?priority"],
-    ...visibleTo("?viewer"),
+    ["?t", "draft", "?draft"], ["?t", "author", "?author"],
+    ["or", ["=", "?draft", false],
+           ["=", "?author", {"#": 7}]],  // was ?viewer  (~51ms)
   ],
-  then: { project: { effectiveStatus: "?eff",
-                     priority: "?priority" } },
-});
-
-// read it, scoped per call — ?bind={ws {# 12} viewer {# 7}}:
-await counts.read({ ws: {"#": ctx.workspaceId},
-                    viewer: {"#": viewerPersonaId} });
-// then count them — the group key arrives already decided`,
-    src: "src/queries.ts · counts · src/board.ts · aggregateCounts()",
-    reactors: [{ name: "board-counts", bind: "{ws {# 12} viewer {# 7}}" }],
+  groupBy: ["?eff", "?priority"],        // 11 rows, not 9,947
+}
+// -> [["todo","med",3858], ["doing","high",430], …]
+// the app adds those up two ways; the group key arrives decided`,
+    src: "src/board.ts · aggregateCounts() · src/derive.ts · visibleTo()",
   },
   blocked: {
     title: "Blocked — recorded by the write that causes it",
@@ -161,11 +163,10 @@ function visibleTo(viewer) {
 // counts / todo-options reactors — supplied at read time:
 await counts.read({ ws: {"#": wsId}, viewer: {"#": personaId} });`,
     src: "src/board-query.ts · canonicalBody() · src/derive.ts · visibleTo() (bound as ?viewer in src/queries.ts)",
-    reactors: [{ name: "board-counts", bind: "{ws {# 12} viewer {# 7}}" }],
   },
   "detail-meta": {
     title: "Metadata — assembled from facts",
-    mech: "detailData() composes the detail from facts and small queries: readEntity for the todo, tagsOf for tags, blockerMap for blockers, and a reverse-dependency query for the 'Blocks' row (which todos depend on this one). No joins baked into a table — each field is a fact or a scoped query.",
+    mech: "detailData() composes the detail from facts and small queries: readEntity for the todo, tagsOf for tags, a `?todo`-bound reactor for blockers, and a reverse-dependency query for the 'Blocks' row (which todos depend on this one). No joins baked into a table — each field is a fact or a scoped query.",
     code: `// "Blocks" = the todos that depend on THIS one (reverse edge),
 // declared once and read with the todo bound per call:
 export const blockedByTodo = define("todo-blocks", {
@@ -187,21 +188,22 @@ await blockedByTodo.read({ todo: {"#": id} });
   },
   blockers: {
     title: "Blocked by — a dependency-graph join",
-    mech: 'blockerMap() runs one join over the workspace\'s kind:\'dep\' edges (todo → blocker) and buckets by todo id. Dependencies are real edge ENTITIES, not an inline array on the todo — so adding/removing one is a single fact write, and the graph is directly queryable. The PICKER below it is where reading the graph gets interesting at scale. It used to offer every visible todo — 9,947 buttons, a 686KB read, 307ms of a 361ms page — so it was bounded to the first 25 by title, which made the page 83ms and made a blocker further down the alphabet unpickable. Typing in it now asks a different index: `title` carries an analyzed english TEXT index as well as a value one, and [fts <term> ?t ?score] returns entity ids with BM25 scores that join back to ordinary clauses. What bounds it is the TERM, not the limit: at 10,003 todos a term matching four rows costs 3ms, one matching 625 costs 11ms and one matching 2,498 costs 42ms. Ordered by [[?score desc] ?t] with a limit IS the bounded top-k the docs describe — 4ms against 17ms unlimited for that 2,498-row term — but only while the fts clause is the whole query; join the workspace and visibility clauses back on and it costs the same limited as unlimited, so `limit` is the post-filter it is everywhere else here. It is a stemmer and not a prefix matcher, so "land" finds "① Design landing page" (both stem to `land`) and "landi" finds nothing. Two things it is deliberately not: not a stored reactor, because the term would have to travel as a RON bind and this app\'s bind writer does not escape quotes (a search for o\'brien becomes `unknown bind var ?brien`) — and not exempt from visibility, because the same visibleTo fragment is in the body, so a draft you cannot see is not a candidate you can search up.',
-    code: `export const blockers = define("board-blockers", {
+    mech: 'blockersFor() runs one join over kind:\'dep\' edges (todo → blocker) and buckets by todo id — for the ids ON THIS PAGE, not for the workspace. It used to be a stored reactor over every edge in the workspace, read on every board render to decorate fifty rows: 34ms at 10,003 todos against 9ms for the two rows on an unfiltered first page that actually draw a ⊘, and no read at all when none of them do. The membership test is where the sharp edge is: `?t` is bound through the `todo` REF field, so a set of BARE ids matches nothing — 7ms, zero rows, and a board that looks right with every badge missing. The set holds refs. Dependencies are real edge ENTITIES, not an inline array on the todo — so adding/removing one is a single fact write, and the graph is directly queryable. The PICKER below it is where reading the graph gets interesting at scale. It used to offer every visible todo — 9,947 buttons, a 686KB read, 307ms of a 361ms page — so it was bounded to the first 25 by title, which made the page 83ms and made a blocker further down the alphabet unpickable. Typing in it now asks a different index: `title` carries an analyzed english TEXT index as well as a value one, and [fts <term> ?t ?score] returns entity ids with BM25 scores that join back to ordinary clauses. What bounds it is the TERM, not the limit: at 10,003 todos a term matching four rows costs 3ms, one matching 625 costs 11ms and one matching 2,498 costs 42ms. Ordered by [[?score desc] ?t] with a limit IS the bounded top-k the docs describe — 4ms against 17ms unlimited for that 2,498-row term — but only while the fts clause is the whole query; join the workspace and visibility clauses back on and it costs the same limited as unlimited, so `limit` is the post-filter it is everywhere else here. It is a stemmer and not a prefix matcher, so "land" finds "① Design landing page" (both stem to `land`) and "landi" finds nothing. Two things it is deliberately not: not a stored reactor, because the term would have to travel as a RON bind and this app\'s bind writer does not escape quotes (a search for o\'brien becomes `unknown bind var ?brien`) — and not exempt from visibility, because the same visibleTo fragment is in the body, so a draft you cannot see is not a candidate you can search up.',
+    code: `// the rows on screen that draw a badge, and no others:
+{
   find: ["?t", "?b", "?bt", "?bs"],
   where: [
     ["?d", "kind", "dep"],
     ["?d", "todo", "?t"],
-    ["?t", "workspace", "?ws"],        // bound per read, not baked in
+    // REFS, not bare ids — ?t is bound through a ref field, and
+    // {"#set": [738, 742]} matches nothing, fast and silently:
+    ["contains", {"#set": [{"#": 738}, {"#": 742}]}, "?t"],
     ["?d", "blocker", "?b"],
     ["?b", "title", "?bt"], ["?b", "status", "?bs"],
   ],
   then: { project: { todo: "?t", blocker: "?b",
                      title: "?bt", status: "?bs" } },
-});
-
-await blockers.read({ ws: {"#": ctx.workspaceId} });
+}
 
 // the picker's typeahead — the term is a VALUE in the body,
 // never text spliced into a query, and the read is a dry-run:
@@ -218,8 +220,7 @@ await blockers.read({ ws: {"#": ctx.workspaceId} });
   limit: 20,
   then: { project: { id: "?t", title: "?title" } },
 }`,
-    src: "src/queries.ts · blockers · src/board.ts · blockerMap() · searchTodoOptions()",
-    reactors: [{ name: "board-blockers", bind: "{ws {# 12}}" }],
+    src: "src/board.ts · blockersFor() · searchTodoOptions()",
   },
   commands: {
     title: "Commands — the role gate is the query",

@@ -25,42 +25,24 @@ import { APP } from "./tenancy.ts";
 /** The one visibility rule, with the viewer left as a per-read bind. */
 const VISIBLE = visibleTo("?viewer");
 
-/** Effective status + priority of every viewer-visible todo — the filter chips.
- *
- *  This used to bind a correlated `exists` over the dep graph per row and let the
- *  app fold `blocked` into an effective status afterwards. It shared the board's
- *  problem exactly (one subquery execution per candidate row, against a budget of
- *  10,000 for the whole query) and it is fixed the same way: `effectiveStatus` is a
- *  stored fact, so this is an ordinary join and the tally is a plain count. */
-export const counts = define("board-counts", {
-  find: ["?eff", "?priority", ["count", "?t"]],
-  where: [
-    ["?t", "app", APP],
-    ["?t", "workspace", "?ws"],
-    ["?t", "effectiveStatus", "?eff"],
-    ["?t", "priority", "?priority"],
-    ...VISIBLE,
-  ],
-  groupBy: ["?eff", "?priority"],
-} as const);
+// `board-counts` and `board-blockers` used to live here, and both are gone — not
+// because a stored reactor was the wrong idea, but because their INPUTS could not
+// carry their weight at ten thousand rows.
+//
+// `board-counts` grouped every viewer-visible todo by (effectiveStatus, priority)
+// with `?ws` and `?viewer` as binds. The body is unchanged; it is a dry-run with
+// both spelled as literals now, and that alone is 197ms -> 132ms on the demo (see
+// `aggregateCounts` in board.ts for the four-way isolation). A bind is the thing
+// that made it a stored reactor and the thing that made it slow.
+//
+// `board-blockers` read EVERY dependency edge in the workspace to draw ⊘ badges on
+// fifty rows. Its replacement asks for the ids on the page (`blockersFor`), which
+// is a set literal that varies per read, so it is a dry-run for the same reason the
+// board's rows are.
 
-/** Every dependency edge in the workspace: todo -> blocker (+ its title/status). */
-export const blockers = define("board-blockers", {
-  find: ["?t", "?b", "?bt", "?bs"],
-  where: [
-    ["?d", "kind", "dep"],
-    ["?d", "todo", "?t"],
-    ["?t", "workspace", "?ws"],
-    ["?d", "blocker", "?b"],
-    ["?b", "title", "?bt"],
-    ["?b", "status", "?bs"],
-  ],
-  then: { project: { todo: "?t", blocker: "?b", title: "?bt", status: "?bs" } },
-} as const);
-
-/** The blockers OF one todo. The same dependency edge as `board-blockers`, walked
- *  from the other end: bound by `?todo` rather than `?ws`, so the detail page reads
- *  the handful of rows it renders instead of every edge in the workspace. */
+/** The blockers OF one todo, walked from the todo end: bound by `?todo`, so the
+ *  detail page reads the handful of rows it renders instead of every edge in the
+ *  workspace. A fixed body and one bind — which is what still belongs in here. */
 export const blockersOfTodo = define("todo-blockers", {
   find: ["?b", "?bt", "?bs"],
   where: [
@@ -270,8 +252,6 @@ export const commandAuthzRows = (cmdId: string, rank: number) => commandAuthz.re
 
 /** Everything `npm run stardust:setup` provisions, besides the board reactor. */
 export const DECLARED = [
-  counts,
-  blockers,
   workspaceTags,
   todoPicker,
   tagsOfTodo,

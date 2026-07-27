@@ -198,15 +198,32 @@ export const boardQuery = (scope: BoardScope, f: Filter, now: Date = new Date())
 });
 
 /**
- * A multi-select, as an inlined literal comparison.
+ * A multi-select, as an inlined literal comparison — or as NOTHING when the
+ * selection is the whole domain.
  *
  * This is the clause that replaced a four-clause value-join. One selected value is
  * a bare `=`; several are an `or` over `=`. Both are expressions over a var the
  * body has already bound by a fact clause, so they FILTER the candidate set rather
  * than joining anything to it — which is why they are faster than no filter at all.
+ *
+ * The empty case used to be spelled as the whole domain, so an unfiltered board
+ * carried `[or [= ?priority low] [= ?priority med] [= ?priority high]]` and a
+ * four-branch twin for `?eff`. Those are expressions with no candidate rows to
+ * remove: every value the fact clause can bind is already a branch, so the engine
+ * evaluated seven comparisons per row of the workspace to reach the same answer.
+ * Measured on the demo at 10,003 todos, one unfiltered page went 85ms to 54ms with
+ * the two of them gone — a third of the read — byte-identical rows and the same
+ * 9,947 matching the unwindowed body. A filter that filters nothing is not free,
+ * and it looks exactly like one that does; the only reason this was visible at all
+ * is that the clause it replaced was the expensive one.
+ *
+ * `null` rather than an empty array so the caller has to decide what "no clause"
+ * means, and because an empty `or` is not a clause Stardust accepts.
  */
-const anyOf = (v: string, values: readonly string[]): unknown[] =>
-  values.length === 1 ? ["=", v, values[0]] : ["or", ...values.map((x) => ["=", v, x])];
+const anyOf = (v: string, values: readonly string[], domain: readonly string[]): unknown[] | null => {
+  if (values.length >= domain.length) return null; // every branch would pass
+  return values.length === 1 ? ["=", v, values[0]] : ["or", ...values.map((x) => ["=", v, x])];
+};
 
 /**
  * A selection, checked against its domain — the guard that makes inlining safe.
@@ -219,6 +236,11 @@ const anyOf = (v: string, values: readonly string[]): unknown[] =>
  * reachable from the CLI, the stress harness and any future caller that did not
  * come through a URL, and because the cost of the check is three lines against a
  * failure mode that is a query matching the wrong rows.
+ *
+ * It still MATERIALIZES the empty case into the domain, even though `anyOf` then
+ * emits no clause for it. "Select nothing" and "select everything" are the same
+ * board — the chips let a reader tick all four statuses — and they must compile to
+ * the same body, which is easiest to guarantee by making them the same VALUE first.
  */
 function inDomain(values: readonly string[], domain: readonly string[], what: string): readonly string[] {
   if (!values.length) return domain;
@@ -226,6 +248,15 @@ function inDomain(values: readonly string[], domain: readonly string[], what: st
     if (!domain.includes(v)) throw new Error(`board ${what} filter: '${v}' is not one of ${domain.join(", ")}`);
   }
   return values;
+}
+
+/** The facet clauses one selection pair adds — one, two, or none at all. Exported
+ *  because the stress harness reconstructs the value-join these replaced by
+ *  finding them in the body, and it must look for exactly what was emitted. */
+export function facetClauses(q: BoardQuery): unknown[] {
+  const p = anyOf("?priority", inDomain(q.priority, PRIORITY_DOMAIN, "priority"), PRIORITY_DOMAIN);
+  const s = anyOf("?eff", inDomain(q.status, STATUS_DOMAIN, "status"), STATUS_DOMAIN);
+  return [p, s].filter((c) => c !== null);
 }
 
 /**
@@ -238,8 +269,7 @@ function inDomain(values: readonly string[], domain: readonly string[], what: st
  * `null` means "no window" and has to be typed out.
  */
 export function canonicalBody(q: BoardQuery, window: PageWindow | null): Record<string, unknown> {
-  const status = inDomain(q.status, STATUS_DOMAIN, "status");
-  const priority = inDomain(q.priority, PRIORITY_DOMAIN, "priority");
+  const facets = facetClauses(q); // domain-checked in here, before anything else
   if (!VIEW_DOMAIN.includes(q.view as (typeof VIEW_DOMAIN)[number])) {
     throw new Error(`board view: '${q.view}' is not one of ${VIEW_DOMAIN.join(", ")}`);
   }
@@ -263,11 +293,12 @@ export function canonicalBody(q: BoardQuery, window: PageWindow | null): Record<
       ["?t", "prank", "?prank"], // the ordering key (high 0, med 1, low 2)
       // viewer visibility (published OR authored by the viewer)
       ["or", ["=", "?draft", false], ["=", "?author", { "#": q.viewer }]],
-      // The two facet filters, INLINED. Each was four clauses joining a session's
-      // `sf` children against the row; each is now one expression over a var this
-      // body already bound. Domain-checked above, which is what makes that safe.
-      anyOf("?priority", priority),
-      anyOf("?eff", status),
+      // The two facet filters, INLINED — when there is anything to filter. Each was
+      // four clauses joining a session's `sf` children against the row; each is now
+      // one expression over a var this body already bound, and a selection covering
+      // the whole domain emits nothing at all rather than an `or` every row passes.
+      // Domain-checked inside `facetClauses`, which is what makes inlining safe.
+      ...facets,
       // The derived view. It used to be an `or` over four branches tested against a
       // `?view` var joined off the session, because the session could change under
       // the body. The view is a compile-time value now, so only the branch that

@@ -57,6 +57,7 @@ import {
   PAGE_SIZE,
   type PageWindow,
   canonicalBody,
+  facetClauses,
   pageWindow,
 } from "../../src/board-query.ts";
 import { BASE as APP_BASE, readEntity } from "../../src/stardust.ts";
@@ -610,12 +611,12 @@ async function main() {
     // itself. An id is what the rows actually are.
     ok(
       `${label}: inlined == joined, row for row`,
-      joined.replaced === 2 &&
+      joined.replaced === joined.expected &&
         same(
           inline.rows.map((r) => r.id),
           join.rows.map((r) => r.id),
         ),
-      `${joined.replaced}/2 clauses swapped · ${inline.rows.length.toLocaleString()} vs ` +
+      `${joined.replaced}/${joined.expected} clauses swapped · ${inline.rows.length.toLocaleString()} vs ` +
         `${join.rows.length.toLocaleString()} rows · inlined ${inline.ms}ms, joined ${join.ms}ms`,
     );
     // The same two bodies at the size the APP asks for — one page. Reported
@@ -903,39 +904,47 @@ async function runBoard(body: unknown): Promise<{ rows: BoardRow[]; ms: number }
 }
 
 /**
- * The board body with the two INLINED facet filters swapped back out for the
+ * The board body with the INLINED facet filters swapped back out for the
  * value-joins they replaced — the shape that shipped before this change.
  *
  * Built by surgery on the app's own body rather than written out again, so it
  * cannot drift into testing a query nobody ever ran. `replaced` is how the caller
- * knows the surgery found what it was looking for: anything other than 2 means
- * `canonicalBody` no longer emits the clauses this expects, and the comparison
- * would otherwise be a body against itself.
+ * knows the surgery found what it was looking for, and `expected` is how many
+ * clauses there were to find: comparing the two is what keeps this from quietly
+ * becoming a body against itself.
+ *
+ * `expected` is not always 2 any more, and that is the point of the pair.
+ * `canonicalBody` emits NOTHING for a selection covering the whole domain — an
+ * `or` over every branch cannot remove a row — so a board with every facet ticked
+ * has no inlined clause to swap. The value-join is still added in that case,
+ * because the join is the shape being compared and the old body carried it
+ * whatever was selected. `facetClauses` is imported from the app rather than
+ * reimplemented, so this cannot disagree with it about what was emitted.
  */
-function joinedBody(f: Facets, sid: number, window: PageWindow | null): { body: unknown; replaced: number } {
-  const inlined = (v: string, values: readonly string[]) =>
-    values.length === 1 ? ["=", v, values[0]] : ["or", ...values.map((x) => ["=", v, x])];
-  const whole = (vals: readonly string[], domain: readonly string[]) => (vals.length ? vals : domain);
-  const swaps: [string, unknown[]][] = [
-    [
-      JSON.stringify(inlined("?priority", whole(f.priority, PRIORITY))),
-      [
-        ["?fp", "kind", "sf"],
-        ["?fp", "session", "?sess"],
-        ["?fp", "facet", "priority"],
-        ["?fp", "value", "?priority"],
-      ],
+function joinedBody(
+  f: Facets,
+  sid: number,
+  window: PageWindow | null,
+): { body: unknown; replaced: number; expected: number } {
+  const joins: Record<string, unknown[]> = {
+    "?priority": [
+      ["?fp", "kind", "sf"],
+      ["?fp", "session", "?sess"],
+      ["?fp", "facet", "priority"],
+      ["?fp", "value", "?priority"],
     ],
-    [
-      JSON.stringify(inlined("?eff", whole(f.status, STATUS))),
-      [
-        ["?fs", "kind", "sf"],
-        ["?fs", "session", "?sess"],
-        ["?fs", "facet", "status"],
-        ["?fs", "value", "?eff"],
-      ],
+    "?eff": [
+      ["?fs", "kind", "sf"],
+      ["?fs", "session", "?sess"],
+      ["?fs", "facet", "status"],
+      ["?fs", "value", "?eff"],
     ],
-  ];
+  };
+  // exactly what the app put in the body, and the var each one narrows
+  const emitted = facetClauses(queryOf(f)) as unknown[][];
+  const varOf = (c: unknown[]) => (c[0] === "or" ? (c[1] as unknown[])[1] : c[1]) as string;
+  const swaps = new Map(emitted.map((c) => [JSON.stringify(c), joins[varOf(c)]!]));
+
   const body = canonicalBody(queryOf(f), window) as { where: unknown[] };
   // The session the join needs. `canonicalBody` no longer selects one — the filter
   // is a parameter, not a fact — so the shape being reconstructed has to bring its
@@ -946,13 +955,18 @@ function joinedBody(f: Facets, sid: number, window: PageWindow | null): { body: 
   ];
   let replaced = 0;
   for (const clause of body.where) {
-    const hit = swaps.find(([json]) => json === JSON.stringify(clause));
+    const hit = swaps.get(JSON.stringify(clause));
     if (hit) {
-      where.push(...hit[1]);
+      where.push(...hit);
       replaced++;
     } else where.push(clause);
   }
-  return { body: { ...body, where }, replaced };
+  // A facet the app no longer inlines still gets its join, so the comparison keeps
+  // its teeth on a fully-selected board.
+  for (const [v, join] of Object.entries(joins)) {
+    if (!emitted.some((c) => varOf(c) === v)) where.push(...join);
+  }
+  return { body: { ...body, where }, replaced, expected: emitted.length };
 }
 
 async function raw(f: Facets): Promise<{ ms: number; bytes: number }> {

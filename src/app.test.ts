@@ -84,12 +84,22 @@ test("the facet filters are INLINED literals, not value-joins", () => {
   assert.equal(clauses(q).includes('"sf"'), false);
 });
 
-test("an empty selection means the whole domain, materialized", () => {
+test("a selection covering the whole domain emits NO clause", () => {
   // "select everything" and "select nothing" have to compile to the same body: the
   // UI treats them as the same thing, and the URL omits a full selection entirely.
+  // That body used to spell them both out as an `or` over every branch — which
+  // cannot remove a row, because the fact clause above it can only bind a value
+  // that is one of them. Seven redundant comparisons per row of the workspace, and
+  // 85ms against 54ms for one unfiltered page at 10,003 todos.
   assert.equal(clauses(PLAIN), clauses({ ...PLAIN, status: ["todo", "doing", "blocked", "done"] }));
-  assert.ok(clauses(PLAIN).includes('["or",["=","?eff","todo"],["=","?eff","doing"]'));
-  assert.ok(clauses(PLAIN).includes('["or",["=","?priority","low"],["=","?priority","med"]'));
+  assert.equal(clauses(PLAIN), clauses({ ...PLAIN, priority: ["low", "med", "high"] }));
+  assert.equal(clauses(PLAIN).includes('["=","?eff"'), false); // no comparison at all
+  assert.equal(clauses(PLAIN).includes('["=","?priority"'), false);
+  assert.ok(clauses(PLAIN).includes('["?t","priority","?priority"]')); // the fact clause stays
+  assert.ok(clauses(PLAIN).includes('["?t","effectiveStatus","?eff"]'));
+  // and a PARTIAL selection is still inlined, on either facet independently
+  assert.ok(clauses({ ...PLAIN, status: ["todo"] }).includes('["=","?eff","todo"]'));
+  assert.equal(clauses({ ...PLAIN, status: ["todo"] }).includes('"?priority","low"'), false);
 });
 
 test("a value outside its domain is REFUSED, which is what makes inlining safe", () => {

@@ -3,14 +3,22 @@
 // only handles single-fact absence, and an `or(owned, not …)` scope was verified to
 // leak across tenants — so those shapes are avoided. Blocked-ness and the effective
 // status are no longer derived on read at all: they are stored facts the board and
-// counts reactors JOIN, so the counts fold here is a plain tally over a group key
+// counts bodies JOIN, so the counts fold here is a plain tally over a group key
 // Stardust already handed us.
+//
+// Two of the three reads beside the board used to be stored reactors read with a
+// bind, and both are dry-runs with their scope inlined now. That is not a change of
+// mind about stored reactors — `page-rows` and the picker are still stored, and
+// still for the reason in queries.ts. It is what measuring the binds at ten
+// thousand todos said: a bind is not a literal, and the counts read is where that
+// was worth 65ms. The blocker read went further and stopped being whole-workspace
+// at all, which is the same fix the picker and the counts had before it.
 
 import type { WorkspaceCtx } from "./workspace.ts";
 import type { Status, Todo } from "./todos.ts";
 import { effectiveStatusOf } from "./todos.ts";
 import { type EntityId, query, refId } from "./stardust.ts";
-import { blockers, blockersOfTodo, counts, todoPicker, workspaceTags } from "./queries.ts";
+import { blockersOfTodo, todoPicker, workspaceTags } from "./queries.ts";
 import { visibleTo } from "./derive.ts";
 import { APP } from "./tenancy.ts";
 
@@ -45,10 +53,8 @@ export interface Counts {
  *
  * Once visibility is per-viewer (drafts), ws-wide counts would leak and mislead
  * ("Blocked 3" when you can see 1), so counts must be tallied over the SAME
- * visible set as the board. It was a viewer-scoped dry-run for exactly as long as
- * "a reactor has no viewer parameter" looked true; the viewer is a per-read BIND,
- * so one stored reactor (`counts`) serves every workspace and viewer. It projects
- * {effectiveStatus, priority} for the viewer's visible todos.
+ * visible set as the board. It projects {effectiveStatus, priority} for the
+ * viewer's visible todos, grouped in the engine.
  *
  * The tally stays app-side, but it no longer DERIVES the group key — it used to
  * fold a per-row `blocked` (a correlated exists, at the board's own cost) into an
@@ -56,21 +62,35 @@ export interface Counts {
  * `groupBy` aggregate in the reactor is finally possible and deliberately not done:
  * the chips want every value present with a zero, and two tallies over the same
  * hundreds of rows are not what costs anything on this page.
+ *
+ * It was a STORED reactor read with `ws` and `viewer` as binds, and it is a
+ * dry-run with both INLINED, which is the third time this app has made that trade
+ * and the first time the number was big enough to argue with the note in
+ * AGENTS.md. "Reading a stored reactor with a bind costs about the same as a
+ * dry-run" was measured on twelve todos and is still true of the ROUTE; what is
+ * not free is the BIND. The same body, the same 11 groups and the same 9,947 rows,
+ * at 10,003 todos: 197ms through the stored reactor, 194ms as a dry-run with the
+ * binds still in the body, 132ms with both spelled as literals. Isolated, the
+ * workspace bind (a value in a fact clause) costs ~28ms and the viewer bind (a
+ * value in an expression) ~51ms, reproduced with the four combinations run in both
+ * orders. A literal is something the planner can narrow on; a bind arrives after
+ * it has decided. So this read follows the rows: no free vars, nothing to omit.
  */
 export async function aggregateCounts(ctx: WorkspaceCtx, viewerPersonaId: number): Promise<Counts> {
-  // Grouped in the ENGINE. This used to ask for every visible todo and tally them
-  // here — 9,947 rows to render two numbers, and the single most expensive read on
-  // the page at ten thousand todos. Grouping by both keys returns one row per
-  // (effectiveStatus, priority) pair: twelve rows, which the folds below turn into
-  // the two tallies the chips want. Measured: 224ms/9,947 rows -> ~130ms/12 rows,
-  // and the app stops parsing a ten-thousand-row response on every render.
-  const rows = await counts.read({
-    ws: { "#": ctx.workspaceId },
-    viewer: { "#": viewerPersonaId },
-  });
+  const rows = (await query<unknown>({
+    find: ["?eff", "?priority", ["count", "?t"]],
+    where: [
+      ["?t", "app", APP],
+      ["?t", "workspace", { "#": ctx.workspaceId }],
+      ["?t", "effectiveStatus", "?eff"],
+      ["?t", "priority", "?priority"],
+      ...visibleTo(viewerPersonaId),
+    ],
+    groupBy: ["?eff", "?priority"],
+  })) as unknown as [string, string, number][];
   const status: Record<string, number> = {};
   const priority: Record<string, number> = {};
-  for (const [eff, pri, n] of rows as unknown as [string, string, number][]) {
+  for (const [eff, pri, n] of rows) {
     status[eff] = (status[eff] ?? 0) + n;
     priority[pri] = (priority[pri] ?? 0) + n;
   }
@@ -83,21 +103,49 @@ export interface Blocker {
   status: Status;
 }
 
-/** Map of todo id -> its blockers (all dep edges in the workspace, one query).
+/**
+ * Map of todo id -> its blockers, for the ids ASKED FOR — the ⊘ badges on one page.
  *
- *  NOTE: stays on raw `query` (not tquery) deliberately. `?t`/`?b` are the ids we
- *  want, but they're bound through REF fields (`todo`/`blocker`), so Stardust
- *  projects them as refs `{"#":n}` — while the typed-query checker models a
- *  subject-position var as a bare `@id` number and its runtime validator then
- *  rejects the ref. Typing this correctly needs the checker to understand
- *  ref-bound projections (a typed-query enhancement), so `refId` normalizes here. */
-export async function blockerMap(ctx: WorkspaceCtx): Promise<Map<EntityId, Blocker[]>> {
-  const rows = await blockers.read({ ws: { "#": ctx.workspaceId } });
+ * This was `blockerMap(ctx)`: every dependency edge in the workspace, read on
+ * every board render to decorate fifty rows. Same unbounded-read-for-a-bounded-UI
+ * shape as the blocker picker and the counts before it, and it went the same way.
+ * At 10,003 todos and 171 blocked ones the whole-workspace read is 34ms; the two
+ * rows on an unfiltered first page that actually carry a badge are 9ms, and a page
+ * with none is a read that never happens at all.
+ *
+ * The membership set holds REFS, and that is the sharp edge rather than a detail.
+ * `?t` is bound through the `todo` REF field, so `[contains {#set [738 742]} ?t]`
+ * — bare ids — matches nothing: 7ms, zero rows, a perfectly healthy-looking empty
+ * board with no badges on it. Measured both ways against the same two ids, and the
+ * ref form returns exactly what the whole-workspace map held for them. That is the
+ * failure this file's own header warns about, reached from a new direction.
+ *
+ * NOTE: stays on raw `query` (not tquery) deliberately. `?t`/`?b` are the ids we
+ * want, but they're bound through REF fields (`todo`/`blocker`), so Stardust
+ * projects them as refs `{"#":n}` — while the typed-query checker models a
+ * subject-position var as a bare `@id` number and its runtime validator then
+ * rejects the ref. Typing this correctly needs the checker to understand
+ * ref-bound projections (a typed-query enhancement), so `refId` normalizes here.
+ */
+export async function blockersFor(ids: readonly EntityId[]): Promise<Map<EntityId, Blocker[]>> {
   const map = new Map<EntityId, Blocker[]>();
+  if (!ids.length) return map;
+  const rows = await query<{ todo: unknown; blocker: unknown; title: string; status: Status }>({
+    find: ["?t", "?b", "?bt", "?bs"],
+    where: [
+      ["?d", "kind", "dep"],
+      ["?d", "todo", "?t"],
+      ["contains", { "#set": ids.map((id) => ({ "#": id })) }, "?t"],
+      ["?d", "blocker", "?b"],
+      ["?b", "title", "?bt"],
+      ["?b", "status", "?bs"],
+    ],
+    then: { project: { todo: "?t", blocker: "?b", title: "?bt", status: "?bs" } },
+  });
   for (const r of rows) {
     const id = refId(r.todo);
     if (!map.has(id)) map.set(id, []);
-    map.get(id)!.push({ id: refId(r.blocker), title: r.title as string, status: r.status as Status });
+    map.get(id)!.push({ id: refId(r.blocker), title: r.title, status: r.status });
   }
   return map;
 }
@@ -105,8 +153,10 @@ export async function blockerMap(ctx: WorkspaceCtx): Promise<Map<EntityId, Block
 /**
  * The blockers of ONE todo.
  *
- * The detail page used to call `blockerMap` — a whole-workspace read of every
- * dependency edge — and then keep exactly one entry. This asks for that entry.
+ * The detail page used to call the whole-workspace read of every dependency edge
+ * and then keep exactly one entry. This asks for that entry — and it is a stored
+ * reactor rather than a dry-run because its body is fixed and its one input is a
+ * bind, which is the test this app applies everywhere.
  */
 export async function blockersOf(todoId: EntityId): Promise<Blocker[]> {
   const rows = await blockersOfTodo.read({ todo: { "#": todoId } });

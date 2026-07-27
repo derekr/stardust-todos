@@ -113,6 +113,32 @@ component is stored as a nested list entity; only a find TUPLE resolves it to
 push nothing — that is a separate decision, four paragraphs down — but the FACT is
 in a place a subscription can see it now, which it was not before.
 
+**A field read only through a PROJECTION PATH is not a trigger, and this is the
+trap with no error in it.** `then.project` accepts a ROOT variable and dotted
+component paths off it — `project ?t { title .title status .status }` in RON,
+`then {project {root '?t' fields {title '.title'}}}` in JSON — which reads a
+component straight off the matched entity with no `where` clause binding it. It
+works, it is documented, and on the board's rows body it is worth 54ms to 44ms at
+10,003 todos with byte-identical output. It is also invisible to invalidation.
+Measured on a throwaway with two stored reactors over the same three entities, one
+binding `[?t title ?title]` in `where` and the other reading `.title` in the
+projection, both subscribed: patching a title re-emitted the `where` one
+immediately and the dotted one **not at all** — it went on serving the old title
+until an unrelated write to a field that IS in its `where` woke it, and that
+emission then carried the new title, so the staleness heals by accident and never
+reports itself. So: dotted paths are fine in a DRY-RUN, which pushes nothing by
+definition, and must never appear in a stored reactor anyone subscribes to. The one
+standing subscription here is `page-rows` (queries.ts), and it projects nine fields
+every one of which is bound in its `where`. Keep it that way.
+
+The board's rows do NOT use dotted paths today either, and that is a judgement
+rather than a rule: 10ms of a ~95ms page against introducing the pattern one file
+away from the subscription it would break, plus a second change nobody would
+notice — a `where` clause is also an EXISTENCE filter, and a todo missing `blocked`
+is excluded today where a dotted path would return it with the key absent. (Both
+bodies see the same 9,947 rows on the demo, because the boot backfills make every
+todo complete. That is a property of the migrations, not of the query.)
+
 **And a query that is not a reactor pushes nothing at all, which is a liveness
 decision and not only a performance one.** The board's rows are a dry-run, so
 NOTHING about the filtered set is live; the app's only board subscription is
@@ -226,6 +252,30 @@ docs are explicit that each one costs write work and storage.
 
 Worth knowing: reading a stored reactor with a bind costs about the same as the
 equivalent dry-run. A stored reactor is not a cache you read for free.
+
+**But a BIND is not a literal, and at ten thousand rows that is worth a third of
+the read.** The sentence above is about the ROUTE, and it survives; what it was
+read as — "so the bind is free too" — does not. The counts body, same clauses, same
+11 groups, same 9,947 rows counted, on the demo:
+
+| board-counts, three ways | p50 |
+| --- | --- |
+| stored reactor, `?bind={ws … viewer …}` | 197ms |
+| dry-run, the same two vars bound in the body | 194ms |
+| dry-run, both spelled as LITERALS | 132ms |
+
+Isolated, the workspace bind (a value in a FACT clause, on an indexed field) costs
+~28ms and the viewer bind (a value in an EXPRESSION) ~51ms; all four combinations
+were run in both orders and the ordering is stable. So the cost is the bind, not
+the storage, and it is the same lesson the facet filters taught from the other
+side: a value the planner has when it plans is one it can narrow on, and a value
+that arrives at read time is one it cannot. `aggregateCounts` is a dry-run with
+literals for exactly this reason.
+
+That does not make binds wrong — it makes them a price. `page-rows` and the picker
+are still stored reactors read with a bind, because what a bind buys them is a
+subscription and one definition serving every caller, which no literal can. It
+means: if a read is hot and its inputs are known to the process, inline them.
 
 ## Searching a value is a THIRD index, and it is the one that backfills
 
@@ -416,6 +466,34 @@ so outright. This is the same shape as the omitted-bind hazard above: not an err
 not a subset, a SUPERSET. Assert a row count against a query you have just
 rewritten, every time.
 
+**And a filter that filters NOTHING is not free — which is the same sentence read
+for cost rather than for correctness.** An empty facet selection means "all", and
+the board spelled that as the whole domain: `[or [= ?priority low] [= ?priority
+med] [= ?priority high]]` and a four-branch twin for `?eff`. Neither can remove a
+row, because the fact clause above it can only bind a value that is already one of
+the branches — so it is seven comparisons per row of the workspace to reach the
+same answer. Deleting both took one unfiltered page from 85ms to 54ms at 10,003
+todos, byte-identical rows and the same 9,947 matching the unwindowed body: a third
+of that read was a filter doing nothing. `anyOf` returns `null` for a full-domain
+selection now (board-query.ts), and `inDomain` still materializes the empty case
+into the domain first, so "select nothing" and "select everything" remain the same
+body — a property the app relies on and app.test.ts asserts.
+
+The reason this survived so long is worth more than the 31ms. A no-op clause is
+invisible from both ends: it cannot change a row count, so no correctness test
+catches it, and it looks like the cheap kind of clause, so no timing catches it
+either — the only reason it was ever visible is that the four-clause value-join it
+replaced was so much worse that nobody looked again. When you replace an expensive
+clause with a cheap one, ask whether the cheap one needed to be there at all.
+
+**`contains {#set …}` over a var bound through a REF field needs REFS in the
+set.** The bounded blocker read matches the page's ids against `?t`, which
+`[?d todo ?t]` binds through a ref field. `{"#set": [738, 742]}` — bare ids — is
+accepted and matches NOTHING: 7ms, zero rows, and a board that renders correctly
+with every ⊘ badge silently missing. `{"#set": [{"#": 738}, {"#": 742}]}` returns
+exactly what the whole-workspace map held for those todos. Same family as the two
+entries above: fast, empty, and shaped like an answer.
+
 Also measured while establishing this: the plain board at 2,000 unindexed todos
 allocates about 400MB of transient heap per read, and at 10,000 it peaks around
 2.1GB and takes ~180s. Stardust is Go and treats allocation failure as fatal
@@ -535,6 +613,37 @@ worth reading before you re-litigate one:
   Also gone with the sessions: the `Session` and `SessionFacet` schemas, and the
   generated `facet`/`value` validators that existed only because the atomic facet
   write bypassed the schema route it was declared for.
+- The count chips: ON the critical path vs BESIDE it — BESIDE, and it is the
+  largest single thing the board's latency was made of. One page view at 10,003
+  todos was ~280ms, and 207ms of it was one read: the (effectiveStatus, priority)
+  tally behind the chips, the sidebar and the total in the title pill. Inlining its
+  binds took it to 132ms (see the bind entry above) and that is its FLOOR — clause
+  order, grouping by one key instead of two, and grouping by `prank` instead of
+  `priority` were all measured and are all within noise of each other, because what
+  it costs is the per-row visibility join (`draft` + `author` + the `or`), which is
+  60ms of the 132 and is not optional: counts must be tallied over the same visible
+  set as the board or "Blocked 3" appears where you can see one. It also cannot be
+  narrowed by the filter, because the chips exist to say what you WOULD get.
+
+  So the render stopped waiting for it. `renderBoard` starts the tally, sends the
+  rows, and patches the chips when it lands; the SSR pass does not read it at all
+  and the stream the document opens supplies the numbers a moment later. First
+  paint went 200ms to 95ms, and a page view now counts the workspace ONCE instead
+  of twice. What it costs, precisely: three numerals arrive late, the pill shows
+  `50 · …` until they do, and they now depend on the stream connecting where the
+  SSR HTML used to be complete on its own. That is deliberately NOT a re-run of the
+  empty-shell decision this file records elsewhere — the board arrives complete and
+  it is the counts that follow, not the content — but it is the same axis, and if
+  the flash ever reads as broken, this is the entry to reverse.
+
+  One faster shape was measured and REFUSED. The visible tally equals (everything,
+  grouped) minus (drafts this viewer cannot see, grouped): 64ms and 46ms, 83ms run
+  in parallel against 132ms for the single body, and it produces exactly the same
+  eleven groups. It is two READS, so it is two snapshots — a draft created between
+  them is counted by neither, and a sparse (eff, priority) group can go NEGATIVE and
+  print a negative number in a chip. 49ms is not worth a count that can lie, and
+  "one question, one snapshot" is the property a tally should not trade away.
+
 - The compile-time query checker only models plain 3-tuple fact clauses. Queries
   using `or` or a bound `exists` cannot use it, so they keep runtime validation and
   lose the compile-time check. That is why `define()` does not apply `CheckQuery`.

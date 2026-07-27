@@ -50,7 +50,7 @@ import {
   SEARCH_LIMIT,
   aggregateCounts,
   availableTags,
-  blockerMap,
+  blockersFor,
   blockersOf,
   effectiveStatus,
   searchTodoOptions,
@@ -81,7 +81,6 @@ import {
   palette,
   sidebar,
   visibleLabel,
-  visibleTotal,
 } from "./view.ts";
 import { type DetailOpts, type HistEntry, candidateList, detailFragment, detailPage } from "./detail.ts";
 import {
@@ -123,10 +122,8 @@ function runnableBinds(name: string, from: { ps?: string; todo?: string }): Reco
     // is built per read with no free vars at all, so there is nothing to bind.)
     case "page-rows":
       return from.ps ? { ps: `{# ${from.ps}}` } : {};
-    case "board-counts":
     case "todo-options":
       return { ws, viewer };
-    case "board-blockers":
     case "board-tags":
       return { ws };
     case "todo-tags":
@@ -273,18 +270,23 @@ async function serveStatic(parts: string[], res: http.ServerResponse): Promise<v
 // derivation server-side, so there is ONE read path feeding both the SSE patches
 // and the server-rendered first paint.
 //
-// NOTE what paging does and does not bound here. The board is one page now, but the
-// three reads beside it are not: `aggregateCounts` tallies every visible row (that
-// is what the chips mean), and `blockerMap`/`availableTags` are whole-workspace
-// queries. So this function is still O(workspace) — paging bounded the board's
-// response and its render, not the cost of a page view. Saying so here because the
-// obvious next question is why the page is not fast yet.
+// NOTE what paging does and does not bound here, because it is most of the answer
+// to "why is a page view still O(workspace)". Three of the four reads it used to be
+// true of are gone from the critical path: `blockersFor` asks about the rows on the
+// page (it was every dependency edge in the workspace), the tag vocabulary is read
+// once per STREAM rather than once per paint, and the TALLY is no longer waited for
+// at all — see `renderBoard`. What is left is the rows, which are one page.
+//
+// The blocker read cannot join the snapshot's `Promise.all`, because it takes the
+// ids the snapshot returned. It costs nothing when no row on the page is blocked,
+// which is the common case — the query is not issued at all.
 async function boardData(state: BoardState, pgset: PageSet | null, tags: string[]) {
-  const [snap, counts, blockers] = await Promise.all([
-    readSnapshot(boardQuery(scopeNow(), state.filter), state.page),
-    aggregateCounts(ctx, viewPersona), // counts over the SAME visible set
-    blockerMap(ctx),
-  ]);
+  const snap = await readSnapshot(boardQuery(scopeNow(), state.filter), state.page);
+  const todos = snap.rows as unknown as Todo[]; // SnapshotRow is Todo-shaped
+  // Only the rows that will actually draw a ⊘ need their blockers, and `row()` draws
+  // one exactly when the effective status is `blocked` — the same stored fact the
+  // snapshot carries. So this asks about those rows and no others.
+  const blockers = await blockersFor(todos.filter((t) => effectiveStatus(t) === "blocked").map((t) => t.id));
   // Record what this stream is now looking at, so the page subscription follows it.
   // Costs nothing at all when the rows have not moved: `showPage` diffs against
   // what this process last wrote to those slots and sends no transaction.
@@ -293,18 +295,34 @@ async function boardData(state: BoardState, pgset: PageSet | null, tags: string[
       pgset,
       snap.rows.map((r) => r.id),
     );
-  return { snap, todos: snap.rows as unknown as Todo[], counts, tags, blockers }; // SnapshotRow is Todo-shaped
+  return { snap, todos, tags, blockers };
 }
 
 // Render the filter bar + board over the stream, for ONE open board. The filter
 // arrives with the stream's own URL and does not change for its lifetime — a
 // different filter is a different stream — so it is captured once and passed down.
-async function renderBoard(stream: any, state: BoardState, pgset: PageSet): Promise<string> {
-  const tags = await availableTags(ctx);
-  const { snap, todos, counts, blockers } = await boardData(state, pgset, tags);
-  stream.patchElements(filterBar(state, counts.status, counts.priority, tags));
+//
+// So is the tag VOCABULARY, and for the same reason rather than as a saving. It is
+// the tag filter's DOMAIN: `boardStateOf` read it to decide whether this stream's
+// URL was one this workspace could answer, and re-reading it per paint would mean
+// drawing chips from one vocabulary while the filter had been validated against
+// another. It used to be read twice on the first paint and once per repaint (28ms
+// each at 10,003 todos, over ten labels), which is what made it worth looking at.
+//
+// THE TALLY IS NOT WAITED FOR. It is started here and patched when it lands, and
+// the rows go out in between — because at 10,003 todos it is 127ms against 49ms for
+// the page of rows, and it is what "the board feels laggy" was made of. Nothing
+// about it can be narrowed: the chips answer "how many are there", and a page of
+// fifty cannot say. What it CAN be is late. This is deliberately not the same move
+// as the empty SSR shell that was reversed for flashing (see `BoardView`): the
+// board arrives complete and it is three numerals that follow, not the content.
+async function renderBoard(stream: any, state: BoardState, pgset: PageSet, tags: string[]): Promise<string> {
+  const counting = aggregateCounts(ctx, viewPersona); // in flight, not awaited
+  const { snap, todos, blockers } = await boardData(state, pgset, tags);
   stream.patchElements(boardFragment(todos, blockers, state.filter, { state, hasMore: snap.hasMore }, pgset.id));
-  stream.patchElements(sidebar(state, counts.status)); // desktop rail (hidden < 900px)
+  const counts = await counting; // counts over the SAME visible set as the board
+  stream.patchElements(filterBar(state, counts, tags));
+  stream.patchElements(sidebar(state, counts)); // desktop rail (hidden < 900px)
   // The emission this render's own page-set write is about to provoke, described in
   // the subscription's own terms. Returning it is what lets the stream loop drop the
   // echo instead of reading the whole board a second time to discover it changed
@@ -316,16 +334,22 @@ async function renderBoard(stream: any, state: BoardState, pgset: PageSet): Prom
 // page. Datastar morphs its first patch over identical markup, so this is purely
 // additive — nothing downstream changes.
 //
+// It renders the chips with NO numbers, which is what makes a filter change feel
+// like one: this is the response a browser blocks on, and it is 75ms rather than
+// 200ms without the tally in it. The numbers arrive on the stream this document
+// opens a few milliseconds later, from the one read that computes them — so a page
+// view now counts the workspace ONCE, where the SSR pass and the stream used to do
+// it separately.
+//
 // No page-set: the SSR pass has no subscription to point at one. The stream that
 // the document opens a moment later leases its own and writes it.
 async function boardView(state: BoardState, tags: string[]): Promise<BoardView> {
-  const { snap, todos, counts, blockers } = await boardData(state, null, tags);
+  const { snap, todos, blockers } = await boardData(state, null, tags);
   return {
-    sidebar: sidebar(state, counts.status),
-    filterbar: filterBarEl(state, counts.status, counts.priority, tags),
+    sidebar: sidebar(state, null),
+    filterbar: filterBarEl(state, null, tags),
     board: boardEl(todos, blockers, state.filter, { state, hasMore: snap.hasMore }),
     visible: visibleLabel(todos.length, snap.hasMore),
-    total: visibleTotal(counts.status),
   };
 }
 
@@ -509,7 +533,7 @@ const server = http.createServer(async (req, res) => {
     if (url === "/stream" && method === "GET") {
       const got = await boardStateOf(parsed, res);
       if (!got) return;
-      const { state } = got;
+      const { state, tags } = got;
       // One page-set per STREAM. It is the identity the `page-rows` subscription
       // binds to, and a stream is exactly the lifetime that identity has meaning
       // for — a session entity outlived the tab that made it, and the demo had 84
@@ -533,7 +557,7 @@ const server = http.createServer(async (req, res) => {
         // seen can be dropped by it.
         let painted = "";
         const paint = () =>
-          void renderBoard(stream, state, pgset)
+          void renderBoard(stream, state, pgset, tags)
             .then((k) => {
               painted = k;
             })
@@ -547,7 +571,7 @@ const server = http.createServer(async (req, res) => {
           // reactor — so subscribing first meant an empty first emission, a full
           // render, and then an echo that triggered a second identical render. One
           // board read per stream instead of two.
-          await renderBoard(stream, state, pgset)
+          await renderBoard(stream, state, pgset, tags)
             .then((k) => {
               painted = k;
             })

@@ -148,6 +148,25 @@ Highlights of the later stages:
   board costs 7.6s unlimited, 7.5s with `limit 50`, and 7.5s for a bare count over
   the same `where`, so paging bounds the response and the render, not the query,
   and a "showing 50 of N" pill would have doubled the work of every page view.
+- **What a page view actually costs** (`src/board.ts`, `src/server.ts`). Paging the
+  board did not make the page fast, because three reads beside it were still
+  whole-workspace. At 10,003 todos one board URL was ~280ms; it is ~95ms now, and
+  none of the four things that got it there was the rows query being clever:
+  * A **filter that filtered nothing.** An empty facet selection compiled to an `or`
+    over its whole domain — a comparison every row passes, seven of them per row.
+    Deleting both: 85ms → 54ms for one page, byte-identical rows.
+  * A **bind is not a literal.** The counts body read through a stored reactor with
+    `?ws`/`?viewer` costs 197ms; the same body as a dry-run with both inlined costs
+    132ms. The fact-clause bind is ~28ms of that and the expression bind ~51ms.
+  * **An unbounded read behind a bounded UI**, for the third time in this repo. The
+    ⊘ badges used to read every dependency edge in the workspace (34ms) to decorate
+    fifty rows; they read the ids on the page now (9ms, or no read at all when
+    nothing on the page is blocked). The membership set holds REFS — bare ids match
+    nothing, fast and silently.
+  * The **tally moved off the critical path.** It is the one read that has to be
+    whole-workspace, and at 132ms it was most of the page. The render sends the rows
+    and patches the numbers when they arrive over the stream that was already open.
+    The pill reads `50 · …` for the moment in between.
 - **The filter is the URL** (`src/filter.ts`, `src/board-query.ts`). It used to be
   facts: an `sf` child per selected value on a per-browser `session` entity, with a
   `/s/<sid>` link naming it. It became a query string in two steps, and both are
