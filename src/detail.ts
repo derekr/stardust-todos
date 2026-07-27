@@ -177,11 +177,16 @@ export function detailFragment(todo: Todo, opts: DetailOpts): string {
         )
         .join("")
     : `<div class="empty">No other todos to depend on.</div>`;
+  // The picker is capped (see todoPicker); say so rather than silently truncating.
+  const candsNote =
+    opts.candidates.length >= 20
+      ? `<div class="empty">Showing the first ${opts.candidates.length} by title.</div>`
+      : "";
   const blocks = `<div class="seclabel">BLOCKED BY</div>
     <div class="card blockcard" data-xray="blockers">
       ${blockerRows}
       <button class="addblock" data-on:click="$addOpen = !$addOpen">+ Add blocker</button>
-      <div class="candlist" style="display:none" data-show="$addOpen">${cands}</div>
+      <div class="candlist" style="display:none" data-show="$addOpen">${cands}${candsNote}</div>
     </div>`;
 
   // 9. Activity timeline.

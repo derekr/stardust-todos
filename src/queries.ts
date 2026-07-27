@@ -123,10 +123,27 @@ export const workspaceTags = define("board-tags", {
 } as const);
 
 /** Viewer-visible todos as pickable options (the dependency picker). */
+/**
+ * Candidates for "add a blocker" — the FIRST PAGE of them, not all of them.
+ *
+ * This used to return every visible todo in the workspace, and the detail page
+ * rendered one button per row. At ten thousand todos that was a 686KB read taking
+ * 307ms of a 361ms page, to build a list of 9,947 buttons nobody can use. The cost
+ * and the UX were the same bug: an unbounded read behind a small control.
+ *
+ * `limit` is deliberately larger than the list shown, because the caller drops the
+ * todo itself and anything already blocking it before rendering.
+ *
+ * The honest limitation: this is the first 25 by title, so a blocker further down
+ * the alphabet cannot be picked. Typeahead is the real answer — `title` is value
+ * indexed now, and Stardust has full-text search — and it is a UI change, not a
+ * query change, so it is left for one.
+ */
 export const todoPicker = define("todo-options", {
   find: ["?t", "?title"],
   where: [["?t", "app", APP], ["?t", "workspace", "?ws"], ["?t", "title", "?title"], ...VISIBLE],
   orderBy: ["?title"],
+  limit: 25,
   then: { project: { id: "?t", title: "?title" } },
 } as const);
 
