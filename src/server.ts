@@ -546,15 +546,20 @@ async function detailData(t: Trace, id: number): Promise<{ todo: any; opts: Deta
     () => tagsOf(ctx, id),
     (v) => v.length,
   );
-  // The row count is the WHOLE history the read returned; the page shows the last
-  // eight of it. A timing next to "8" would be a timing next to the template.
-  const history = (
-    (await t.read(
-      "history",
-      () => statusHistory(id),
-      (h) => h.length,
-    )) as HistEntry[]
-  ).slice(-8);
+  // The row count is what this read RETURNED, and it is now the same eight the
+  // page renders. It used to be the whole timeline — 17 entries on the demo's
+  // busiest todo, attributed one HTTP round trip at a time and then sliced to the
+  // last eight by this line, which is what made it 44ms for a fragment showing
+  // eight. `statusHistory` asks the fact log for the newest `HISTORY_LIMIT` and
+  // attributes them in one query (history.ts). The number in the log got smaller
+  // because the read did, which is worth saying out loud: a read that returns less
+  // is faster for reasons that are not always an improvement, and this one is only
+  // an improvement because the rows it stopped fetching were being thrown away.
+  const history = (await t.read(
+    "history",
+    () => statusHistory(id),
+    (h) => h.length,
+  )) as HistEntry[];
   const role = await curRole();
   const commands = await t.read(
     "commands",

@@ -36,27 +36,22 @@ interface XraySpec {
 const XRAY: Record<string, XraySpec> = {
   board: {
     title: "The board — the filter is the URL, compiled into the query",
-    mech: "Your filter is the QUERY STRING you are looking at — `?st=todo&v=ready&p=2` — and every read compiles it into the body as LITERALS: `[or [= ?eff todo] [= ?eff doing]]`. It used to be facts on a per-browser `session` entity, joined into the body by matching `sf` children against every candidate row. Two things moved, in that order. First the join became an inline, which is worth 41x: measured on 5,000 todos with value indexes on, one page of fifty, the value-join costs 2,303ms and the inlined form 56ms — faster than no filter at all, because a literal NARROWS the candidate set while a join adds work proportional to it. Then the facts themselves went, because by that point nothing was EVALUATING them: they were being read back and compiled in, which is what a query string does for free. They were not free — ~129 facts per session and ~46 per filter click on an append-only store, and this demo held 24,389 facts for twelve todos — and they were not buying reactivity either, since the live subscription has no `sf` clause and a filter write re-emitted nothing at all. What the URL buys on top: back and forward work, the link is shareable, and two people opening it get two independent views rather than one shared mutable session they overwrite each other in. What it costs: the filter is INPUT now, so every value is checked against its domain before it can become query — `archived` is refused, and a TAG (free text, no fixed domain) is checked against the labels this workspace actually uses. The TAG chips are the newest part of this and the one that was actually broken: the filter used to be a correlated `exists` over the tag EDGE entities, and a subquery's output is capped at 1,000 rows per directive — so one label took 82.7s, and three labels put 1,275 edges through that directive, were REFUSED, and the app rendered the refusal as an empty board. A todo carries its labels as a fact of its own now (`tags ['design' 'launch']`, written by the same transaction as the edge), so the filter is two ordinary clauses: bind the list, test membership. 84ms at ten thousand todos, flat in the number of labels, and each todo comes back once however many of the selected labels it carries — which is the duplicate that made it a subquery in the first place. The rest of the body is unchanged: it derives nothing per row (blocked/effectiveStatus/prank are stored facts the write paths recorded, JOINED here) and returns ONE PAGE — `limit 51`, fifty shown and a fifty-first read only to know whether a next page exists, which is why the pill says \"50+\". `limit` is a POST-FILTER, measured at 2,000 unindexed todos as 7.6s unlimited and 7.5s with `limit 50`, and a bare count over the same `where` costs the same — so paging bounds the response and the render, not the query. Narrowing the filter is what bounds the query. Liveness is a different reactor: `page-rows` subscribes to the fifty rows on screen. You do not have to take any of these numbers on trust: add `?debug=1` to this URL and the server appends what THIS request cost — every read, with the number of rows it returned beside it — or open /inspect, where the last sixty requests are listed with the same breakdown. The row count is the part that matters, because a filter that matched nothing is fast and looks exactly like a filter that was quick.",
-    code: `// Built per read, from the URL. The facet filters are LITERALS —
-// this is what a value-join off a session entity used to be:
+    mech: "Your filter is the QUERY STRING you are looking at — `?st=todo&v=ready&p=2` — and every read compiles it into the body as LITERAL FACT CLAUSES, at the FRONT: `[?t effectiveStatus blocked]`. Where they sit is half of what they are worth. Stardust evaluates a `where` in the order it is written and does not reorder it, so the leading clause is what the read STARTS from and everything after it filters that. These used to be expressions at the end, over vars the rest of the body had already bound — which means walking the whole workspace in `prank` order and discarding rows, fine for a dense selection and terrible for a sparse one. 124 of 9,947 todos here are blocked, so `?st=blocked` filled its 51-row window in 193ms where the unfiltered board took 52ms; written first, the identical body costs 27ms and returns the same 51 rows in the same order. Every filter this board has got faster and none got slower, dense ones included: `?st=blocked&pr=high` 262→29ms, `?v=mine` 49→24ms, `?tag=design` 47→24ms, `?st=todo` — 69% of the corpus — 52→33ms. It used to be facts on a per-browser `session` entity, joined into the body by matching `sf` children against every candidate row. Two things moved, in that order. First the join became an inline, which is worth 41x: measured on 5,000 todos with value indexes on, one page of fifty, the value-join costs 2,303ms and the inlined form 56ms — faster than no filter at all, because a literal NARROWS the candidate set while a join adds work proportional to it. Then the facts themselves went, because by that point nothing was EVALUATING them: they were being read back and compiled in, which is what a query string does for free. They were not free — ~129 facts per session and ~46 per filter click on an append-only store, and this demo held 24,389 facts for twelve todos — and they were not buying reactivity either, since the live subscription has no `sf` clause and a filter write re-emitted nothing at all. What the URL buys on top: back and forward work, the link is shareable, and two people opening it get two independent views rather than one shared mutable session they overwrite each other in. What it costs: the filter is INPUT now, so every value is checked against its domain before it can become query — `archived` is refused, and a TAG (free text, no fixed domain) is checked against the labels this workspace actually uses. The TAG chips are the newest part of this and the one that was actually broken: the filter used to be a correlated `exists` over the tag EDGE entities, and a subquery's output is capped at 1,000 rows per directive — so one label took 82.7s, and three labels put 1,275 edges through that directive, were REFUSED, and the app rendered the refusal as an empty board. A todo carries its labels as a fact of its own now (`tags ['design' 'launch']`, written by the same transaction as the edge), so the filter is two ordinary clauses: bind the list, test membership. 84ms at ten thousand todos, flat in the number of labels, and each todo comes back once however many of the selected labels it carries — which is the duplicate that made it a subquery in the first place. The ORDER is a function of the filter too, for a reason that is not obvious: what an `orderBy` costs is its LEADING key's cardinality, not how many keys it has. `[?title ?prank]` is 6ms on this board and `[?prank ?title]` is 47ms — two keys either way, both value-indexed, same rows — because a key with three distinct values cannot drive an index-ordered scan and the whole visible set gets sorted instead. So when you pin a single priority every row has the same `prank`, ordering by it is provably a no-op, and dropping it lets `?title` lead: `?pr=med` 184ms → 6ms, in exactly the same order, because within one priority \"prank then title\" IS \"title\". The rest of the body is unchanged: it derives nothing per row (blocked/effectiveStatus/prank are stored facts the write paths recorded, JOINED here) and returns ONE PAGE — `limit 51`, fifty shown and a fifty-first read only to know whether a next page exists, which is why the pill says \"50+\". `limit` is a POST-FILTER, measured at 2,000 unindexed todos as 7.6s unlimited and 7.5s with `limit 50`, and a bare count over the same `where` costs the same — so paging bounds the response and the render, not the query. Narrowing the filter is what bounds the query. Liveness is a different reactor: `page-rows` subscribes to the fifty rows on screen. You do not have to take any of these numbers on trust: add `?debug=1` to this URL and the server appends what THIS request cost — every read, with the number of rows it returned beside it — or open /inspect, where the last sixty requests are listed with the same breakdown. The row count is the part that matters, because a filter that matched nothing is fast and looks exactly like a filter that was quick.",
+    code: `// Built per read, from the URL. What the FILTER narrows to comes
+// FIRST: the engine does not reorder a where, so the leading clause
+// is what the read starts from. 193ms -> 27ms for ?st=blocked.
 {
   find: ["?t"],
   where: [
-    ["?t", "app", "todo-app"],
-    ["?t", "workspace", {"#": 12}],   // scope: the server's, never yours
-    ["?t", "status", "?status"], ["?t", "priority", "?priority"], /* … */
-
-    // the derived facts, JOINED — recorded by the write that caused them:
-    ["?t", "blocked", "?blocked"],
-    ["?t", "effectiveStatus", "?eff"],
-    ["?t", "prank", "?prank"],
-    ["or", ["=", "?draft", false], ["=", "?author", {"#": 7}]],
-
-    ["=", "?priority", "high"],                        // was 4 clauses
-    ["or", ["=", "?eff", "todo"], ["=", "?eff", "doing"]],  // was 4 clauses
-    // …and NOTHING at all for a facet with everything selected: an
-    // or over the whole domain cannot remove a row.  85ms -> 54ms
-    ["=", "?eff", "todo"],                 // ?v=ready, chosen at compile time
+    ["?t", "effectiveStatus", "blocked"],  // ?st=blocked — was 4 clauses
+    ["?t", "priority", "high"],            // ?pr=high    — was 4 clauses
+    // several selected values cannot be a literal, so they bind a var
+    // of their own and test membership over it — 25ms for two:
+    //   ["?t","effectiveStatus","?effIn"],
+    //   ["contains", {"#set": ["todo","doing"]}, "?effIn"]
+    // …and NOTHING at all for a facet with everything selected: a
+    // clause that cannot remove a row is not written.  85ms -> 54ms
+    ["?t", "effectiveStatus", "todo"],     // ?v=ready, chosen at compile time
 
     // ?tag=design,launch — the todo's OWN labels, bound once per row,
     // then a membership test. This was a correlated exists over the
@@ -65,8 +60,26 @@ const XRAY: Record<string, XraySpec> = {
     ["?t", "tags", "?tags"],
     ["any", ["fn", ["l"],
              ["contains", {"#set": ["design", "launch"]}, "l"]], "?tags"],
+
+    // …and only then the clauses that are true of every todo, where
+    // the order among them cannot matter because none of them narrows:
+    ["?t", "app", "todo-app"],
+    ["?t", "workspace", {"#": 12}],   // scope: the server's, never yours
+    ["?t", "status", "?status"], ["?t", "priority", "?priority"], /* … */
+    ["?t", "blocked", "?blocked"],    // the derived facts, JOINED —
+    ["?t", "effectiveStatus", "?eff"],//   recorded by the write that
+    ["?t", "prank", "?prank"],        //   caused them
+    ["or", ["=", "?draft", false], ["=", "?author", {"#": 7}]],
+
+    // ?v=overdue's comparison trails on purpose: the clauses above are
+    // what make ?t a TODO, and a 'due' read off a SCHEMA entity (which
+    // declares the property) is a ref that < refuses — at evaluation
+    // time, so it would 400 on page 4 and work on page 1.
   ],
-  orderBy: ["?prank", "?title", "?t"],   // high→med→low, then a total order
+  orderBy: ["?prank", "?title"],  // high→med→low, then title. ONE key when
+                                  // the filter pins a priority: prank is
+                                  // constant then, and a 3-value key cannot
+                                  // lead an index scan.  184ms -> 6ms
   limit: 51, offset: 100,                // ?p=2 — 50 shown, 1 read-ahead
   then: { project: { id: "?t", effectiveStatus: "?eff",
                      blocked: "?blocked", /* … */ } },
@@ -259,16 +272,25 @@ await authorizeCommand(cmdId, role)   // same rule, on write`,
   },
   activity: {
     title: "Activity — read straight off the fact log",
-    mech: "No audit table, and no event replay needed. Every fact carries the transaction that asserted it, so ONE facts read for this entity + field already IS that field's history — a `status` fact only exists because that write actually changed the value. Rows come back newest-first; we reverse to chronological, then attribute each one by reading its transaction ENTITY, where the commit instant and the Tx-Meta headers landed as ordinary facts. (The /inspect page does use bus replay — that's a different mechanism, for the whole log.)",
-    code: `// One read. Each row is a value + the tx that asserted it.
-const rows = await readFacts({ entityId: id, field: "status" });
+    mech: "No audit table, and no event replay needed. Every fact carries the transaction that asserted it, so ONE facts read for this entity + field already IS that field's history — a `status` fact only exists because that write actually changed the value. Rows come back newest-first; we reverse to chronological, then attribute the whole set from its TRANSACTION entities, where the commit instant and the Tx-Meta headers landed as ordinary facts. That attribution used to be one HTTP round trip PER ROW, which is what made this 44ms for 17 rows on a pane that shows eight — eighteen requests to render eight lines. It is two requests now, 11ms, and the two things that had to be got right are both worth knowing. A transaction is an ordinary entity, so `[?tx stardust/committed ?at]` matches it and one dry-run can carry the page's worth; but the membership test has to be an `or` of `[= ?tx {# N}]`, because `[contains {#set …} ?tx]` against a var bound in SUBJECT position matches NOTHING — fast, zero rows, and every timestamp silently blank. And `or` is a macro with a size limit (twelve branches read, fourteen are `macro expansion size exceeded`), so the ids are chunked. `actor` and `causationId` are OPTIONAL on a transaction and a `where` clause is an existence filter, so they are read as dotted projection PATHS, which return the key absent instead of dropping the row — safe in a dry-run, and never in a stored reactor, where a path is invisible to invalidation. (The /inspect page does use bus replay — that's a different mechanism, for the whole log.)",
+    code: `// One read, bounded to what the pane SHOWS — newest-first.
+const rows = await readFacts({ entityId: id, field: "status", limit: 8 });
 //   [{ component: "doing", tx: { "#": 3460 }, entity: { "#": 216 } }, …]
 
-// Attribution + timestamp live ON the transaction entity:
-const txe = await readEntity(refId(row.tx));
-txe["stardust/committed"]   // {"#utc": "2026-07-24T…"} — commit instant
-txe.actor                   // from Tx-Meta-Actor on the write
-txe.causationId             // workflow:tx:<N> — what triggered it`,
+// Attribution for the whole page in ONE dry-run, not one read per row:
+{
+  find: ["?tx"],
+  where: [
+    ["?tx", "stardust/committed", "?at"],       // a tx is an ordinary entity
+    ["or", ["=", "?tx", {"#": 3460}], ["=", "?tx", {"#": 3456}], /* … */],
+  ],                    // NOT [contains {#set […]} ?tx] — that matches NOTHING
+  then: { project: { root: "?tx", fields: {
+    tx: "?tx", at: "?at",
+    actor: ".actor",        // OPTIONAL on a tx, so read by PATH: a where
+    cause: ".causationId",  // clause would drop every unattributed write
+  } } },
+}
+// 44ms/17 rows and 18 round trips  ->  11ms/8 rows and 2.`,
     src: "src/history.ts · statusHistory()",
   },
   concurrency: {

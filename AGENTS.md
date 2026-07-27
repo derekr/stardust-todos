@@ -140,7 +140,18 @@ it eliminates every app-side explanation, which is what the next person needs
 before taking the body to a throwaway.
 
 It found one thing nobody was looking for, too: the detail page is 90ms and 44ms of
-it is `history` — one read, 17 rows.
+it is `history` — one read, 17 rows. That ratio was the whole diagnosis. The read was
+one round trip for the facts and then ONE MORE PER ROW for the transaction entities
+that carry the commit time and the actor — eighteen requests to render the eight
+lines the pane shows. It reads what the page shows now (the newest eight, which is
+what `GET /facts` returns with a `limit`) and attributes all of them in one dry-run
+over the transaction entities, which are ordinary entities that `[?tx
+stardust/committed ?at]` matches. 44ms/17 rows and 18 round trips → 11ms/8 rows and 2,
+with the last eight entries byte-identical to what the old code produced, checked
+against it on eight todos. The row count in the log got SMALLER, which is worth
+saying out loud every time it happens: a read that returns less is faster for
+reasons that are not always an improvement, and this one is only an improvement
+because the rows it stopped fetching were being thrown away by the next line.
 
 ## Assume Stardust can carry more than you think
 
@@ -382,6 +393,116 @@ That does not make binds wrong — it makes them a price. `page-rows` and the pi
 are still stored reactors read with a bind, because what a bind buys them is a
 subscription and one definition serving every caller, which no literal can. It
 means: if a read is hot and its inputs are known to the process, inline them.
+
+## Clause order IS the plan, and nothing will fix it for you
+
+Stardust evaluates a `where` in the order it is WRITTEN. It does not reorder
+clauses, so the first one decides what the read starts from and every clause after
+it filters what that produced. This was already known here in miniature and had
+been left as a curiosity: `tagsOfTodo` led with `[?e kind tag]` — a scan of every
+tag edge in the database — ahead of `[?e todo {# id}]`, a backlink that returns the
+two edges the todo actually has, and paid 16.0ms for two labels where 6.2ms was
+sitting there. It generalises, and it is the largest single lever this app has
+found.
+
+The board's rows were the general case of the same mistake. The facet filters were
+EXPRESSIONS at the END of the body, over vars the base clauses had already bound,
+so every read began by walking the whole workspace in `prank` order and discarding
+rows. That is fine when the selection is dense and terrible when it is sparse: 124
+of 9,947 todos are blocked, and filling one 51-row window out of a 1.2% match set
+cost 193ms against 52ms for the unfiltered board. The identical body with `[?t
+effectiveStatus blocked]` written FIRST costs 26ms and returns the same 51 rows in
+the same order. Measured on the demo's 10,003 todos, one page, p50, every pair
+returning byte-identical rows:
+
+| filter | expressions last | clauses first |
+| --- | --- | --- |
+| `?st=blocked` | 193ms | **27ms** |
+| `?st=blocked&pr=high` | 262ms | **29ms** |
+| `?st=blocked,done` | 49ms | 25ms |
+| `?st=doing` | 51ms | 23ms |
+| `?st=todo` (69% of the corpus) | 52ms | 33ms |
+| `?pr=high` | 61ms | 50ms |
+| `?pr=med` (55%) | 242ms | 176ms |
+| `?v=mine` | 49ms | 24ms |
+| `?v=overdue` | 58ms | 34ms |
+| `?tag=design` | 47ms | 24ms |
+| no filter at all | 54ms | 54ms |
+
+The rule is **the filter before the corpus**, and the honest form of it is not "the
+most selective clause first" — the app has no statistics and cannot know which
+selection is selective. It knows only that a narrowed facet is narrower than no
+facet, and that is enough. The DENSE rows are the ones worth reading twice, because
+they are where starting from the filter might have cost more than starting from the
+ordering index, and none of them regressed.
+
+Three things about this took measuring and none of them was guessable:
+
+**A literal beats a bound var, so the two spellings are not interchangeable.** One
+selected value is a LITERAL in the fact clause (`[?t effectiveStatus blocked]`),
+which is an index seek: 26ms. Several cannot be, so they bind a var of their own and
+test membership (`[?t effectiveStatus ?effIn] [contains {#set [blocked done]}
+?effIn]`): 25ms for two values, and **40ms if the same two-clause shape is used for a
+single value**. Reusing the `?eff` the projection needs, instead of a fresh var, is
+slower again (43ms). So: a value the planner has when it plans is one it can seek
+on, one it has to bind first is not, and the redundant-looking second clause over an
+already-narrowed set is cheaper than moving the binding.
+
+**What an `orderBy` costs is its LEADING key's cardinality, not the number of
+keys.** `orderBy [?title ?prank]` on the unfiltered board is 6ms and `orderBy [?prank
+?title]` is 47ms — two keys either way, both value-indexed, same rows. A key with
+three distinct values cannot drive an index-ordered scan, so the whole visible set is
+materialised and sorted; a near-unique one is walked until fifty-one rows have
+passed. (`orderBy` omitted entirely is 290ms, so the scan is doing real work in both
+cases.) The board's ordering is therefore a function of the FILTER: when the priority
+selection pins a single value, every matching row has the same `prank`, ordering by it
+is provably a no-op, and dropping it lets `?title` lead — `?pr=med` 184ms → 6ms,
+`?pr=low` 122ms → 8ms, `?pr=high` 60ms → 8ms, same rows in the same order, because
+within one priority "prank then title" IS "title". The general form is the useful
+one: **an ordering key a filter has made CONSTANT is not free, it is the most
+expensive part of the read.**
+
+**Hoisting a clause changes WHAT IT SCANS, and that is where this shipped a bug.** A
+clause matching a VALUE narrows to rows carrying that value whatever else they are.
+A clause matching only a field's EXISTENCE narrows to every entity family that uses
+the field NAME. `[?t due ?due]` hoisted to the front of the overdue board is not
+"every todo with a due date", it is every entity with a `due` component — and 89 of
+the demo's 2,087 are SCHEMA entities, because a schema document names the properties
+it declares and `due` is one of them. The answer was never wrong (`[?t app
+todo-app]` two clauses later removes them); the COMPARISON was, because a schema's
+`due` is a ref and `[< ?due {#utc …}]` over a ref is `query: invalid argument type
+for <`. And it fails at EVALUATION time, so it appeared on `?v=overdue&tag=design&p=3`
+and not on `?v=overdue` — the shapes that stop after fifty-one rows never reach the
+bad row. A read that works on page 1 and 400s on page 4 is the worst version of this,
+and a paired before/after timing would have shipped it happily. So the join leads and
+the comparison trails, behind the clauses that make `?t` a todo: 34ms, against 29ms
+for the arrangement that sometimes fails.
+
+Two engine facts collected while fixing the detail page's `history`, both of the
+"fast, empty, shaped like an answer" family this file keeps collecting:
+
+- **`[contains {#set […]} ?e]` over a var bound in SUBJECT position matches
+  NOTHING** — with refs in the set, with bare ids in the set, either way. 15ms, zero
+  rows, and an activity feed with every timestamp silently blank. `[= ?e {# N}]`
+  with the same ref matches fine. (The existing entry below is about a var bound
+  through a REF FIELD, where refs in the set is exactly right. These are different
+  positions and they behave differently.)
+- **`or` is a MACRO and has a size limit.** Twelve `[= ?tx {# N}]` branches read
+  fine; fourteen fail with `query: macro expansion size exceeded`. So an id list
+  that travels as an `or` has to be chunked, and a body that builds one from a
+  variable-length list needs a cap it chose rather than one it discovers.
+
+**The lever this leaves on the table**, with the numbers, because the next person
+will want it: the UNFILTERED board still pays that 47ms for leading its scan with a
+three-value key, and it is the common path. The fix is a single near-unique ordering
+key the schema does not have — a stored `prank`-then-title composite, written by the
+same write path that already maintains `prank`, value-indexed, and ordered by alone.
+Every measurement above says it lands the unfiltered board near 6ms. It was
+deliberately not bundled into a query-compiler change: it is a schema property, a
+value index, a boot backfill, a reconciliation check and another invariant moved from
+"guaranteed by the query" to "guaranteed by write discipline" — the exact trade the
+`blocked` entry below spells out, and it deserves its own commit and its own
+harness run.
 
 ## Searching a value is a THIRD index, and it is the one that backfills
 
@@ -750,6 +871,14 @@ worth reading before you re-litigate one:
   print a negative number in a chip. 49ms is not worth a count that can lie, and
   "one question, one snapshot" is the property a tally should not trade away.
 
+- The board's ordering key: a COMPOSITE stored field vs the two keys it has —
+  NEITHER YET, and this is the one open item rather than a decision made. Leading an
+  `orderBy` with `prank` costs 47ms of the unfiltered board's ~54ms rows read, and a
+  near-unique key costs 6ms; the filtered boards get that for free today because a
+  pinned priority lets the key be dropped, and the unfiltered one cannot. Writing a
+  `prank`-then-title composite would fix it and would move one more invariant onto
+  the write path. Recorded here rather than done, so that whoever does it does it as
+  its own change. See the clause-order section for the measurements.
 - The compile-time query checker only models plain 3-tuple fact clauses. Queries
   using `or` or a bound `exists` cannot use it, so they keep runtime validation and
   lose the compile-time check. That is why `define()` does not apply `CheckQuery`.

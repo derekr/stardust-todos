@@ -49,6 +49,42 @@
 // whose cost is the page rather than the corpus. That is what wakes a reader; this
 // file only answers "what is on the page right now".
 //
+// CLAUSE ORDER IS THE PLAN. The engine evaluates a `where` in the order it is
+// written and does not reorder it, so the FIRST clause decides what the read starts
+// from and everything after it is a filter over that. This file used to put the
+// filter LAST — the facets as expressions over vars the base clauses had already
+// bound — which meant every read began by walking the whole workspace in `prank`
+// order and discarding rows. That is fine when the selection is dense and terrible
+// when it is sparse, and the shape of the difference is exactly what `?st=blocked`
+// was: 124 of 9,947 todos are blocked, and filling one 51-row window out of a 1.2%
+// match set cost 193ms against 52ms for the unfiltered board. The identical body
+// with `[?t effectiveStatus blocked]` written FIRST costs 26ms and returns the same
+// 51 rows in the same order.
+//
+// So the rule this file follows: everything the filter narrows to comes first, and
+// the clauses that are true of every todo come after it. Measured on the demo's
+// 10,003 todos, one page, p50, tail-expression form → leading-clause form:
+//
+//   ?st=blocked            193ms → 27ms      ?pr=high              61ms → 50ms
+//   ?st=doing               51ms → 23ms      ?pr=med (dense)      242ms → 176ms
+//   ?st=todo (dense)        52ms → 33ms      ?st=blocked&pr=high  262ms → 29ms
+//   ?st=blocked,done        49ms → 25ms      ?v=mine               49ms → 24ms
+//   ?tag=design             47ms → 24ms      ?v=overdue            58ms → 34ms
+//
+// Every one of those returns byte-identical rows; the row count is what makes it a
+// result rather than a guess. Nothing got slower, including the DENSE cases, which
+// was the thing worth checking — a selection covering most of the workspace is the
+// one where starting from the filter might have cost more than starting from the
+// ordering index, and it does not. The unfiltered board emits no narrowing clause
+// at all and is untouched at ~54ms.
+//
+// Two consequences that look alarming and are not. The workspace scope is no longer
+// the first clause in the body — but it is still a LITERAL, still a conjunct, and
+// still the only thing that decides which workspace a row can come from; a
+// conjunction has no order, only a plan. And the tag clause is no longer LAST: it
+// leads with the other narrowing clauses, which is worth 47ms → 24ms and is the
+// same rule, not an exception to it.
+//
 // TAG LABELS are the one filter with no fixed domain — they are free text from
 // `addTag` — so they are checked against the workspace's actual tag vocabulary
 // (`availableTags`, which the render already reads) on the way in, and again by
@@ -63,14 +99,38 @@
 // whole entry, including why one field per label cannot express two labels). One
 // page went 104,475ms to 84ms, flat in the number of labels, and a todo carrying
 // several selected labels still comes back once, which is the duplicate that made
-// this a subquery in the first place. It is still placed LAST and still compiled
-// out entirely when no tag is selected.
+// this a subquery in the first place. It is still compiled out entirely when no tag
+// is selected.
 //
 // `overdue` compares against WALL-CLOCK time, so no write can ever be the moment it
 // changes and it cannot be a stored fact. It is plain clauses (`[?t due ?due]`,
 // `[< ?due {#utc …}]`) with the instant supplied by the read that builds the body.
 // It used to be a literal baked in when the reactor was PROVISIONED, which went
 // quietly wrong the moment the wall clock passed it and had been wrong for weeks.
+// It is also the view that will not lead ENTIRELY, and the reason is worth more
+// than the clause. `[?t due ?due]` hoisted to the front is a scan of every entity
+// carrying a `due` field, not every TODO carrying one — and 89 of the demo's 2,087
+// are SCHEMA entities, because a schema document names the properties it declares
+// and `due` is one of them. They are filtered out again by `[?t app todo-app]` two
+// clauses later, so the ANSWER was never wrong. What broke is the comparison: a
+// schema's `due` is a ref, `[< ?due {#utc …}]` over a ref is `query: invalid
+// argument type for <`, and it is an EVALUATION-time failure, so it appeared on
+// `?v=overdue&tag=design&p=3` and not on `?v=overdue` — the shapes that stop after
+// fifty-one rows never reach the bad one. A read that works on page 1 and 400s on
+// page 4 is the worst version of this bug, and it is the one a paired timing
+// measurement would have shipped.
+//
+// So the join leads and the COMPARISON trails, behind the clauses that make `?t` a
+// todo. `[!= ?status done]` trails for the plainer reason that it reads a var those
+// same clauses bind. 58ms → 34ms, against 29ms for the unsafe arrangement; 5ms is
+// not worth a query that fails on a page nobody tested.
+//
+// The general rule, which the facet seeks satisfy for free: hoisting a clause
+// changes WHAT IT SCANS. A clause matching a value (`[?t effectiveStatus blocked]`)
+// narrows to rows that carry that value whatever else they are, and an expression
+// over a var it bound is safe. A clause matching only a field's EXISTENCE narrows
+// to every entity family that uses that field name, which is not the same set at
+// all.
 //
 // Ordering is `orderBy [?prank ?title]`, and BOTH keys are value-indexed on
 // purpose. Every key must be, or the engine abandons the index-ordered scan and
@@ -86,9 +146,30 @@
 //
 // `prank` is the priority ORDINAL
 // (high 0, med 1, low 2), so ascending is high→med→low; the board used to order by
-// the priority STRING, which is alphabetical nonsense (high, low, med). `?t` is the
-// final tiebreaker — real titles are not unique, and only a total order keeps an
-// offset from dropping and repeating rows.
+// the priority STRING, which is alphabetical nonsense (high, low, med).
+//
+// WHAT COSTS IS THE LEADING KEY, not the number of them, and that is the second
+// thing worth carrying out of this file. `orderBy [?title ?prank]` is 6ms on the
+// unfiltered board and `orderBy [?prank ?title]` is 47ms — two keys either way. A
+// key with three distinct values cannot drive an index-ordered scan the way a
+// near-unique one can, so leading with `prank` means the whole visible set is
+// materialised and sorted, and leading with `title` means walking an index until
+// fifty-one rows have passed. (`orderBy` omitted entirely is 290ms, so the index
+// scan is doing real work either way — this is about which key drives it.)
+//
+// That is why `orderBy` is a function of the filter and not a constant. When the
+// priority selection pins a SINGLE value, every matching row has the same `prank`,
+// so ordering by it is provably a no-op and the key is dropped — leaving `?title`,
+// which is near-unique, to lead. Measured on the demo, same 51 rows in the same
+// order: `?pr=med` 184ms → 6ms, `?pr=low` 122ms → 8ms, `?pr=high` 60ms → 8ms. The
+// board's own order is unchanged, which is the property that makes this legal
+// rather than a trade: within one priority, "by prank then title" IS "by title".
+//
+// The unfiltered board still pays the ~47ms, and the fix for that is a single
+// near-unique ordering key it does not have — a stored `prank`-then-title composite
+// written by the same write path that maintains `prank`. That is a field, an index,
+// a backfill and a reconciliation check, and it was deliberately not bundled in
+// here; AGENTS.md records it as the next lever with the numbers.
 //
 // The board DERIVES nothing per row, and with the tag clause rewritten it now runs
 // NO SUBQUERY AT ALL. `blocked`, `effectiveStatus` and `prank` are stored facts
@@ -198,13 +279,46 @@ export const boardQuery = (scope: BoardScope, f: Filter, now: Date = new Date())
 });
 
 /**
- * A multi-select, as an inlined literal comparison — or as NOTHING when the
- * selection is the whole domain.
+ * One narrowing the filter contributes — the clauses it emits, and the var the
+ * four-clause value-join these replaced used to bind.
  *
- * This is the clause that replaced a four-clause value-join. One selected value is
- * a bare `=`; several are an `or` over `=`. Both are expressions over a var the
- * body has already bound by a fact clause, so they FILTER the candidate set rather
- * than joining anything to it — which is why they are faster than no filter at all.
+ * The GROUP is the unit rather than the clause because a multi-value selection
+ * takes two clauses to say, and because the stress harness swaps a whole group back
+ * out for the value-join it replaced. Handing it loose clauses would make it guess
+ * which ones belonged together.
+ */
+export interface Narrowing {
+  /** `?eff` or `?priority` — the var the value-join bound */
+  narrows: string;
+  /** in emission order: one clause for a single value, two for several */
+  clauses: unknown[][];
+}
+
+/**
+ * A multi-select, as the clause the read STARTS from — or as NOTHING when the
+ * selection covers the whole domain.
+ *
+ * This is the clause that replaced a four-clause value-join, and it has now moved
+ * twice. It was a join; then it became an inlined `=` (or an `or` over `=`) sitting
+ * at the END of the body, which is worth 82x because a literal narrows the
+ * candidate set where a join adds work proportional to it; and it is a FACT clause
+ * at the FRONT of the body now, which is worth another 7x on a sparse selection,
+ * because an expression can only filter rows something else already produced. Same
+ * lesson each time, one step further along it: the earlier the engine knows a
+ * value, the less it has to look at.
+ *
+ * The two spellings are not interchangeable and the difference is measured. A
+ * single value is a LITERAL in the fact clause, which is an index seek: 26ms for
+ * `?st=blocked`. Several values cannot be, so they bind a var of their own and test
+ * membership over it — 25ms for `?st=blocked,done`, and 40ms if the same
+ * two-clause shape is used for a single value, which is why the single case is
+ * spelled separately rather than uniformly.
+ *
+ * The var is a fresh one (`?effIn`) rather than the `?eff` the base clauses bind,
+ * and that is deliberate too: reusing `?eff` means dropping the base clause and
+ * letting this one bind the projection's value, which measured SLOWER (43ms against
+ * 40ms). The redundant-looking second clause over an already-narrowed set is
+ * cheaper than moving the binding.
  *
  * The empty case used to be spelled as the whole domain, so an unfiltered board
  * carried `[or [= ?priority low] [= ?priority med] [= ?priority high]]` and a
@@ -217,12 +331,22 @@ export const boardQuery = (scope: BoardScope, f: Filter, now: Date = new Date())
  * and it looks exactly like one that does; the only reason this was visible at all
  * is that the clause it replaced was the expensive one.
  *
- * `null` rather than an empty array so the caller has to decide what "no clause"
- * means, and because an empty `or` is not a clause Stardust accepts.
+ * `null` rather than an empty group so the caller has to decide what "no clause"
+ * means, and because a selection covering the domain must emit nothing at all.
  */
-const anyOf = (v: string, values: readonly string[], domain: readonly string[]): unknown[] | null => {
-  if (values.length >= domain.length) return null; // every branch would pass
-  return values.length === 1 ? ["=", v, values[0]] : ["or", ...values.map((x) => ["=", v, x])];
+const seek = (field: string, v: string, values: readonly string[], domain: readonly string[]): Narrowing | null => {
+  if (values.length >= domain.length) return null; // nothing left to narrow
+  const held = `${v}In`;
+  return {
+    narrows: v,
+    clauses:
+      values.length === 1
+        ? [["?t", field, values[0]!]]
+        : [
+            ["?t", field, held],
+            ["contains", { "#set": [...values] }, held],
+          ],
+  };
 };
 
 /**
@@ -237,7 +361,7 @@ const anyOf = (v: string, values: readonly string[], domain: readonly string[]):
  * come through a URL, and because the cost of the check is three lines against a
  * failure mode that is a query matching the wrong rows.
  *
- * It still MATERIALIZES the empty case into the domain, even though `anyOf` then
+ * It still MATERIALIZES the empty case into the domain, even though `seek` then
  * emits no clause for it. "Select nothing" and "select everything" are the same
  * board — the chips let a reader tick all four statuses — and they must compile to
  * the same body, which is easiest to guarantee by making them the same VALUE first.
@@ -250,13 +374,23 @@ function inDomain(values: readonly string[], domain: readonly string[], what: st
   return values;
 }
 
-/** The facet clauses one selection pair adds — one, two, or none at all. Exported
- *  because the stress harness reconstructs the value-join these replaced by
- *  finding them in the body, and it must look for exactly what was emitted. */
-export function facetClauses(q: BoardQuery): unknown[] {
-  const p = anyOf("?priority", inDomain(q.priority, PRIORITY_DOMAIN, "priority"), PRIORITY_DOMAIN);
-  const s = anyOf("?eff", inDomain(q.status, STATUS_DOMAIN, "status"), STATUS_DOMAIN);
-  return [p, s].filter((c) => c !== null);
+/**
+ * The narrowings one selection pair contributes — two, one, or none at all.
+ *
+ * Status before priority, because that is the order that measured best on a board
+ * carrying both (`?st=blocked&pr=high`: 28ms leading with the status, 32ms leading
+ * with the priority) — and because nothing here can know a selection's real
+ * selectivity, only that a narrowed facet is narrower than no facet. The honest
+ * shape of the rule is "the filter before the corpus", not "the most selective
+ * clause first"; the app does not have the statistics for the second one.
+ *
+ * Exported because the stress harness reconstructs the value-join these replaced by
+ * finding them in the body, and it must look for exactly what was emitted.
+ */
+export function facetClauses(q: BoardQuery): Narrowing[] {
+  const s = seek("effectiveStatus", "?eff", inDomain(q.status, STATUS_DOMAIN, "status"), STATUS_DOMAIN);
+  const p = seek("priority", "?priority", inDomain(q.priority, PRIORITY_DOMAIN, "priority"), PRIORITY_DOMAIN);
+  return [s, p].filter((c) => c !== null);
 }
 
 /**
@@ -276,8 +410,30 @@ export function canonicalBody(q: BoardQuery, window: PageWindow | null): Record<
   return {
     find: ["?t"],
     where: [
-      // base todo facts, scoped to the workspace this server has open. The scope is
-      // a LITERAL, not a var: nothing a client sends can move it.
+      // ---- what the FILTER narrows to, first --------------------------------
+      //
+      // The engine does not reorder a `where`, so these decide what the read
+      // starts from. Every one is a fact clause with a literal or a set the app
+      // domain-checked, and every one is absent when its facet is not narrowed —
+      // an unfiltered board reaches the next section with nothing in front of it.
+      // See the header for the before/after table; the short version is 193ms →
+      // 27ms for `?st=blocked` and not one case slower.
+      ...facets.flatMap((f) => f.clauses),
+      // The derived view, as clauses that can SEEK. It used to be an `or` over four
+      // branches tested against a `?view` var joined off the session, because the
+      // session could change under the body. The view is a compile-time value now,
+      // so only the branch that applies is emitted at all, and `all` emits nothing.
+      ...viewLead(q),
+      // Tag filter: the todo's own list of labels, plus a membership test over it.
+      // The labels reached this file having been checked against the workspace's
+      // own tag vocabulary, and `tagClauses` checks each one again on the way into
+      // the set literal.
+      ...(q.tags.length ? tagClauses(q.tags) : []),
+      // ---- the todo, and who may see it -------------------------------------
+      //
+      // True of every row in the workspace, so nothing here narrows anything and
+      // the order among them does not matter. The scope is a LITERAL, not a var:
+      // nothing a client sends can move it, whichever clause it is written on.
       ["?t", "app", APP],
       ["?t", "workspace", { "#": q.workspace }],
       ["?t", "status", "?status"],
@@ -293,35 +449,22 @@ export function canonicalBody(q: BoardQuery, window: PageWindow | null): Record<
       ["?t", "prank", "?prank"], // the ordering key (high 0, med 1, low 2)
       // viewer visibility (published OR authored by the viewer)
       ["or", ["=", "?draft", false], ["=", "?author", { "#": q.viewer }]],
-      // The two facet filters, INLINED — when there is anything to filter. Each was
-      // four clauses joining a session's `sf` children against the row; each is now
-      // one expression over a var this body already bound, and a selection covering
-      // the whole domain emits nothing at all rather than an `or` every row passes.
-      // Domain-checked inside `facetClauses`, which is what makes inlining safe.
-      ...facets,
-      // The derived view. It used to be an `or` over four branches tested against a
-      // `?view` var joined off the session, because the session could change under
-      // the body. The view is a compile-time value now, so only the branch that
-      // applies is emitted at all — one comparison instead of four, and `all` emits
-      // nothing.
+      // ---- the filter tests that cannot lead --------------------------------
       //
-      // `overdue` is the branch that could never be expressed that way: it needs
-      // `?due` bound by a fact clause, and a fact clause cannot be conditional, so
-      // joining `due` unconditionally would silently drop every todo with no due
-      // date.
-      ...viewClauses(q),
-      // Tag filter, LAST, and no longer a subquery: the todo's own list of labels,
-      // plus a membership test over it. The labels reached this file having been
-      // checked against the workspace's own tag vocabulary, and `tagClauses` checks
-      // each one again on the way into the set literal.
-      ...(q.tags.length ? tagClauses(q.tags) : []),
+      // `overdue`'s two expressions. "Not done" reads `?status`, which the section
+      // above binds, and an expression running before its var is bound is
+      // `query_failed: unbound input var`. The date comparison is subtler and is
+      // why this section exists at all: the clauses above are what make `?t` a
+      // TODO, and a `due` read off anything else — a schema document declaring the
+      // property, say — is a ref that `<` refuses. Both failures are
+      // evaluation-time, so they surface on a deep page and not on page one.
+      ...viewTail(q),
     ],
-    orderBy: ["?prank", "?title"],
-    // The window, if this body has one. `orderBy` ends with `?t`, so the order is
-    // TOTAL — which is what makes an offset mean the same thing on two reads.
-    // Without that last component two rows with equal (prank, title) could swap
-    // between reads, and a page boundary falling between them would drop one row
-    // and repeat the other; the harness's paging properties are what would catch it.
+    orderBy: orderBy(q),
+    // The window, if this body has one. Two rows tying on (prank, title) have no
+    // defined order between them; the harness's paging properties are what stand
+    // behind that, by paging the whole corpus and asserting the concatenation
+    // equals the unpaginated read, in order.
     ...window,
     then: {
       project: {
@@ -339,25 +482,68 @@ export function canonicalBody(q: BoardQuery, window: PageWindow | null): Record<
   };
 }
 
-/** The clauses one derived view adds. `all` adds none. */
-function viewClauses(q: BoardQuery): unknown[] {
+/**
+ * The ordering keys, which are a function of the FILTER rather than a constant.
+ *
+ * `[?prank ?title]` is the board's order: ascending prank is high→med→low, then
+ * title. What it costs is the LEADING key — `prank` has three distinct values, so
+ * it cannot drive an index-ordered scan and the whole visible set is materialised
+ * and sorted (47ms on the demo, against 6ms for the same two keys the other way
+ * round, and 290ms with no `orderBy` at all).
+ *
+ * So when the priority selection pins a SINGLE value, `prank` is constant across
+ * every row the body can return and ordering by it is a no-op. Dropping it leaves
+ * `?title` — near-unique, and therefore able to lead a scan — and the board's order
+ * is not merely preserved but identical: within one priority, "prank then title" IS
+ * "title". Measured on the demo, same 51 rows in the same order, `?pr=med` 184ms →
+ * 6ms, `?pr=low` 122ms → 8ms, `?pr=high` 60ms → 8ms.
+ *
+ * The general form, which is worth more than the special case: an ordering key a
+ * filter has made CONSTANT is not free, it is the most expensive part of the read.
+ */
+function orderBy(q: BoardQuery): string[] {
+  const pinned = inDomain(q.priority, PRIORITY_DOMAIN, "priority").length === 1;
+  return pinned ? ["?title"] : ["?prank", "?title"];
+}
+
+/**
+ * The clauses one derived view adds AT THE FRONT — the ones that can seek.
+ *
+ * `ready`/`done` are a value on `effectiveStatus` and `mine` one on `lastActor`, so
+ * all three are index seeks. `overdue` needs `?due` bound by a fact clause, and a
+ * fact clause cannot be conditional — joining `due` unconditionally would silently
+ * drop every todo with no due date — so it leads with the join and the comparison
+ * and leaves its "not done" test to `viewTail`. `all` adds nothing.
+ */
+function viewLead(q: BoardQuery): unknown[][] {
   switch (q.view) {
     case "ready":
-      return [["=", "?eff", "todo"]];
+      return [["?t", "effectiveStatus", "todo"]];
     case "done":
-      return [["=", "?eff", "done"]];
+      return [["?t", "effectiveStatus", "done"]];
     case "mine":
-      return [["=", "?lastActor", q.actor]];
+      return [["?t", "lastActor", q.actor]];
     case "overdue":
-      return [
-        ["?t", "due", "?due"],
-        ["<", "?due", { "#utc": q.now.toISOString() }], // wall clock is not a fact
-        ["!=", "?status", "done"],
-      ];
+      // The JOIN only. Its comparison is in `viewTail` — see the header: this clause
+      // matches a field's EXISTENCE, so hoisting it scans every entity family that
+      // uses the name `due`, schema documents included, and their `due` is a ref
+      // that `<` refuses at evaluation time on whichever page first reaches one.
+      return [["?t", "due", "?due"]];
     default:
       return [];
   }
 }
+
+/** The view clauses that must run AFTER the base ones — either because they read a
+ *  var those clauses bind, or because those clauses are what make `?t` a todo and
+ *  therefore what makes `?due` an instant. */
+const viewTail = (q: BoardQuery): unknown[][] =>
+  q.view === "overdue"
+    ? [
+        ["<", "?due", { "#utc": q.now.toISOString() }], // wall clock is not a fact
+        ["!=", "?status", "done"],
+      ]
+    : [];
 
 /**
  * The current board PAGE — a one-shot dry-run, so it always recomputes.

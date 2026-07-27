@@ -914,12 +914,20 @@ async function runBoard(body: unknown): Promise<{ rows: BoardRow[]; ms: number }
  * becoming a body against itself.
  *
  * `expected` is not always 2 any more, and that is the point of the pair.
- * `canonicalBody` emits NOTHING for a selection covering the whole domain — an
- * `or` over every branch cannot remove a row — so a board with every facet ticked
- * has no inlined clause to swap. The value-join is still added in that case,
+ * `canonicalBody` emits NOTHING for a selection covering the whole domain — a
+ * clause that cannot remove a row is not written at all — so a board with every
+ * facet ticked has nothing to swap. The value-join is still added in that case,
  * because the join is the shape being compared and the old body carried it
  * whatever was selected. `facetClauses` is imported from the app rather than
  * reimplemented, so this cannot disagree with it about what was emitted.
+ *
+ * What it swaps is a GROUP of clauses, not a clause: a single selected value is one
+ * fact clause and several are a fact clause plus a membership test, and the app
+ * hands both over as a `Narrowing` so this does not have to guess which loose
+ * clauses belonged together. The joins go on the END, where the shipped body
+ * carried them — the app's own narrowing clauses LEAD the body now, and putting a
+ * four-clause value-join in that position would be comparing against a shape
+ * nobody ever ran.
  */
 function joinedBody(
   f: Facets,
@@ -940,10 +948,10 @@ function joinedBody(
       ["?fs", "value", "?eff"],
     ],
   };
-  // exactly what the app put in the body, and the var each one narrows
-  const emitted = facetClauses(queryOf(f)) as unknown[][];
-  const varOf = (c: unknown[]) => (c[0] === "or" ? (c[1] as unknown[])[1] : c[1]) as string;
-  const swaps = new Map(emitted.map((c) => [JSON.stringify(c), joins[varOf(c)]!]));
+  // exactly what the app put in the body, group by group
+  const emitted = facetClauses(queryOf(f));
+  const leads = new Set(emitted.map((g) => JSON.stringify(g.clauses[0])));
+  const rest = new Set(emitted.flatMap((g) => g.clauses.slice(1).map((c) => JSON.stringify(c))));
 
   const body = canonicalBody(queryOf(f), window) as { where: unknown[] };
   // The session the join needs. `canonicalBody` no longer selects one — the filter
@@ -955,17 +963,14 @@ function joinedBody(
   ];
   let replaced = 0;
   for (const clause of body.where) {
-    const hit = swaps.get(JSON.stringify(clause));
-    if (hit) {
-      where.push(...hit);
-      replaced++;
-    } else where.push(clause);
+    const k = JSON.stringify(clause);
+    if (leads.has(k))
+      replaced++; // the group's first clause — the one being swapped
+    else if (!rest.has(k)) where.push(clause); // …and the rest of that same group
   }
-  // A facet the app no longer inlines still gets its join, so the comparison keeps
-  // its teeth on a fully-selected board.
-  for (const [v, join] of Object.entries(joins)) {
-    if (!emitted.some((c) => varOf(c) === v)) where.push(...join);
-  }
+  // Both joins, always, and at the END: a facet the app no longer narrows still
+  // gets one, so the comparison keeps its teeth on a fully-selected board.
+  for (const join of Object.values(joins)) where.push(...join);
   return { body: { ...body, where }, replaced, expected: emitted.length };
 }
 

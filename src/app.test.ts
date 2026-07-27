@@ -70,16 +70,42 @@ test("the board body executes NO subqueries — with a tag filter or without one
       `joins ${field}`,
     );
   }
-  // ascending prank is high→med→low; ?t breaks ties that ?title does not
+  // ascending prank is high→med→low, then title
   assert.deepEqual(body.orderBy, ["?prank", "?title"]);
 });
 
-test("the facet filters are INLINED literals, not value-joins", () => {
+test("an ordering key the FILTER has pinned to one value is dropped", () => {
+  // What an `orderBy` costs is its LEADING key. `prank` has three distinct values,
+  // so it cannot drive an index-ordered scan and the whole visible set is sorted
+  // instead: 47ms on the demo's unfiltered board, against 6ms for the same two keys
+  // written the other way round. When the priority selection pins a single value
+  // every matching row has the same prank, so ordering by it is a no-op — and
+  // dropping it leaves `?title`, which is near-unique, to lead. 184ms → 6ms for
+  // ?pr=med at 10,003 todos, the same 51 rows in the same order.
+  const pinned = canonicalBody({ ...PLAIN, priority: ["med"] }, null) as { orderBy: string[] };
+  assert.deepEqual(pinned.orderBy, ["?title"]);
+  // two values do not pin it, and neither does a selection covering the domain
+  const two = canonicalBody({ ...PLAIN, priority: ["med", "low"] }, null) as { orderBy: string[] };
+  assert.deepEqual(two.orderBy, ["?prank", "?title"]);
+  const all = canonicalBody({ ...PLAIN, priority: ["low", "med", "high"] }, null) as { orderBy: string[] };
+  assert.deepEqual(all.orderBy, ["?prank", "?title"]);
+});
+
+test("the facet filters are LEADING fact clauses, not value-joins and not trailing tests", () => {
   const q: BoardQuery = { ...PLAIN, status: ["todo", "doing"], priority: ["high"] };
   const where = whereOf(q);
-  // one selected value is a bare `=`; several are an `or` over `=`
-  assert.ok(where.some((c) => JSON.stringify(c) === '["=","?priority","high"]'));
-  assert.ok(where.some((c) => JSON.stringify(c) === '["or",["=","?eff","todo"],["=","?eff","doing"]]'));
+  // A single selected value is a LITERAL in the fact clause — an index seek.
+  // Several cannot be, so they bind a var of their own and test membership over it.
+  assert.deepEqual(where.slice(0, 3), [
+    ["?t", "effectiveStatus", "?effIn"],
+    ["contains", { "#set": ["todo", "doing"] }, "?effIn"],
+    ["?t", "priority", "high"],
+  ]);
+  // …and they come FIRST, which is the whole point. The engine does not reorder a
+  // `where`, so a clause that narrows only narrows if it is written where the read
+  // starts: 193ms → 27ms for ?st=blocked at 10,003 todos, returning the same 51
+  // rows in the same order. Everything true of every todo comes after them.
+  assert.ok(where.findIndex((c) => JSON.stringify(c) === '["?t","app","todo-app"]') > 2);
   // and NOTHING joins a session's `sf` children — there is no session left to join
   assert.equal(clauses(q).includes('"facet"'), false);
   assert.equal(clauses(q).includes('"sf"'), false);
@@ -99,7 +125,7 @@ test("a selection covering the whole domain emits NO clause", () => {
   assert.ok(clauses(PLAIN).includes('["?t","priority","?priority"]')); // the fact clause stays
   assert.ok(clauses(PLAIN).includes('["?t","effectiveStatus","?eff"]'));
   // and a PARTIAL selection is still inlined, on either facet independently
-  assert.ok(clauses({ ...PLAIN, status: ["todo"] }).includes('["=","?eff","todo"]'));
+  assert.ok(clauses({ ...PLAIN, status: ["todo"] }).includes('["?t","effectiveStatus","todo"]'));
   assert.equal(clauses({ ...PLAIN, status: ["todo"] }).includes('"?priority","low"'), false);
 });
 
@@ -135,9 +161,24 @@ test("the optional clause groups appear exactly when they are called for", () =>
   assert.equal(clauses({ ...PLAIN, view: "overdue" }).includes("exists"), false); // plain clauses
   assert.ok(clauses({ ...PLAIN, view: "overdue" }).includes('["<","?due",{"#utc":"2026-07-26T00:00:00.000Z"}]'));
   assert.equal(clauses(PLAIN).includes("?due"), false);
-  assert.ok(clauses({ ...PLAIN, view: "ready" }).includes('["=","?eff","todo"]'));
-  assert.ok(clauses({ ...PLAIN, view: "mine" }).includes('["=","?lastActor","Owner"]'));
-  assert.equal(clauses(PLAIN).includes('?lastActor","'), false); // `all` adds no view clause
+  assert.ok(clauses({ ...PLAIN, view: "ready" }).includes('["?t","effectiveStatus","todo"]'));
+  assert.ok(clauses({ ...PLAIN, view: "mine" }).includes('["?t","lastActor","Owner"]'));
+  assert.equal(clauses(PLAIN).includes('"Owner"'), false); // `all` adds no view clause
+  // `overdue` is the view that SPLITS, and both halves of the split are load-bearing.
+  // The join leads, because it narrows. Both expressions trail, because the clauses
+  // between them are what make `?t` a todo: "not done" reads `?status`, which those
+  // clauses bind, and the date comparison reads a `?due` that is only an INSTANT on
+  // a todo — a schema document declares a `due` property too, and `<` over that ref
+  // is `invalid argument type`. Both fail at evaluation time, so a body that hoists
+  // them works on page one and 400s on page four.
+  const od = whereOf({ ...PLAIN, view: "overdue" });
+  assert.deepEqual(od[0], ["?t", "due", "?due"]);
+  assert.deepEqual(od.slice(-2), [
+    ["<", "?due", { "#utc": "2026-07-26T00:00:00.000Z" }],
+    ["!=", "?status", "done"],
+  ]);
+  // and the clauses that make ?t a todo really are BETWEEN them
+  assert.ok(od.findIndex((c) => JSON.stringify(c) === '["?t","app","todo-app"]') < od.length - 2);
 });
 
 test("the blocker picker's search is bounded, viewer-scoped, and takes the term as a VALUE", () => {
@@ -218,8 +259,10 @@ test("a page window is limit/offset on the body, and asks for one row too many",
   const unpaged = canonicalBody(PLAIN, null) as Record<string, unknown>;
   assert.equal("limit" in unpaged, false);
   assert.equal("offset" in unpaged, false);
-  // offset paging is only meaningful over a TOTAL order; ?t is the tiebreaker
+  // an offset only means the same thing twice if the order does; a window and the
+  // unwindowed body it tiles must therefore order by exactly the same keys
   assert.deepEqual((windowed as { orderBy: string[] }).orderBy, ["?prank", "?title"]);
+  assert.deepEqual((unpaged as { orderBy: string[] }).orderBy, ["?prank", "?title"]);
 });
 
 // ---- the filter codec ------------------------------------------------------

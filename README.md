@@ -167,6 +167,34 @@ Highlights of the later stages:
     whole-workspace, and at 132ms it was most of the page. The render sends the rows
     and patches the numbers when they arrive over the stream that was already open.
     The pill reads `50 · …` for the moment in between.
+- **Clause order is the plan** (`src/board-query.ts`). Once the page was ~95ms the
+  next thing the instrumentation showed was that a FILTERED board cost far more than
+  an unfiltered one: `?st=blocked` was 249ms against 94ms, and 143 of the 154ms sat
+  in one read that returned the same 51 rows. Stardust evaluates a `where` in the
+  order it is written and does not reorder it, so the facet filters — expressions at
+  the END of the body, over vars the base clauses had bound — meant every read walked
+  the whole workspace in `prank` order and discarded rows. 124 of 9,947 todos are
+  blocked, so that walk was long. Writing `[?t effectiveStatus blocked]` FIRST costs
+  27ms instead of 193ms for byte-identical rows, and the same move is worth
+  something on every filter the board has, dense ones included: `?st=blocked&pr=high`
+  262 → 29ms, `?v=mine` 49 → 24ms, `?tag=design` 47 → 24ms, `?st=todo` (69% of the
+  corpus) 52 → 33ms, no filter unchanged at 54ms. End to end through the app,
+  `?st=blocked` is 242ms → 74ms.
+  A second finding rode along: what an `orderBy` costs is its LEADING key's
+  cardinality, not how many keys it has. `[?title ?prank]` is 6ms and `[?prank
+  ?title]` is 47ms on the same board — a three-value key cannot drive an
+  index-ordered scan. So when the filter pins one priority, `prank` is constant,
+  ordering by it is a no-op, and dropping it takes `?pr=med` from 184ms to 6ms with
+  the rows in exactly the same order.
+- **A ratio is a diagnosis** (`src/history.ts`). The detail page's activity feed was
+  44ms for 17 rows — one facts read plus one HTTP round trip PER ROW for the
+  transaction entities that carry the commit time and the actor, eighteen requests to
+  render the eight lines the pane shows. It reads the newest eight now and attributes
+  all of them in ONE dry-run over the transaction entities: 11ms, and the detail page
+  91ms → 60ms. Two engine details made that query work: the membership test has to be
+  an `or` of `[= ?tx {# N}]`, because `[contains {#set …} ?tx]` against a
+  subject-position var matches nothing at all, and `or` is a macro whose expansion is
+  capped around twelve branches.
 - **The filter is the URL** (`src/filter.ts`, `src/board-query.ts`). It used to be
   facts: an `sf` child per selected value on a per-browser `session` entity, with a
   `/s/<sid>` link naming it. It became a query string in two steps, and both are
