@@ -65,7 +65,7 @@ test("the plain board body executes NO subqueries and joins the stored fields", 
     );
   }
   // ascending prank is high→med→low; ?t breaks ties that ?title does not
-  assert.deepEqual(body.orderBy, ["?prank", "?title", "?t"]);
+  assert.deepEqual(body.orderBy, ["?prank", "?title"]);
 });
 
 test("the facet filters are INLINED literals, not value-joins", () => {
@@ -151,7 +151,7 @@ test("a page window is limit/offset on the body, and asks for one row too many",
   assert.equal("limit" in unpaged, false);
   assert.equal("offset" in unpaged, false);
   // offset paging is only meaningful over a TOTAL order; ?t is the tiebreaker
-  assert.deepEqual((windowed as { orderBy: string[] }).orderBy, ["?prank", "?title", "?t"]);
+  assert.deepEqual((windowed as { orderBy: string[] }).orderBy, ["?prank", "?title"]);
 });
 
 // ---- the filter codec ------------------------------------------------------

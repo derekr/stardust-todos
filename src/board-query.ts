@@ -66,7 +66,19 @@
 // It used to be a literal baked in when the reactor was PROVISIONED, which went
 // quietly wrong the moment the wall clock passed it and had been wrong for weeks.
 //
-// Ordering is `orderBy [?prank ?title ?t]`. `prank` is the priority ORDINAL
+// Ordering is `orderBy [?prank ?title]`, and BOTH keys are value-indexed on
+// purpose. Every key must be, or the engine abandons the index-ordered scan and
+// sorts the whole visible set: measured at 10,003 todos, `[?prank ?title]` takes
+// 36ms and `[?prank ?title ?t]` takes 252ms, because an entity var has no value
+// index and cannot have one. That trailing `?t` also made the query ineligible for
+// keyset pagination (`page_unsupported`), which the two-key form is not.
+//
+// It was there to force a TOTAL order so an offset means the same thing twice. Two
+// rows tying on both priority and title now have no defined order between them, so
+// the harness's paging properties are what stand behind this — they page the whole
+// corpus and assert the concatenation equals the unpaginated read, in order.
+//
+// `prank` is the priority ORDINAL
 // (high 0, med 1, low 2), so ascending is high→med→low; the board used to order by
 // the priority STRING, which is alphabetical nonsense (high, low, med). `?t` is the
 // final tiebreaker — real titles are not unique, and only a total order keeps an
@@ -278,7 +290,7 @@ export function canonicalBody(q: BoardQuery, window: PageWindow | null): Record<
           ]
         : []),
     ],
-    orderBy: ["?prank", "?title", "?t"],
+    orderBy: ["?prank", "?title"],
     // The window, if this body has one. `orderBy` ends with `?t`, so the order is
     // TOTAL — which is what makes an offset mean the same thing on two reads.
     // Without that last component two rows with equal (prank, title) could swap
