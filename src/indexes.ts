@@ -43,6 +43,13 @@ import { BASE } from "./stardust.ts";
  * Deliberately NOT indexed: fields only ever READ out of a matched row (`order`,
  * `danger`, `minRank`, `showWhenDenied`, `due`). Projection does not need a value
  * index, and each one would be write cost for nothing.
+ *
+ * `tags` is the interesting absence, because the board's tag filter DOES match on
+ * it. It matches it as a VAR (`[?t tags ?tags]`) and then tests membership with an
+ * expression, so the plain field path already covers it — nothing is ever looked up
+ * by the value of a whole list, and a value index over one would be an index of
+ * list identities. Verified on the demo rather than assumed: one page under a tag
+ * filter is ~270ms at 10,003 todos with no index on the field at all.
  */
 export const KEYED_FIELDS = [
   "kind",

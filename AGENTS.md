@@ -98,6 +98,21 @@ through a bound `exists`, so "subqueries don't invalidate" is the wrong lesson.
 The rule that has never missed is the first one: reason about what appears as a
 top-level clause. If liveness matters for a fact, put it there.
 
+That paragraph has since been TAKEN UP for tags, and the change is the clearest
+demonstration of it in the repo. A todo now carries its labels as a fact of its own
+(`tags ['design' 'launch']`, tags.ts) as well as as edges, because the board could
+not filter on the edges at all — and the side effect is exactly what the rule
+predicts. The detail pane subscribes to `GET /entities/{id}`, which is the todo's
+OWN facts; a tag edge is a different entity, so adding one used to be invisible
+there, and adding one now re-emits that subscription. Measured against the live
+demo with a subscription held open from a second shell: one snapshot on connect, a
+second the moment `addTag` committed, a third on `removeTag`, with nothing watching
+the bus. (The snapshot names the list by REF — `tags {# 27272}` — because an array
+component is stored as a nested list entity; only a find TUPLE resolves it to
+`['design' 'launch']`. See tags.ts.) The board's rows are still a dry-run and still
+push nothing — that is a separate decision, four paragraphs down — but the FACT is
+in a place a subscription can see it now, which it was not before.
+
 **And a query that is not a reactor pushes nothing at all, which is a liveness
 decision and not only a performance one.** The board's rows are a dry-run, so
 NOTHING about the filtered set is live; the app's only board subscription is
@@ -365,6 +380,42 @@ todos.ts): every app todo with a title, minus the ones carrying the field, 28ms 
 its ceiling are both per-ROW, so anything correlated has a corpus size at which it
 stops working rather than slowing down.
 
+**That output cap is a DIFFERENT ceiling from the 10,000-execution budget, and it
+is the one that shipped a bug.** The budget counts subquery EXECUTIONS across a
+whole query and is what retired `blocked`; this one counts ROWS out of ONE
+directive, and it does not care how many rows reached the clause. The board's tag
+filter — a correlated `exists` over the tag edges, the app's last subquery — died
+of it in production, on the public demo, measured through the app:
+
+| `?tag=` | status | time | rows |
+| --- | --- | --- | --- |
+| `design` | 200 | 82.7s | 50 |
+| `design,launch` | 200 | 77.7s | 50 |
+| `design,launch,api` | 200 | 60.4s | **0** |
+
+The third is not a timeout: at ~425 edges per label, three labels put 1,275 rows
+through one directive, the engine refused the query, and the app rendered the
+refusal as an empty board. So the ceiling moves with the TAG VOCABULARY's density,
+not with the corpus — a third of the size of the todo count would not have saved
+it, and neither would `limit`. Two lessons worth separating: a subquery has two
+independent ceilings, and a filter that comes back EMPTY and fast is the failure
+mode to look for first, because it looks exactly like a correct answer. Tags are a
+component on the todo now (tags.ts) and the board runs no subquery at all: 84ms for
+one label at ten thousand todos, and flat in the number of labels.
+
+**`or` is not a disjunction of PATTERNS, and getting that wrong is silent.** The
+obvious way to filter on several labels once each todo carries them as fields is
+`["or", ["?t", "tag/design", true], ["?t", "tag/launch", true]]`. Stardust accepts
+it and it matches EVERYTHING: 9,948 rows of 9,948, the same as no clause at all,
+and the same for a single-branch `or`. A fact pattern inside an expression is a
+three-element list, a list is truthy, so the clause is a constant `true`. Stardust
+has no or-join; `or` is an expression over values that are already BOUND (which is
+what `visibleTo` uses it for), and the engine's own answer for "is this row's value
+one of these" is `[contains {#set [...]} ?v]` — see the pokemon tutorial, which says
+so outright. This is the same shape as the omitted-bind hazard above: not an error,
+not a subset, a SUPERSET. Assert a row count against a query you have just
+rewritten, every time.
+
 Also measured while establishing this: the plain board at 2,000 unindexed todos
 allocates about 400MB of transient heap per read, and at 10,000 it peaks around
 2.1GB and takes ~180s. Stardust is Go and treats allocation failure as fatal
@@ -452,10 +503,35 @@ worth reading before you re-litigate one:
   no fixed domain and were therefore the one filter deliberately kept out of the
   body, no longer have a session to correlate to: they are inlined like everything
   else, checked against `availableTags` — the workspace's actual tag vocabulary,
-  which is a real domain and which the render already reads. The clause stays a
-  correlated `exists` for a different reason: a plain join returns a todo carrying
-  two selected labels twice, and the harness caught exactly that. It is also the one
-  clause in the body with a ceiling of its own, and the slowest thing on the page.
+  which is a real domain and which the render already reads — and checked again by
+  `tagLabel` on the way into the body.
+- Tags: EDGE ENTITIES vs a COMPONENT on the todo — BOTH, and this entry used to end
+  by calling the tag clause "the slowest thing on the page". That was wrong twice
+  over. It was not slow, it was BROKEN (82.7s for one label, a REFUSAL for three,
+  rendered as an empty board — see the output-cap entry above), and a correlated
+  `exists` was never going to be the fix. A todo now carries its labels as a `tags`
+  list component as well, written by the same transaction as the edge, and the board
+  matches the component: `[?t tags ?tags]` plus `[any [fn [l] [contains {#set […]}
+  l]] ?tags]`. One page went 104,475ms to 84ms at ten thousand todos, flat in the
+  number of labels, returning exactly the rows the `exists` returned where the
+  `exists` could still run (420 for one label, 841 for two, identical and in order).
+
+  Why BOTH, and not one. The EDGE stays because it is the vocabulary
+  `availableTags` groups over and what the detail page reads, and because it keeps a
+  label a piece of data. The COMPONENT is what a filter can use: matching the edge is
+  a join that returns a todo carrying two selected labels TWICE, and de-duplicating
+  that is a subquery, which is where the ceiling came from. A LIST rather than a
+  field per label (`tag/design true`) for the reason in the `or` entry above — one
+  field per label is right for one label and cannot express two, and the version
+  that looks like it can silently matches everything.
+
+  What it gives up is what `blocked` gave up: an invariant that used to be the
+  query's is now write discipline plus a check. `addTag`/`removeTag` write both
+  halves in one transaction, `reconcileTags()` reports every todo where the two
+  disagree, `migrateTagComponents()` writes what it reports (and runs at boot), and
+  the harness drives the sequence a denormalised set gets wrong — add, add again, add
+  a second, remove one, remove the last, and delete a tagged todo, whose edges
+  OUTLIVE it, which is why the guard requires the todo to still have a title.
   Also gone with the sessions: the `Session` and `SessionFacet` schemas, and the
   generated `facet`/`value` validators that existed only because the atomic facet
   write bypassed the schema route it was declared for.

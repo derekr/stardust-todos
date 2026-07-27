@@ -19,6 +19,7 @@ import {
   toggled,
 } from "./filter.ts";
 import { validators } from "./field-registry.ts";
+import { TAG_LABEL_MAX, TagLabelError, canonicalTags, tagClauses, tagLabel } from "./tags.ts";
 import { validationPlan } from "./typed-query.ts";
 
 test("visibleTo builds the published-OR-mine predicate (bound scalars + expression or)", () => {
@@ -53,11 +54,15 @@ const PLAIN: BoardQuery = {
 const whereOf = (q: BoardQuery) => (canonicalBody(q, null) as { where: unknown[] }).where;
 const clauses = (q: BoardQuery) => JSON.stringify(whereOf(q));
 
-test("the plain board body executes NO subqueries and joins the stored fields", () => {
+test("the board body executes NO subqueries — with a tag filter or without one", () => {
   const body = canonicalBody(PLAIN, null) as { where: unknown[]; orderBy: string[] };
   const json = JSON.stringify(body.where);
   assert.equal(json.includes("exists"), false); // the whole point of phase 2
   assert.equal(json.includes("cond"), false);
+  // The tag clause was the last one left, and it was the one that hard-failed: a
+  // subquery's OUTPUT is capped at 1,000 rows per directive, so three labels was a
+  // refusal the app rendered as an empty board.
+  assert.equal(clauses({ ...PLAIN, tags: ["alpha", "beta"] }).includes("exists"), false);
   for (const field of ["blocked", "effectiveStatus", "prank"]) {
     assert.ok(
       body.where.some((c) => Array.isArray(c) && c[0] === "?t" && c[1] === field),
@@ -114,8 +119,8 @@ test("the optional clause groups appear exactly when they are called for", () =>
   // Only the branch that applies is emitted at all: `view` is a compile-time value
   // now, where it used to be a var joined off the session and tested by an `or`
   // over four branches.
-  assert.ok(clauses({ ...PLAIN, tags: ["alpha"] }).includes("exists"));
-  assert.ok(clauses({ ...PLAIN, tags: ["alpha"] }).includes('["=","?l","alpha"]'));
+  assert.ok(clauses({ ...PLAIN, tags: ["alpha"] }).includes('["?t","tags","?tags"]'));
+  assert.ok(clauses({ ...PLAIN, tags: ["alpha"] }).includes('{"#set":["alpha"]}'));
   assert.equal(clauses({ ...PLAIN, view: "overdue" }).includes("exists"), false); // plain clauses
   assert.ok(clauses({ ...PLAIN, view: "overdue" }).includes('["<","?due",{"#utc":"2026-07-26T00:00:00.000Z"}]'));
   assert.equal(clauses(PLAIN).includes("?due"), false);
@@ -144,6 +149,36 @@ test("the blocker picker's search is bounded, viewer-scoped, and takes the term 
   assert.ok(json.includes('["=","?author",{"#":7}]'));
   assert.ok(json.includes('["?t","workspace",{"#":12}]'));
   assert.equal(json.includes("?viewer"), false); // nothing left to forget to bind
+});
+
+test("the tag filter is a membership test over the row's OWN labels, not a subquery", () => {
+  // Two clauses whatever the number of labels: bind the todo's list, then test it.
+  // The list binds ONCE per row, which is what keeps a todo carrying two selected
+  // labels from coming back twice — the duplicate that made this an `exists`.
+  assert.deepEqual(tagClauses(["beta", "alpha"]), [
+    ["?t", "tags", "?tags"],
+    ["any", ["fn", ["l"], ["contains", { "#set": ["alpha", "beta"] }, "l"]], "?tags"],
+  ]);
+  // one label and five labels are the same two clauses — the ceiling that broke at
+  // three labels was the subquery's, and there is no subquery left to have one
+  const five = tagClauses(["e", "d", "c", "b", "a"]);
+  assert.equal(five.length, 2);
+  assert.deepEqual((five[1] as unknown[])[1], ["fn", ["l"], ["contains", { "#set": ["a", "b", "c", "d", "e"] }, "l"]]);
+});
+
+test("a tag label is checked in ONE place, on the way in and on the way out", () => {
+  assert.equal(tagLabel("  design "), "design"); // trimmed
+  assert.equal(tagLabel("o'brien & sons"), "o'brien & sons"); // a VALUE, not a field name
+  assert.throws(() => tagLabel("   "), TagLabelError);
+  assert.throws(() => tagLabel("x".repeat(TAG_LABEL_MAX + 1)), TagLabelError);
+  // the comma is the one that is not hygiene: the filter URL joins labels with it,
+  // so a label containing one could never survive its own share link
+  assert.throws(() => tagLabel("design,launch"), TagLabelError);
+  assert.throws(() => tagLabel("two\nlines"), TagLabelError);
+  // canonical order + dedupe, so rewriting an unchanged set is `unchanged` at the
+  // engine rather than a new fact
+  assert.deepEqual(canonicalTags(["launch", "design", "launch"]), ["design", "launch"]);
+  assert.throws(() => tagClauses(["ok", "bad,label"]), TagLabelError);
 });
 
 test("boardQuery carries the scope and the filter, tag labels included", () => {

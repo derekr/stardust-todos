@@ -36,7 +36,7 @@ interface XraySpec {
 const XRAY: Record<string, XraySpec> = {
   board: {
     title: "The board — the filter is the URL, compiled into the query",
-    mech: 'Your filter is the QUERY STRING you are looking at — `?st=todo&v=ready&p=2` — and every read compiles it into the body as LITERALS: `[or [= ?eff todo] [= ?eff doing]]`. It used to be facts on a per-browser `session` entity, joined into the body by matching `sf` children against every candidate row. Two things moved, in that order. First the join became an inline, which is worth 41x: measured on 5,000 todos with value indexes on, one page of fifty, the value-join costs 2,303ms and the inlined form 56ms — faster than no filter at all, because a literal NARROWS the candidate set while a join adds work proportional to it. Then the facts themselves went, because by that point nothing was EVALUATING them: they were being read back and compiled in, which is what a query string does for free. They were not free — ~129 facts per session and ~46 per filter click on an append-only store, and this demo held 24,389 facts for twelve todos — and they were not buying reactivity either, since the live subscription has no `sf` clause and a filter write re-emitted nothing at all. What the URL buys on top: back and forward work, the link is shareable, and two people opening it get two independent views rather than one shared mutable session they overwrite each other in. What it costs: the filter is INPUT now, so every value is checked against its domain before it can become query — `archived` is refused, and a TAG (free text, no fixed domain) is checked against the labels this workspace actually uses. The rest of the body is unchanged: it derives nothing per row (blocked/effectiveStatus/prank are stored facts the write paths recorded, JOINED here) and returns ONE PAGE — `limit 51`, fifty shown and a fifty-first read only to know whether a next page exists, which is why the pill says "50+". `limit` is a POST-FILTER, measured at 2,000 unindexed todos as 7.6s unlimited and 7.5s with `limit 50`, and a bare count over the same `where` costs the same — so paging bounds the response and the render, not the query. Narrowing the filter is what bounds the query. Liveness is a different reactor: `page-rows` subscribes to the fifty rows on screen.',
+    mech: "Your filter is the QUERY STRING you are looking at — `?st=todo&v=ready&p=2` — and every read compiles it into the body as LITERALS: `[or [= ?eff todo] [= ?eff doing]]`. It used to be facts on a per-browser `session` entity, joined into the body by matching `sf` children against every candidate row. Two things moved, in that order. First the join became an inline, which is worth 41x: measured on 5,000 todos with value indexes on, one page of fifty, the value-join costs 2,303ms and the inlined form 56ms — faster than no filter at all, because a literal NARROWS the candidate set while a join adds work proportional to it. Then the facts themselves went, because by that point nothing was EVALUATING them: they were being read back and compiled in, which is what a query string does for free. They were not free — ~129 facts per session and ~46 per filter click on an append-only store, and this demo held 24,389 facts for twelve todos — and they were not buying reactivity either, since the live subscription has no `sf` clause and a filter write re-emitted nothing at all. What the URL buys on top: back and forward work, the link is shareable, and two people opening it get two independent views rather than one shared mutable session they overwrite each other in. What it costs: the filter is INPUT now, so every value is checked against its domain before it can become query — `archived` is refused, and a TAG (free text, no fixed domain) is checked against the labels this workspace actually uses. The TAG chips are the newest part of this and the one that was actually broken: the filter used to be a correlated `exists` over the tag EDGE entities, and a subquery's output is capped at 1,000 rows per directive — so one label took 82.7s, and three labels put 1,275 edges through that directive, were REFUSED, and the app rendered the refusal as an empty board. A todo carries its labels as a fact of its own now (`tags ['design' 'launch']`, written by the same transaction as the edge), so the filter is two ordinary clauses: bind the list, test membership. 84ms at ten thousand todos, flat in the number of labels, and each todo comes back once however many of the selected labels it carries — which is the duplicate that made it a subquery in the first place. The rest of the body is unchanged: it derives nothing per row (blocked/effectiveStatus/prank are stored facts the write paths recorded, JOINED here) and returns ONE PAGE — `limit 51`, fifty shown and a fifty-first read only to know whether a next page exists, which is why the pill says \"50+\". `limit` is a POST-FILTER, measured at 2,000 unindexed todos as 7.6s unlimited and 7.5s with `limit 50`, and a bare count over the same `where` costs the same — so paging bounds the response and the render, not the query. Narrowing the filter is what bounds the query. Liveness is a different reactor: `page-rows` subscribes to the fifty rows on screen.",
     code: `// Built per read, from the URL. The facet filters are LITERALS —
 // this is what a value-join off a session entity used to be:
 {
@@ -55,6 +55,14 @@ const XRAY: Record<string, XraySpec> = {
     ["=", "?priority", "high"],                        // was 4 clauses
     ["or", ["=", "?eff", "todo"], ["=", "?eff", "doing"]],  // was 4 clauses
     ["=", "?eff", "todo"],                 // ?v=ready, chosen at compile time
+
+    // ?tag=design,launch — the todo's OWN labels, bound once per row,
+    // then a membership test. This was a correlated exists over the
+    // tag EDGES, which REFUSED at three labels (subquery output is
+    // capped at 1,000 rows per directive) — 104,475ms -> 84ms:
+    ["?t", "tags", "?tags"],
+    ["any", ["fn", ["l"],
+             ["contains", {"#set": ["design", "launch"]}, "l"]], "?tags"],
   ],
   orderBy: ["?prank", "?title", "?t"],   // high→med→low, then a total order
   limit: 51, offset: 100,                // ?p=2 — 50 shown, 1 read-ahead
@@ -71,8 +79,16 @@ const XRAY: Record<string, XraySpec> = {
 // tag labels have no fixed domain, so the check is the workspace's
 // own tag vocabulary — the same list these chips are drawn from.
 
+// the label is stored twice, by ONE transaction: the tag EDGE (the
+// vocabulary these chips are grouped from) and the todo's own list.
+await transact({
+  "#_e": { kind: "tag", todo: {"#": todoId}, label: "design" },
+  [todoId]: { tags: ["design", "launch"] },
+});
+await reconcileTags()   // [] means the two still agree
+
 // read it:  await readSnapshot(boardQuery(scope, filter), page)`,
-    src: "src/filter.ts · decodeFilter() · src/board-query.ts · canonicalBody() + readSnapshot()",
+    src: "src/filter.ts · decodeFilter() · src/board-query.ts · canonicalBody() + readSnapshot() · src/tags.ts · tagClauses() + reconcileTags()",
     reactors: [{ name: "page-rows", bind: "{ps {# 1519}}" }],
   },
   counts: {

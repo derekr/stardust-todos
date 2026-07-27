@@ -28,6 +28,14 @@
 // paginates cleanly, and `{#viewer}` is injected server-side, so hidden rows
 // never cross the wire. Every todo must carry draft+author for the binding
 // clauses to match (addTodo sets them; migrateVisibilityFields backfills).
+//
+// "The one shape `or` supports" is exact, and the tag filter is what proved it. An
+// `or` whose branches are FACT PATTERNS — `[or [?t tag/design true] [?t tag/launch
+// true]]` — is not rejected and is not a disjunction: a pattern is a three-element
+// list, a list is truthy, so the clause is a constant `true` and the query returns
+// every row it would have returned with no clause at all (9,948 of 9,948, measured).
+// Stardust has no or-join over patterns at all; a membership test over one bound
+// value is the shape to reach for, which is what tags.ts does with `contains`.
 // ---------------------------------------------------------------------------
 export function visibleTo(viewer: number | string): unknown[][] {
   // A persona id pins the viewer into the query (dry-runs); a "?var" leaves it to

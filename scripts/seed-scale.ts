@@ -167,6 +167,12 @@ async function main() {
         effectiveStatus: s.effectiveStatus,
         prank: PRANK[s.priority],
       };
+      // The tag component, written WITH the row for the same reason the derived
+      // fields are: the board's tag filter matches `tags`, and a row that never
+      // carried the field is not a row that filters oddly, it is one the filter
+      // cannot see. The tag EDGES below say the same thing a second way, and
+      // `reconcileTags` is what holds the two together.
+      if (s.tags.length) t.tags = [...new Set(s.tags)].sort();
       if (s.due !== null) t.due = { "#utc": new Date(s.due).toISOString() };
       return t;
     },

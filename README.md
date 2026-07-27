@@ -127,7 +127,9 @@ Highlights of the later stages:
 
 - **Rich fields nobody planned up front** (`src/features.ts`). Tags and
   dependencies are **edge entities** (like `grant`), so membership and graph
-  questions are plain datalog joins rather than array gymnastics. Due dates are
+  questions are plain datalog joins rather than array gymnastics — with one
+  exception the entry below explains, because "membership as a join" is exactly
+  what the board's tag filter could not afford. Due dates are
   Stardust instants, queried with a field predicate (`[< ?due {#utc now}]`) in
   the board's `overdue` clauses.
 - **Derived state, no worker** (`src/board-query.ts`, `src/derive.ts`, `src/todos.ts`).
@@ -168,8 +170,21 @@ Highlights of the later stages:
   INPUT now, so every value is checked against its domain and an unknown one is a
   400 rather than a dropped clause — dropping widens the board, which is the failure
   you do not notice. Tag labels have no fixed domain, so they are checked against the
-  workspace's actual tag vocabulary; the clause stays a correlated `exists` because a
-  plain join returns a todo with two matching labels twice.
+  workspace's actual tag vocabulary instead.
+- **Tags are stored twice, on purpose** (`src/tags.ts`, `src/features.ts`). A tag is
+  still an edge ENTITY — that is the vocabulary the chips are grouped from — and the
+  todo now also carries its labels as a list component of its own, written by the
+  same transaction as the edge. The board filters on the component, and the reason is
+  not speed but a hard failure: filtering on the edges meant a correlated `exists`,
+  and a subquery's OUTPUT is capped at 1,000 rows per directive, so on the 10,003-todo
+  demo `?tag=design` took 82.7s, `?tag=design,launch` 77.7s, and `?tag=design,launch,api`
+  was refused outright and rendered as an empty board — the worst kind of wrong,
+  because a filter matching nothing looks like an answer. Two plain clauses replaced
+  it (bind the todo's list, then `[contains {#set […]} …]` over it): 84ms at ten
+  thousand todos, flat in the number of labels, each todo returned once however many
+  selected labels it carries. What it gives up is the same trade `blocked` made —
+  the invariant is now write discipline plus `reconcileTags()`, which asks both
+  questions plainly and reports every todo where the two disagree.
 
 - **The blocker picker searches, through a second index on the same field**
   (`src/board.ts`, `src/indexes.ts`). "Add blocker" used to offer every visible
@@ -215,7 +230,8 @@ Highlights of the later stages:
 - `src/tenancy.ts`       — users, personas, workspaces, grants; per-workspace reactors.
 - `src/workspace.ts`     — `WorkspaceCtx` capability, `openWorkspace` (access gate), default tenant.
 - `src/todos.ts`         — workspace-scoped schema (evolved 3×) + commands + projected reads.
-- `src/features.ts`      — tags & dependencies (edge entities).
+- `src/features.ts`      — tags & dependencies (edge entities); a tag write records both halves.
+- `src/tags.ts`          — the tag component the board filters on, its label rule, its backfill and its reconciliation guard.
 - `src/derive.ts`        — the correlated `exists` fragments (blocked, visibility).
 - `src/filter.ts`        — the Filter ⇄ query-string codec, and the domains every value is checked against.
 - `src/board-query.ts`   — compiles one filter and one page into the board's body; runs it as a dry-run.

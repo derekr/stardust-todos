@@ -97,6 +97,10 @@ export async function seed(base: string, n: number, batchSize = 5000, log = cons
         effectiveStatus: effectiveStatus(k),
         prank: prank(k),
       };
+      // Same argument for the tag component: the board filters on `tags`, the tag
+      // EDGES written below are the other half of the same fact, and the harness
+      // asserts they agree (`reconcileTags`).
+      if (r.tags.length) t.tags = [...r.tags].sort();
       if (r.due !== null) t.due = { "#utc": new Date(r.due).toISOString() };
       return t;
     },

@@ -45,6 +45,7 @@ import { lookupRef } from "./registry.ts";
 import { createPersona, createWorkspace, ensureUser, grantAccess, listPersonas, roleOf } from "./tenancy.ts";
 import { authorizeCommand, ensureCommandCatalog, visibleCommands } from "./commands.ts";
 import { addDependency, removeDependency, tagsOf } from "./features.ts";
+import { migrateTagComponents } from "./tags.ts";
 import {
   SEARCH_LIMIT,
   aggregateCounts,
@@ -167,6 +168,12 @@ await migrateVisibilityFields(ctx.personaId); // give legacy todos author + draf
 // it computes the answer and writes only the rows that differ, so a second boot
 // writes nothing.
 await migrateDerivedFields();
+// The tag component the board's filter matches on. Todos whose tag EDGES predate it
+// carry none, and a row that has never been written a field a clause names is
+// skipped in silence — which for a tag filter means a todo that simply stops being
+// findable by its own label. Idempotent the same way: it writes exactly what
+// `reconcileTags` reports diverging, so a second boot writes nothing.
+await migrateTagComponents();
 const OWNER_PERSONA = ctx.personaId;
 const demoUser = await ensureUser("default@local");
 if (!(await listPersonas(demoUser)).some((p) => p.name === "Teammate")) {

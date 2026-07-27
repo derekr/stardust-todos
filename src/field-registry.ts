@@ -33,6 +33,7 @@ interface DeclaredFields {
   email: string; // user login identity
   user: Ref; // persona → user
   label: string; // tag label
+  tags: string[]; // a todo's labels, as a list component — the board's tag filter
   todo: Ref; // edge → todo
   pgset: Ref; // page slot → the page-set it belongs to
   slot: number; // the slot's position in the page
@@ -69,6 +70,11 @@ export const validators: Record<string, (v: unknown) => boolean> = {
   email: (v) => typeof v === "string",
   user: isRef,
   label: (v) => typeof v === "string",
+  // The tag component is written by a multi-entity `transact` (the edge and the
+  // consequence in one transaction), so it cannot go through the Todo schema's
+  // write boundary — same position `refreshDerived` is in. This is the check that
+  // stands in for it.
+  tags: (v) => Array.isArray(v) && v.every((x) => typeof x === "string"),
   todo: isRef,
   pgset: isRef,
   slot: (v) => typeof v === "number",

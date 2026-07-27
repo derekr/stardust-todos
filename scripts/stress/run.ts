@@ -12,6 +12,9 @@
 //   3. oracle     — does the board agree with the SPEC, row for row?
 //   4. derivation — do the STORED derived fields agree with the plain query?
 //   5. write paths — do they still agree after an adversarial write sequence?
+//   5b. tags      — the same question for the OTHER thing stored twice: does a
+//                   todo's `tags` component still equal its tag edges after every
+//                   add, every remove, and a delete that outlives its edges?
 //   6. the clock  — does `overdue` answer for NOW, or for a literal frozen into the
 //                   reactor when it was provisioned? (It was the latter, for weeks.)
 //   7. paging     — do the WINDOWS of a body tile the body? The board returns one
@@ -22,9 +25,11 @@
 //                   That is the change this section exists to hold down, and it is
 //                   asked against the engine rather than against the oracle, so a
 //                   spec and an implementation being wrong together cannot hide it.
-// Plus timings, because a query that is right at 10k and unusable at 1M is a bug —
-// including the tag body, which is the one that still runs a subquery and so is the
-// one that still has a ceiling.
+// Plus timings, because a query that is right at 10k and unusable at 1M is a bug.
+// The tag body used to be the exception on that list — the last correlated subquery,
+// and the only clause with a ceiling of its own. It has neither now, and sections 3
+// and 5b are what keep the replacement honest: the same rows, and the two places a
+// label is stored still agreeing after every write.
 //
 // One harness rule learned the hard way: the unfiltered board at a million rows is
 // a ~200MB response, so it is measured, never parsed. (The other one — a FRESH
@@ -56,10 +61,21 @@ import {
 } from "../../src/board-query.ts";
 import { BASE as APP_BASE, readEntity } from "../../src/stardust.ts";
 import { addTodo, reconcileBlocked, removeTodo, setDone, setStatus, toggleTodo } from "../../src/todos.ts";
-import { addDependency, removeDependency } from "../../src/features.ts";
+import { addDependency, addTag, removeDependency, removeTag, tagsOf } from "../../src/features.ts";
+import { reconcileTags } from "../../src/tags.ts";
 import { createPersona, createWorkspace, ensureUser } from "../../src/tenancy.ts";
-import { openWorkspace } from "../../src/workspace.ts";
-import { PRIORITY, STATUS, type Facets, blocked, effectiveStatus, expectedCount, expectedSet, prank } from "./model.ts";
+import { type WorkspaceCtx, openWorkspace } from "../../src/workspace.ts";
+import {
+  PRIORITY,
+  STATUS,
+  type Facets,
+  blocked,
+  effectiveStatus,
+  expectedCount,
+  expectedSet,
+  prank,
+  row as model,
+} from "./model.ts";
 import { seed, session } from "./seed.ts";
 
 const BASE = process.env.STARDUST_URL ?? "http://127.0.0.1:3095";
@@ -156,6 +172,19 @@ async function main() {
   // clause a row has never been written skips that row in silence. A todo missing
   // `prank` does not sort oddly — it disappears.
   ok("every todo has all twelve board facts", complete === N, `${complete.toLocaleString()} / ${N.toLocaleString()}`);
+  // The tag COMPONENT is the thirteenth, and it is optional by design — only the
+  // todos the model gives labels to carry one. Counted separately for that reason,
+  // and against the model rather than against N: a todo whose labels never reached
+  // the component is not a todo that filters oddly, it is one the tag filter cannot
+  // see at all.
+  const withTags = await count(`find[[count ?t]] where[[?t app todo-app] [?t workspace ${ws}] [?t tags ?tags]]`);
+  let modelTagged = 0;
+  for (let k = 0; k < N; k++) if (model(k).tags.length) modelTagged++;
+  ok(
+    "every todo the model tags carries the tag component",
+    withTags === modelTagged,
+    `${withTags.toLocaleString()} / ${modelTagged.toLocaleString()}`,
+  );
 
   // ---- 2. invariants -----------------------------------------------------
   console.log("\n\x1b[1minvariants\x1b[0m");
@@ -210,6 +239,17 @@ async function main() {
     ["view=mine", { ...full, priority: ["high"], status: STATUS, view: "mine" } as Facets],
     ["viewer=member (drafts)", { ...hi, viewerIsOwner: false } as Facets],
     ["tagActive alpha", { ...full, priority: ["high"], status: STATUS, tagActive: true, tags: ["alpha"] } as Facets],
+    // Two labels and three, because the number of labels is exactly what the old
+    // subquery could not survive: its OUTPUT was capped at 1,000 rows per
+    // directive, so two labels passed, three refused, and the app rendered the
+    // refusal as an empty board. The membership test that replaced it is one
+    // expression over a set literal, so these three cases are the same query with a
+    // bigger set — and the union property below says so directly.
+    ["tagActive alpha,beta", { ...full, tagActive: true, tags: ["alpha", "beta"] } as Facets],
+    [
+      "tagActive alpha,beta,gamma (one unused)",
+      { ...full, tagActive: true, tags: ["alpha", "beta", "gamma"] } as Facets,
+    ],
   ] as const) {
     const got = await board(f);
     if (!got) {
@@ -357,6 +397,76 @@ async function main() {
     await run();
     ok(label, ...(await derivedHolds(ctx.workspaceId, touched, ordinal)));
   }
+
+  // ---- 5b. the SAME kind of invariant for tags ----------------------------
+  //
+  // A todo's labels are stored twice now — as `tag` edge entities and as a `tags`
+  // list component on the todo — because the board can filter on the component and
+  // could not filter on the edges (a correlated `exists` whose output is capped at
+  // 1,000 rows per directive: 82.7s for one label and a REFUSAL for three, rendered
+  // as an empty board). That buys a filter that works and gives up an invariant, so
+  // it gets the same treatment `blocked` got: every step below is a real app
+  // command, and after each one the two representations are compared — by the app's
+  // own guard AND by reading the component back.
+  //
+  // The last step is the one that is easy to get wrong in the guard rather than in
+  // the write path: deleting a todo leaves its tag edges behind, pointing at a dead
+  // id, and a reconciliation that does not require the todo to still exist reports
+  // that as a missing component forever.
+  console.log("\n\x1b[1mtag writes (the component must equal the edges)\x1b[0m");
+  const T1 = await addTodo(ctx, "tag subject one", "high", {}, "Owner");
+  const T2 = await addTodo(ctx, "tag subject two", "med", {}, "Owner");
+  const tagSteps: [string, () => Promise<unknown>, number[]][] = [
+    ["add alpha", () => addTag(ctx, T1, "alpha"), [T1]],
+    ["add alpha again (idempotent)", () => addTag(ctx, T1, "alpha"), [T1]],
+    ["add beta beside it", () => addTag(ctx, T1, "beta"), [T1]],
+    ["a second todo takes alpha", () => addTag(ctx, T2, "alpha"), [T1, T2]],
+    ["remove alpha from the first", () => removeTag(ctx, T1, "alpha"), [T1, T2]],
+    ["remove a label it does not have", () => removeTag(ctx, T1, "alpha"), [T1, T2]],
+    ["remove its last label", () => removeTag(ctx, T1, "beta"), [T1, T2]],
+    ["DELETE a tagged todo (edges outlive it)", () => removeTodo(ctx, T2), [T1]],
+  ];
+  for (const [label, run, live] of tagSteps) {
+    await run();
+    ok(label, ...(await tagsHold(ctx, ctx.workspaceId, live)));
+  }
+  // And the board itself, in that workspace: the filter finds the row by its label,
+  // once, and stops finding it when the label is removed.
+  const tagBoard = async (labels: string[]) =>
+    (
+      await runBoard(
+        canonicalBody(
+          {
+            workspace: ctx.workspaceId,
+            viewer: persona,
+            actor: "Owner",
+            status: [],
+            priority: [],
+            tags: labels,
+            view: "all",
+            now: new Date(NOW),
+          },
+          null,
+        ),
+      )
+    )?.rows ?? [];
+  await addTag(ctx, T1, "alpha");
+  await addTag(ctx, T1, "beta");
+  const twoLabels = await tagBoard(["alpha", "beta"]);
+  ok(
+    "a todo carrying BOTH selected labels appears exactly once",
+    twoLabels.filter((r) => r.id === T1).length === 1,
+    `${twoLabels.length} row(s) for two labels`,
+  );
+  await removeTag(ctx, T1, "alpha");
+  const gone = await tagBoard(["alpha"]);
+  ok("removing the label removes it from that filtered board", !gone.some((r) => r.id === T1), `${gone.length} row(s)`);
+  const still = await tagBoard(["beta"]);
+  ok(
+    "...and leaves it on the board for the label it kept",
+    still.some((r) => r.id === T1),
+    `${still.length} row(s)`,
+  );
 
   // ---- 6. `overdue` against the real clock --------------------------------
   //
@@ -535,13 +645,18 @@ async function main() {
   const narrowPerf = await raw(hi);
   console.log(`  narrow slice       ${String(narrowPerf.ms).padStart(6)}ms   ${size(narrowPerf, 1024, "KB")}`);
 
-  // The tag body is the one that still runs a correlated `exists`, so it still has a
-  // ceiling: roughly "however many rows reach the clause", which is why it is placed
-  // last. Measured, not asserted — this is where the remaining limit IS, and it
-  // moves with the corpus.
+  // The tag body used to be the one that still ran a correlated `exists`, and so the
+  // one with a ceiling of its own — one label cost 104,475ms at ten thousand todos
+  // and three labels were REFUSED (`where subquery row/output limit exceeded (per
+  // directive max 1000)`). It is a membership test over the todo's own `tags` list
+  // now: 84ms, and flat in the number of labels, because more labels is a bigger set
+  // literal rather than more subquery executions. The row counts travel with the
+  // timings on purpose — a filter matching nothing is the fastest line here.
   for (const [label, f] of [
     ["tag + narrow facets", { ...full, priority: ["high"], tagActive: true, tags: ["alpha"] } as Facets],
     ["tag + every facet", { ...full, tagActive: true, tags: ["alpha"] } as Facets],
+    ["two labels", { ...full, tagActive: true, tags: ["alpha", "beta"] } as Facets],
+    ["a label nothing carries", { ...full, tagActive: true, tags: ["gamma"] } as Facets],
   ] as const) {
     const got = await board(f);
     console.log(
@@ -681,6 +796,54 @@ async function derivedHolds(
   }
   const shipped = await reconcileBlocked(ws);
   if (shipped.length) problems.push(`reconcileBlocked reported ${shipped.length} divergence(s)`);
+  return [problems.length === 0, problems.slice(0, 3).join(" · ")];
+}
+
+/**
+ * Do a todo's `tags` COMPONENT and its tag EDGES still say the same thing?
+ *
+ * The tag half of `derivedHolds`, and deliberately asked twice: `reconcileTags` is
+ * the guard that ships and gets to answer for the whole workspace, and then the
+ * component is read back per touched todo and compared against the edges directly,
+ * so a guard and a write path that are wrong in the same way cannot agree their way
+ * past this.
+ */
+async function tagsHold(ctx: WorkspaceCtx, ws: number, live: number[]): Promise<[boolean, string]> {
+  const problems: string[] = [];
+  // The component is read with a bare `find` TUPLE, which is the only shape that
+  // hands back the list itself. `then.project` and `GET /entities/{id}` both give a
+  // REF to the list entity instead (`{"#": 92}`) — an array component is stored as
+  // one, and only find-tuple output resolves it. Reading it the other way is how
+  // this check first "passed" against a value that was never an array.
+  const stored = new Map<number, string[]>(
+    (
+      await dry<[number, string[]]>({
+        find: ["?t", "?tags"],
+        where: [
+          ["?t", "app", "todo-app"],
+          ["?t", "workspace", { "#": ws }],
+          ["?t", "tags", "?tags"],
+        ],
+      })
+    ).map(([id, tags]) => [id, tags ?? []]),
+  );
+  for (const id of live) {
+    const have = (stored.get(id) ?? []).slice().sort();
+    const edges = (await tagsOf(ctx, id)).slice().sort();
+    if (have.join(" ") !== edges.join(" ")) {
+      problems.push(`#${id} component [${have.join(" ")}] but edges [${edges.join(" ")}]`);
+    }
+  }
+  const shipped = await reconcileTags(ws);
+  if (shipped.length) {
+    problems.push(
+      `reconcileTags reported ${shipped.length}: ` +
+        shipped
+          .slice(0, 2)
+          .map((d) => `#${d.id} [${(d.stored ?? []).join(" ")}] != [${d.actual.join(" ")}]`)
+          .join(", "),
+    );
+  }
   return [problems.length === 0, problems.slice(0, 3).join(" · ")];
 }
 

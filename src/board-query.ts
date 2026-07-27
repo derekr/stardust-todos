@@ -50,15 +50,21 @@
 // file only answers "what is on the page right now".
 //
 // TAG LABELS are the one filter with no fixed domain — they are free text from
-// `addTag`. They used to be kept out of the body entirely, matched instead by a
-// subquery correlated to the session's own `sf` rows. With no session to correlate
-// to they have to be inlined like everything else, so they are checked against the
-// workspace's actual tag vocabulary (`availableTags`, which the render already
-// reads) on the way in. The clause stays a correlated `exists` for a different
-// reason: a plain join would return a todo carrying two selected labels TWICE, and
-// the stress harness caught exactly that. It is placed LAST, where the fewest rows
-// reach it, and compiled out entirely when no tag is selected — and it remains the
-// one clause in the body with a ceiling of its own.
+// `addTag` — so they are checked against the workspace's actual tag vocabulary
+// (`availableTags`, which the render already reads) on the way in, and again by
+// `tagLabel` on the way into the body.
+//
+// This clause was the app's LAST correlated `exists`, over the tag edges, and it
+// was not slow, it was broken: a subquery's output is capped at 1,000 rows PER
+// DIRECTIVE, so `?tag=design` took 82.7s, two labels 77.7s, and three labels
+// refused outright while the app rendered an empty board. It is two plain clauses
+// now — the todo's own `tags` list, and a membership test over it — because the
+// todo carries its labels as a component as well as as edges (tags.ts holds the
+// whole entry, including why one field per label cannot express two labels). One
+// page went 104,475ms to 84ms, flat in the number of labels, and a todo carrying
+// several selected labels still comes back once, which is the duplicate that made
+// this a subquery in the first place. It is still placed LAST and still compiled
+// out entirely when no tag is selected.
 //
 // `overdue` compares against WALL-CLOCK time, so no write can ever be the moment it
 // changes and it cannot be a stored fact. It is plain clauses (`[?t due ?due]`,
@@ -84,16 +90,20 @@
 // final tiebreaker — real titles are not unique, and only a total order keeps an
 // offset from dropping and repeating rows.
 //
-// The board DERIVES nothing per row. `blocked`, `effectiveStatus` and `prank` are
-// stored facts written by the transaction that causes them (todos.ts,
-// `refreshDerived`), so this body JOINS them. A correlated subquery is executed
-// once per candidate ROW against a budget of 10,000 executions shared by the ENTIRE
-// query, so the three of them here did not degrade past a few thousand todos, they
-// hard-FAILED — and `limit` cannot rescue it, being a post-filter that neither
-// reduces executions nor raises the ceiling.
+// The board DERIVES nothing per row, and with the tag clause rewritten it now runs
+// NO SUBQUERY AT ALL. `blocked`, `effectiveStatus` and `prank` are stored facts
+// written by the transaction that causes them (todos.ts, `refreshDerived`) and
+// `tags` is one written by `addTag`/`removeTag` (tags.ts), so this body JOINS all
+// four. That is the same lesson reached twice, from two different ceilings: a
+// correlated subquery is executed once per candidate ROW against a budget of 10,000
+// executions for the whole query, AND its output is capped at 1,000 rows per
+// directive — so a per-row subquery does not degrade with the corpus, it hard-FAILS
+// at some size, and `limit` cannot rescue either one, being a post-filter that
+// neither reduces executions nor raises a ceiling.
 
 import { type EntityId, query } from "./stardust.ts";
 import { type Filter, PRIORITY_DOMAIN, STATUS_DOMAIN, VIEW_DOMAIN } from "./filter.ts";
+import { tagClauses } from "./tags.ts";
 import { APP } from "./tenancy.ts";
 
 /**
@@ -218,17 +228,6 @@ function inDomain(values: readonly string[], domain: readonly string[], what: st
   return values;
 }
 
-/** The tag membership test: does this row carry any of the SELECTED labels?
- *
- *  Correlated to `?t` alone now — there is no session to correlate to. A plain join
- *  would be cheaper and is wrong: a todo carrying two selected labels would come
- *  back twice, which the stress harness caught the first time this was tried. */
-const tagSub = (labels: readonly string[]) => ({
-  capture: { t: "?t" },
-  find: ["?e"],
-  where: [["?e", "kind", "tag"], ["?e", "todo", "?t"], ["?e", "label", "?l"], anyOf("?l", labels)],
-});
-
 /**
  * The canonical board body, for ONE filter and ONE page.
  *
@@ -280,15 +279,11 @@ export function canonicalBody(q: BoardQuery, window: PageWindow | null): Record<
       // joining `due` unconditionally would silently drop every todo with no due
       // date.
       ...viewClauses(q),
-      // Tag filter, LAST: the one correlated `exists` left. It runs against the
-      // smallest row set the rest of the body can hand it, and the labels reached
-      // this file having been checked against the workspace's own tag vocabulary.
-      ...(q.tags.length
-        ? [
-            [["exists", tagSub(q.tags)], "?hasTag"],
-            ["=", "?hasTag", true],
-          ]
-        : []),
+      // Tag filter, LAST, and no longer a subquery: the todo's own list of labels,
+      // plus a membership test over it. The labels reached this file having been
+      // checked against the workspace's own tag vocabulary, and `tagClauses` checks
+      // each one again on the way into the set literal.
+      ...(q.tags.length ? tagClauses(q.tags) : []),
     ],
     orderBy: ["?prank", "?title"],
     // The window, if this body has one. `orderBy` ends with `?t`, so the order is
