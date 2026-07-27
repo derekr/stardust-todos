@@ -396,6 +396,45 @@ async function patchTodo(
 }
 
 /**
+ * The app's todos that carry NO `field` fact — the question every backfill below
+ * asks, and the one shape of query that could not answer it at scale.
+ *
+ * All three used to ask Stardust directly, with `["not", ["?t", <field>, "?v"]]`.
+ * A `not` is a SUBQUERY and it is correlated — executed once per candidate row —
+ * so its output grows with the corpus against a per-directive cap of a thousand
+ * rows. Past that it does not get slow, it hard-FAILS:
+ *
+ *   query: $.where[2]: query: where subquery row/output limit exceeded
+ *   (per directive max 1000)
+ *
+ * and since all three run from the web server's boot sequence, the app refused to
+ * START against any database holding more than a thousand todos — including every
+ * stress corpus, none of whose rows are missing anything. A backfill that cannot
+ * run on a large database is a backfill that has the size dependency exactly
+ * backwards.
+ *
+ * So the difference is taken here instead: two plain scans, no subquery, no cap to
+ * exceed. Measured against 10,003 todos (three of them genuinely unscoped): every
+ * app todo is 28ms / 10,003 rows, the ones that have the field are 43ms / 10,000
+ * rows, and the diff is exactly the three. 71ms, once, on the boot that needs it —
+ * against a query that could not run at all. The set difference is the same set
+ * difference; the only thing that moved is which side of the wire computes it.
+ *
+ * `title` is what separates a todo from an infra marker: registry.ts writes those
+ * with `app` too, and they legitimately carry no workspace, author or actor.
+ */
+async function todosMissing(field: string): Promise<EntityId[]> {
+  const scan = (extra: unknown[]) =>
+    query({
+      find: ["?t"],
+      where: [["?t", "app", APP], ["?t", "title", "?title"], ...extra],
+    }) as Promise<[EntityId][]>;
+  const [every, have] = await Promise.all([scan([]), scan([["?t", field, "?v"]])]);
+  const has = new Set(have.map(([id]) => id));
+  return every.map(([id]) => id).filter((id) => !has.has(id));
+}
+
+/**
  * One-time: `status` is USER INTENT and never holds "blocked". Revert any legacy
  * rows the old worker overwrote to status "blocked" back to "todo". This survives
  * the v4 change unchanged and is the distinction v4 depends on: blocked-ness is
@@ -423,17 +462,10 @@ export async function migrateBlockedStatus(): Promise<number> {
  * workspace owner) and mark them published. Additive facts via generic transact.
  */
 export async function migrateVisibilityFields(ownerPersonaId: EntityId): Promise<number> {
-  const rows = (await query({
-    find: ["?t"],
-    where: [
-      ["?t", "app", APP],
-      ["?t", "title", "?title"], // a todo has a title — `app` alone also matches infra markers
-      ["not", ["?t", "author", "?a"]],
-    ],
-  })) as [EntityId][];
+  const rows = await todosMissing("author");
   if (!rows.length) return 0;
   const patch: Record<string, Record<string, unknown>> = {};
-  for (const [id] of rows) patch[id] = { author: { "#": ownerPersonaId }, draft: false };
+  for (const id of rows) patch[id] = { author: { "#": ownerPersonaId }, draft: false };
   await transact(patch);
   return rows.length;
 }
@@ -532,17 +564,10 @@ export async function migrateDerivedFields(): Promise<number> {
 
 /** One-time backfill: give app todos without a lastActor a placeholder. */
 export async function backfillActor(): Promise<number> {
-  const rows = (await query({
-    find: ["?t"],
-    where: [
-      ["?t", "app", APP],
-      ["?t", "title", "?title"], // ditto — never stamp lastActor onto a marker
-      ["not", ["?t", "lastActor", "?a"]],
-    ],
-  })) as [EntityId][];
+  const rows = await todosMissing("lastActor");
   if (!rows.length) return 0;
   const patch: Record<string, Record<string, unknown>> = {};
-  for (const [id] of rows) patch[id] = { lastActor: "seed" };
+  for (const id of rows) patch[id] = { lastActor: "seed" };
   await transact(patch);
   return rows.length;
 }
@@ -600,19 +625,24 @@ export async function watchTodos(ctx: WorkspaceCtx, cb: (todos: Todo[]) => void,
 
 // ---- Migration: pull legacy single-tenant todos into a workspace ---------
 
-/** Assign app-tagged todos that have NO workspace to `ctx`'s workspace. */
+/**
+ * Assign app-tagged todos that have NO workspace to `ctx`'s workspace.
+ *
+ * This is the one genuine migration in the app: todos written before workspaces
+ * existed (commit 3ab2ee5, single-tenant) carry `app` and a `title` and nothing
+ * that scopes them, and the read-time alternative — adopting them with an
+ * `or(owned, not …)` scope clause — was tested and LEAKS across tenants. So they
+ * have to actually be assigned, once, when the default workspace is first created.
+ *
+ * It asked that with a `not` until the whole family moved to `todosMissing` — see
+ * the note there for why a correlated subquery could not answer it past a thousand
+ * todos, and for the measurement that replaced it.
+ */
 export async function migrateOrphanTodos(ctx: WorkspaceCtx): Promise<number> {
-  const rows = (await query({
-    find: ["?t"],
-    where: [
-      ["?t", "app", APP],
-      ["?t", "title", "?title"], // ditto — a marker has no workspace and needs none
-      ["not", ["?t", "workspace", "?w"]],
-    ],
-  })) as [EntityId][];
+  const rows = await todosMissing("workspace");
   if (!rows.length) return 0;
   const patch: Record<string, Record<string, unknown>> = {};
-  for (const [id] of rows) patch[id] = { workspace: { "#": ctx.workspaceId } };
+  for (const id of rows) patch[id] = { workspace: { "#": ctx.workspaceId } };
   await transact(patch);
   return rows.length;
 }
