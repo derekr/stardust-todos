@@ -21,12 +21,12 @@
 import { BASE } from "./stardust.ts";
 
 /**
- * Fields matched by value somewhere in `queries.ts`, `session.ts` or the
- * provisioning path — as a constant (`kind`, `scope`), as a bind (`ws`), as an
- * inlined literal (`sid`, `priority`, `effectiveStatus`), or as a join key between
- * two clauses (`facet`/`value`, `session`, `todo`). An inlined literal keys the
- * same way a bind does: the engine is still asked for the rows whose field equals
- * a value, and without an index it still scans every fact of that field.
+ * Fields matched by value somewhere in `queries.ts`, `board-query.ts` or the
+ * provisioning path — as a constant (`kind`, `scope`), as a bind (`ws`, `pgset`),
+ * as an inlined literal (`workspace`, `priority`, `effectiveStatus`), or as a join
+ * key between two clauses (`todo`, `blocker`). An inlined literal keys the same way
+ * a bind does: the engine is still asked for the rows whose field equals a value,
+ * and without an index it still scans every fact of that field.
  *
  * Deliberately NOT indexed: fields only ever READ out of a matched row (`title`,
  * `order`, `danger`, `minRank`, `showWhenDenied`, `due`). Projection does not need
@@ -36,10 +36,11 @@ export const KEYED_FIELDS = [
   "kind",
   "app",
   "workspace",
-  "sid",
-  "session",
-  "facet",
-  "value",
+  // The page-set's join key. `sid`, `session`, `facet` and `value` used to be here
+  // and are gone with the search session: the filter is a query string, so nothing
+  // matches a facet row by value any more, and the only thing still keyed by a
+  // per-stream identity is the fifty `pg` rows the live subscription joins.
+  "pgset",
   "todo",
   "blocker",
   "status",
@@ -63,7 +64,6 @@ export const KEYED_FIELDS = [
   "target",
   "persona",
   "role",
-  "viewer",
   "author",
   "lastActor",
 ] as const;

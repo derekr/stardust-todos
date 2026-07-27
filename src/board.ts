@@ -7,7 +7,7 @@
 // Stardust already handed us.
 
 import type { WorkspaceCtx } from "./workspace.ts";
-import type { Priority, Status, Todo } from "./todos.ts";
+import type { Status, Todo } from "./todos.ts";
 import { effectiveStatusOf } from "./todos.ts";
 import { type EntityId, refId } from "./stardust.ts";
 import { blockers, blockersOfTodo, counts, todoPicker, workspaceTags } from "./queries.ts";
@@ -22,33 +22,15 @@ import { blockers, blockersOfTodo, counts, todoPicker, workspaceTags } from "./q
 export const effectiveStatus = (t: Pick<Todo, "status" | "blocked" | "effectiveStatus">): Status =>
   t.effectiveStatus ?? effectiveStatusOf(t.status, t.blocked === true);
 
-type DerivedView = "all" | "ready" | "overdue" | "mine" | "done";
-type GroupBy = "none" | "status" | "priority";
-
-export interface Filter {
-  status: Status[]; // empty = all (multi-select via `contains {#set ...}`)
-  priority: Priority[];
-  tags: string[];
-  view: DerivedView;
-  group: GroupBy;
-}
-
-export const emptyFilter: Filter = {
-  status: [],
-  priority: [],
-  tags: [],
-  view: "all",
-  group: "status",
-};
-
 /**
- * (The board's filtering used to be split — a session reactor for priority +
- * visibility, then an app-side residual tail for status/tags/views. That tail is
- * GONE: the session reactor applies every filter server-side over the stored
- * effective status, so `renderBoard` just renders `readSnapshot`. The snapshot is
- * the single source of truth, ordered by the stored priority ordinal — and it is
- * ONE PAGE of it, since the body carries `limit`/`offset`, so nothing here should
- * treat those rows as the whole answer. See session.ts.)
+ * (The board's filtering used to be split — a reactor for priority + visibility,
+ * then an app-side residual tail for status/tags/views. That tail is GONE: one
+ * body applies every filter server-side over the stored effective status, so
+ * `renderBoard` just renders `readSnapshot`. The snapshot is the single source of
+ * truth, ordered by the stored priority ordinal — and it is ONE PAGE of it, since
+ * the body carries `limit`/`offset`, so nothing here should treat those rows as
+ * the whole answer. The `Filter` those rows were narrowed by lives in filter.ts
+ * and arrives in the URL; the body that applies it is board-query.ts.)
  */
 
 export interface Counts {

@@ -25,8 +25,8 @@ interface DeclaredFields {
     | "tag"
     | "dep"
     | "project"
-    | "session"
-    | "sf"
+    | "pgset"
+    | "pg"
     | "reactorRef"
     | "schemaRef";
   name: string; // workspace / persona / project name
@@ -34,6 +34,7 @@ interface DeclaredFields {
   user: Ref; // persona → user
   label: string; // tag label
   todo: Ref; // edge → todo
+  pgset: Ref; // page row → the page-set it belongs to
   blocker: Ref; // dep edge → blocker
   reactor: Ref; // workspace → its board reactor
   countsReactor: Ref; // workspace → its aggregate (counts) reactor
@@ -68,6 +69,7 @@ export const validators: Record<string, (v: unknown) => boolean> = {
   user: isRef,
   label: (v) => typeof v === "string",
   todo: isRef,
+  pgset: isRef,
   blocker: isRef,
   reactor: isRef,
   countsReactor: isRef,

@@ -46,11 +46,14 @@ holds it. What that has already removed:
 
 - A 194-line bus subscriber that watched every commit and decided what was
   relevant. The reactor pushes its own result; the query already said what matters.
-- All server-side filter state. Filters are facts on a session, so two browsers
-  have two filters and the server holds none. Note what that does NOT settle: the
-  filter being a fact says nothing about how it reaches the query. It was a JOIN
-  for a long time and it is now READ AND INLINED, which was worth 82x — see the
-  entry in the tension section.
+- All server-side filter state. FULLY REVERSED, in two steps, and it is the
+  cautionary entry on this list rather than a success — read the tension section
+  before you push the next piece of per-user state into the database. Filters were
+  facts on a per-browser session entity, first JOINED into the board body and then
+  READ AND INLINED (worth 82x). The inlining is what ended it: once the app was
+  reading the facts back and compiling them into the query, the engine was not
+  EVALUATING them for anything, and a value the app reads back and compiles in is a
+  parameter wearing a fact's clothes. It is a query string now.
 - A revision counter used to force re-emits. Writing the facts re-emits.
 - Per-render dry-runs, promoted to stored reactors read with a per-call bind, so
   one reactor serves every workspace, viewer and todo. Partly REVERSED for the
@@ -96,15 +99,37 @@ The rule that has never missed is the first one: reason about what appears as a
 top-level clause. If liveness matters for a fact, put it there.
 
 **And a query that is not a reactor pushes nothing at all, which is a liveness
-decision and not only a performance one.** The board's rows are a dry-run now, so
+decision and not only a performance one.** The board's rows are a dry-run, so
 NOTHING about the filtered set is live; the app's only board subscription is
-`session-page`, which watches the fifty rows on screen. That is deliberate — a
+`page-rows`, which watches the fifty rows on screen. That is deliberate — a
 subscription over the whole filtered set pushes membership churn at you while you
-are reading — but it means every write the app makes that changes WHICH rows
-belong (a filter, a page) has to re-open the stream by hand (`remount` in
-server.ts). Forgetting that is silent: the board simply keeps showing the previous
-answer. It has happened once already, and no test caught it, because every test
-opens a fresh stream.
+are reading — but it means anything that changes WHICH rows belong is not going to
+arrive by itself.
+
+That used to be a hazard and is now a non-question, and the difference is worth
+carrying because it is the clearest thing the filter change bought. When the filter
+was a fact, changing it wrote to the database, that write pushed nothing (the
+subscription has no `sf` clause and never did), and the app compensated by aborting
+its own SSE stream and re-opening it — `remount()` plus a `boardGate` to stop the
+re-subscribe racing the write. Forgetting that was silent: the board kept showing
+the previous answer, which shipped once and no test caught it, because every test
+opens a fresh stream. The filter is in the URL now, so changing it is a NAVIGATION:
+a different document, a different stream, and the old one closed by the browser.
+There is nothing left to remember to re-open. The general shape: if a piece of
+state selects WHICH rows a subscription is about, either put it in a top-level
+clause of that subscription or put it somewhere that re-opening is automatic. The
+middle option — a fact nothing watches — is the one that costs you a bug.
+
+**`bind.with.facts` works on a LIVE subscription, and is still the wrong tool for
+liveness.** It overlays facts for one evaluation — replacements, retractions, new
+entities, temp ids — and a subscription accepts it, which makes "what would the
+board look like if this todo were done" a real, cheap question to ask. But it
+invalidates at CLAUSE-FIELD granularity with no result-equality suppression: any
+write to a field named by any clause re-emits, whether or not the answer changed.
+That is fine for a preview a user is holding open for a second, and wrong for a
+standing subscription, which is why nothing here uses it. (Reported and recorded,
+not re-measured in this pass — treat the granularity claim as the thing to check
+first if you build on it.)
 
 ## An omitted bind is usually silent, and once is not
 
@@ -237,6 +262,37 @@ and the response get smaller. Three consequences worth carrying:
   all be binds. `limit`/`offset` cannot be binds, and neither can a clause that is
   present or absent. If either varies, it is a dry-run.
 
+  **There is a second pagination mode this app has never tried, and it is the
+  counter to the paragraph above.** 0.0.6 documents KEYSET pagination: a request
+  carries `page.size` (`pageSize`/`pageAfter` on stored result routes) and the
+  response is one nested item, `result [...] page {hasMore true next OPAQUE_TOKEN}`.
+  It answers the "one stored reactor cannot serve every page" problem directly,
+  because the cursor is a parameter of the REQUEST rather than of the body — so a
+  stored reactor could serve page 40. The CHANGELOG claims a page after 5,000 rows
+  going from 19.50ms to 531.5µs, 36.7x, which if it holds is the only thing measured
+  here that would make a deep page cheaper rather than merely no more expensive.
+  What the docs say it costs, and why it has not simply been adopted: it CANNOT be
+  combined with `limit` or `offset`, it needs an ordered eligible query, and the
+  token is opaque, expiring, and bound to the query, authorization, database, page
+  size, ordering AND snapshot — "start from the first page after changing any
+  input". A prev/next pager over a shareable URL wants a cursor that survives being
+  bookmarked, and this one is explicitly not that. Untested here. If deep paging
+  ever becomes the bottleneck, this is the experiment, and the honest shape is
+  probably keyset for a scrolling reader plus offsets for a link.
+
+One more directive with a hard ceiling rather than a slope, found the same way:
+`not` is a SUBQUERY, correlated like any other, and its output is capped at 1,000
+rows PER DIRECTIVE. `["not", ["?t", "workspace", "?w"]]` over an app's todos is
+fine at 900 and fails outright at 1,001 with `where subquery row/output limit
+exceeded (per directive max 1000)`. Three boot-time backfills asked exactly that
+question, so the web server refused to start against any database with more than a
+thousand todos in it — including every stress corpus, none of whose rows were
+missing anything. They take the set difference app-side now (`todosMissing` in
+todos.ts): every app todo with a title, minus the ones carrying the field, 28ms and
+43ms at 10,003 rows. The rule that keeps generalising is that a subquery's cost and
+its ceiling are both per-ROW, so anything correlated has a corpus size at which it
+stops working rather than slowing down.
+
 Also measured while establishing this: the plain board at 2,000 unindexed todos
 allocates about 400MB of transient heap per read, and at 10,000 it peaks around
 2.1GB and takes ~180s. Stardust is Go and treats allocation failure as fatal
@@ -260,13 +316,15 @@ worth reading before you re-litigate one:
 - A complex query body vs a simpler query plus app code. The board body computes
   effectiveStatus and every filter server-side. It is genuinely hard to read, and
   it is why the board needs no filtering layer at all.
-- The facet filters: JOINED vs READ AND INLINED. REVERSED, by measurement, and this
-  is the one to read before assuming "let the engine do it" means "make it a join".
-  The filter is facts either way — that part never moved and is not up for
-  discussion. The question was only whether the query MATCHES those facts or is
-  BUILT from them. Matching them means the engine joins the session's `sf` children
-  against every candidate row, and its cost therefore grows with the corpus times
-  the number of values selected. Building the query from them means one literal
+- The facet filters: JOINED vs READ AND INLINED, and then FACTS vs A QUERY STRING.
+  Reversed twice, both times by measurement. Read this before assuming that "let
+  the engine do it" means "make it a join" — or that state being facts is
+  self-evidently the right answer.
+
+  The FIRST reversal was about how the filter reaches the query: whether the query
+  MATCHES the session's facts or is BUILT from them. Matching them means the engine
+  joins the session's `sf` children against every candidate row, so its cost grows
+  with the corpus times the number of values selected. Building the query from them means one literal
   comparison that NARROWS the candidate set. Measured at 5,005 todos, 50 rows,
   value indexes on: no facet filter at all is 51ms, the value-joins are 1,972ms,
   the inlined literals are 24ms. Unindexed the join is 32,775ms. Reproduced by the
@@ -278,20 +336,60 @@ worth reading before you re-litigate one:
   function of the selection (15 x 7 x 5 x 2 of them) so the rows are a dry-run built
   per read. Three consequences: the query is no longer a durable artifact you can
   read out of the database or hand to the lab with a bind, so what the x-ray offers
-  is the `session-page` subscription instead; the app now OWNS the correctness of a
+  is the `page-rows` subscription instead; the app now OWNS the correctness of a
   compiler, where before it owned only a body; and every value that reaches that
   compiler has to be checked against a domain, because a value that becomes part of
-  a query is not data any more. Tag labels have no domain — they are free text from
-  `addTag` — so the tag filter is deliberately NOT inlined and stays the correlated
-  `exists` it always was. What it gains beyond the speed: the body has no free vars
-  left, so the "an omitted bind matches everything" hazard two sections up cannot
-  apply to it, and a deep page stops costing an ephemeral reactor.
+  a query is not data any more. What it gains beyond the speed: the body has no free
+  vars left, so the "an omitted bind matches everything" hazard two sections up
+  cannot apply to it, and a deep page stops costing an ephemeral reactor.
+
+  The SECOND reversal followed from the first, and took a while to see precisely
+  because the first had been such a clear win. Once the app reads the facts back and
+  compiles them into the body, nothing in the engine is EVALUATING them. The filter
+  was not being stored for anything; it was a parameter spelled as facts. Three
+  things were then measured, and all three said to stop:
+
+  * **The facts bought no reactivity.** The one thing a fact buys that a parameter
+    cannot is a subscriber waking up. `session-page` had no `sf` clause and no
+    `page` clause, so a filter write re-emitted nothing at all, and the repaint came
+    from `remount()` aborting the SSE stream and re-opening it. Reactivity-for-free
+    had already died when the page-set landed; nobody had noticed, because the
+    workaround was working.
+  * **They cost writes that never stop costing.** ~129 facts per session and ~46
+    per filter click, on an append-only store where retraction appends more facts.
+    The demo held twelve todos in 24,389 facts across 7,274 entities and 84
+    sessions. Worse, that churn taxes UNRELATED writes permanently: a three-fact
+    todo patch measured 4ms at 7.5k facts, 9ms at 192k and 17ms at 369k, reproduced
+    by growing the database with entities the patch never touches. The cheapest
+    interaction on the page was making every future write slower.
+  * **A mutable session is the wrong thing to share.** `/s/<sid>` handed a second
+    reader the SAME session, so two people on one link shared one filter and
+    overwrote each other. A URL-encoded filter gives each recipient an independent
+    view — which is what sharing a filtered board means everywhere else.
+
+  The property the facts were supposed to protect survives verbatim: "the server
+  holds no per-user FILTER state" is exactly as true of a query string. The stronger
+  claim was never true — `liveSessions`, `boardStreams`, `boardGate` and
+  `viewPersona` were all per-process state sitting right beside it.
+
+  What the URL costs, precisely. The filter is INPUT now, arriving from a client
+  rather than from a schema-checked write, so the domain check stops being belt to
+  the schema's braces and becomes the only check there is. `decodeFilter` REFUSES an
+  unknown status, priority, view, group or page rather than dropping it — dropping
+  widens the board, which is the failure nobody notices. And tag labels, which have
+  no fixed domain and were therefore the one filter deliberately kept out of the
+  body, no longer have a session to correlate to: they are inlined like everything
+  else, checked against `availableTags` — the workspace's actual tag vocabulary,
+  which is a real domain and which the render already reads. The clause stays a
+  correlated `exists` for a different reason: a plain join returns a todo carrying
+  two selected labels twice, and the harness caught exactly that. It is also the one
+  clause in the body with a ceiling of its own, and the slowest thing on the page.
+  Also gone with the sessions: the `Session` and `SessionFacet` schemas, and the
+  generated `facet`/`value` validators that existed only because the atomic facet
+  write bypassed the schema route it was declared for.
 - The compile-time query checker only models plain 3-tuple fact clauses. Queries
   using `or` or a bound `exists` cannot use it, so they keep runtime validation and
   lose the compile-time check. That is why `define()` does not apply `CheckQuery`.
-- Writing facets in ONE transaction stopped subscribers seeing half-written filter
-  states, but a transact bypasses the schema, so those values are checked app-side
-  against the generated validators instead.
 - `kind` is redundant for ten of eleven entity families — the field shape already
   identifies them. It stays because the redundancy is cheap insurance against a
   future entity carrying the same fields.

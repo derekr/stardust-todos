@@ -74,21 +74,20 @@ export const blockersOfTodo = define("todo-blockers", {
 } as const);
 
 /**
- * The rows a session currently has on screen, joined back from its `pg` facts.
+ * The rows one open stream has on screen, joined back from its `pg` facts.
  *
- * Bound by `?sid`, so one definition serves every session. This is the ONE place a
- * stored reactor is unambiguously right: it is a subscription, its cost is bounded
- * by the page size rather than the workspace, and membership changes only when the
- * app rewrites the page-set — so a reader is woken by edits to what they are
- * looking at and by nothing else.
+ * Bound by `?ps` — a REF to the page-set entity, which a bind does accept where a
+ * list of fifty ids does not. One definition serves every open stream. This is the
+ * ONE place a stored reactor is unambiguously right: it is a subscription, its cost
+ * is bounded by the page size rather than the workspace, and membership changes
+ * only when the app rewrites the page-set — so a reader is woken by edits to what
+ * they are looking at and by nothing else.
  */
-export const sessionPage = define("session-page", {
+export const pageRows = define("page-rows", {
   find: ["?t", "?title", "?status", "?priority", "?eff", "?blocked", "?done"],
   where: [
-    ["?sess", "kind", "session"],
-    ["?sess", "sid", "?sid"],
     ["?p", "kind", "pg"],
-    ["?p", "session", "?sess"],
+    ["?p", "pgset", "?ps"],
     ["?p", "todo", "?t"],
     ["?t", "title", "?title"],
     ["?t", "status", "?status"],
@@ -253,7 +252,7 @@ export const DECLARED = [
   tagsOfTodo,
   blockedByTodo,
   blockersOfTodo,
-  sessionPage,
+  pageRows,
   commandMenu,
   commandAuthz,
 ] as const;

@@ -32,43 +32,20 @@ const GRANT_SCHEMA = {
   additionalProperties: false,
 };
 
-const SESSION_SCHEMA = {
-  title: "Session",
-  type: "object",
-  properties: {
-    kind: { const: "session" },
-    workspace: ref,
-    viewer: ref,
-    actor: { type: "string" },
-    view: { type: "string", enum: ["all", "ready", "overdue", "mine", "done"] },
-    tagActive: { type: "boolean" },
-    sid: { type: "number" }, // set to the session's own id after creation
-    group: { type: "string", enum: ["none", "status", "priority"] }, // display-only grouping
-    page: { type: "number" }, // zero-based board page; the offset is page * PAGE_SIZE
-  },
-  required: ["kind", "workspace", "viewer", "view", "tagActive"],
-  additionalProperties: false,
-};
-
-/**
- * Facets are no longer WRITTEN through this schema — they go out in one atomic
- * transact (see session.ts writeFacets), and there is no batch form of the schema
- * entity route. It stays declared because it is still the shape of record, and
- * because `npm run gen:query` turns it into the `facet` and `value` validators
- * that the atomic write checks against. Declared shape, app-side enforcement.
- */
-const FACET_SCHEMA = {
-  title: "SessionFacet",
-  type: "object",
-  properties: {
-    kind: { const: "sf" },
-    session: ref,
-    facet: { type: "string", enum: ["status", "priority", "tag"] },
-    value: { type: "string" },
-  },
-  required: ["kind", "session", "facet", "value"],
-  additionalProperties: false,
-};
+// A `Session` and a `SessionFacet` schema used to sit here, because the board's
+// filter was facts on a session entity and a malformed one drove the board query.
+// The filter is a query string now (filter.ts), so there is no session to
+// schematise — and the check those schemas were really providing has not gone
+// anywhere, it has moved to where the value now enters: `decodeFilter` refuses a
+// status, priority, view, group or tag that is not in its domain, and
+// `canonicalBody` refuses it again. A schema validating a write the app was about
+// to read back was one hop further from the hazard than that.
+//
+// What went with them, and is worth noticing: the generated `facet` and `value`
+// validators. They existed because `writeFacets` bypassed the schema route (a
+// transact writes facts unchecked, and there is no batch form of
+// `POST /schemas/{id}/entities`), so the app checked its own writes against the
+// validators its own schema generated. That circle is gone with the writes.
 
 const cache = new Map<string, Promise<EntityId>>();
 /** The schema id for `name`, provisioned once per process. */
@@ -82,11 +59,6 @@ function idOf(name: string, doc: Record<string, unknown>): Promise<EntityId> {
 }
 
 export const grantSchema = () => idOf("grant", GRANT_SCHEMA);
-export const sessionSchema = () => idOf("session", SESSION_SCHEMA);
 
 /** Everything `npm run stardust:setup` provisions, besides the Todo schema. */
-export const DECLARED_SCHEMAS = [
-  { name: "grant", doc: GRANT_SCHEMA },
-  { name: "session", doc: SESSION_SCHEMA },
-  { name: "sf", doc: FACET_SCHEMA },
-] as const;
+export const DECLARED_SCHEMAS = [{ name: "grant", doc: GRANT_SCHEMA }] as const;

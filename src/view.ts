@@ -1,11 +1,19 @@
 // Server-rendered HTML for the HOME/LIST screen — Gruvbox-dark mobile design.
 // Datastar (v1.0.2) patches #board, #filterbar (and the two count spans) over the
-// long-lived /s/<sid>/stream SSE. The sid is in the URL rather than a signal, so the
-// session a click belongs to is named by the request itself. Colors derive from the
-// :root tokens.
+// long-lived /stream SSE, whose query string carries the filter this page is
+// showing. Colors derive from the :root tokens.
+//
+// Every filter control is an ANCHOR, not a button, and that is the whole of the
+// client side of "the filter lives in the URL". A chip's href is the state a click
+// leads to (`toggled()` in filter.ts), so a click is a navigation: the address bar
+// updates, back and forward work, the link is shareable, and the SSE stream is
+// re-opened by the new document with the new filter in its own URL. That last part
+// is what replaced `remount()` — the server used to abort the stream by hand and
+// re-open it, because a filter write changed which rows belonged on the page
+// without touching any row already on it, so nothing re-emitted.
 
 import type { Todo, Priority, Status } from "./todos.ts";
-import type { Filter } from "./board.ts";
+import { type BoardState, type Filter, boardHref, encodeFilter, toggled } from "./filter.ts";
 import type { Blocker } from "./board.ts";
 import { effectiveStatus } from "./board.ts";
 import type { ProjectedCommand } from "./commands.ts";
@@ -69,15 +77,18 @@ const ICON = {
 // Secondary facets (status/priority/tag/group) live in a collapsible row behind
 // the sliders toggle so every endpoint stays reachable without clutter.
 
-const viewChip = (sid: number, label: string, active: boolean, view: string, count?: number) =>
-  `<button class="vchip ${active ? "on" : ""}" data-on:click="@post('${B}/s/${sid}/filter/view/${view}')">${esc(label)}${
-    count !== undefined ? `<span class="vc-n">·${count}</span>` : ""
-  }</button>`;
+/** Where a chip click goes: the same state with one facet flipped, encoded. */
+const chipHref = (s: BoardState, facet: string, value: string) => `${B}${boardHref(toggled(s, facet, value))}`;
 
-const facetChip = (sid: number, label: string, active: boolean, action: string, count?: number) =>
-  `<button class="fchip ${active ? "on" : ""}" data-on:click="@post('${B}/s/${sid}${action}')">${esc(label)}${
+const viewChip = (s: BoardState, label: string, active: boolean, view: string, count?: number) =>
+  `<a class="vchip ${active ? "on" : ""}" href="${chipHref(s, "view", view)}">${esc(label)}${
+    count !== undefined ? `<span class="vc-n">·${count}</span>` : ""
+  }</a>`;
+
+const facetChip = (s: BoardState, label: string, active: boolean, facet: string, value: string, count?: number) =>
+  `<a class="fchip ${active ? "on" : ""}" href="${chipHref(s, facet, value)}">${esc(label)}${
     count !== undefined ? `<span class="fc-n">${count}</span>` : ""
-  }</button>`;
+  }</a>`;
 
 /** The two count spans live in the title pill and are morphed there by id. The
  *  visible one is a STRING now: a paged board that has a next page shows "50+",
@@ -91,31 +102,29 @@ export const visibleTotal = (statusCounts: Record<string, number>): number =>
 
 /** The filter bar element on its own — shared by the SSE patch and the SSR shell. */
 export function filterBarEl(
-  sid: number,
-  f: Filter,
+  state: BoardState,
   statusCounts: Record<string, number>,
   priorityCounts: Record<string, number>,
   tags: string[],
 ): string {
+  const f = state.filter;
   const total = visibleTotal(statusCounts);
 
   const views =
-    viewChip(sid, "all", f.view === "all", "all", total) +
-    viewChip(sid, "ready", f.view === "ready", "ready") +
-    viewChip(sid, "overdue", f.view === "overdue", "overdue") +
-    viewChip(sid, "mine", f.view === "mine", "mine");
+    viewChip(state, "all", f.view === "all", "all", total) +
+    viewChip(state, "ready", f.view === "ready", "ready") +
+    viewChip(state, "overdue", f.view === "overdue", "overdue") +
+    viewChip(state, "mine", f.view === "mine", "mine");
 
   const statuses = STATUS_ORDER.map((s) =>
-    facetChip(sid, STATUS_LABEL[s], f.status.includes(s), `/filter/status/${s}`, statusCounts[s] ?? 0),
+    facetChip(state, STATUS_LABEL[s], f.status.includes(s), "status", s, statusCounts[s] ?? 0),
   ).join("");
   const prios = PRIOS.map((p) =>
-    facetChip(sid, p, f.priority.includes(p), `/filter/priority/${p}`, priorityCounts[p] ?? 0),
+    facetChip(state, p, f.priority.includes(p), "priority", p, priorityCounts[p] ?? 0),
   ).join("");
-  const tagChips = tags
-    .map((t) => facetChip(sid, `#${t}`, f.tags.includes(t), `/filter/tag/${encodeURIComponent(t)}`))
-    .join("");
+  const tagChips = tags.map((t) => facetChip(state, `#${t}`, f.tags.includes(t), "tag", t)).join("");
   const groups = (["status", "priority", "none"] as const)
-    .map((g) => facetChip(sid, g, f.group === g, `/filter/group/${g}`))
+    .map((g) => facetChip(state, g, f.group === g, "group", g))
     .join("");
 
   return `<div id="filterbar">
@@ -140,13 +149,12 @@ export function filterBarEl(
  * count-visible the same way.
  */
 export function filterBar(
-  sid: number,
-  f: Filter,
+  state: BoardState,
   statusCounts: Record<string, number>,
   priorityCounts: Record<string, number>,
   tags: string[],
 ): string {
-  return `${filterBarEl(sid, f, statusCounts, priorityCounts, tags)}
+  return `${filterBarEl(state, statusCounts, priorityCounts, tags)}
   ${cnum("count-total", visibleTotal(statusCounts))}`;
 }
 
@@ -182,26 +190,32 @@ function row(t: Todo, blockers: Blocker[]): string {
  * "there is more" and "you are on page N".
  */
 export interface Pager {
-  sid: number;
-  page: number;
+  state: BoardState;
   hasMore: boolean;
 }
 
 function pagerEl(p: Pager): string {
-  if (p.page === 0 && !p.hasMore) return ""; // one page: no controls at all
+  const at = p.state.page;
+  if (at === 0 && !p.hasMore) return ""; // one page: no controls at all
   const btn = (label: string, to: number, on: boolean) =>
     on
-      ? `<button class="pgbtn" data-on:click="@post('${B}/s/${p.sid}/page/${to}')">${label}</button>`
-      : `<button class="pgbtn" disabled>${label}</button>`;
+      ? `<a class="pgbtn" href="${B}${boardHref({ ...p.state, page: to })}">${label}</a>`
+      : `<span class="pgbtn off">${label}</span>`;
   return `<nav class="pager" data-xray="board">
-    ${btn("‹ prev", p.page - 1, p.page > 0)}
-    <span class="pgn">page ${p.page + 1}</span>
-    ${btn("next ›", p.page + 1, p.hasMore)}
+    ${btn("‹ prev", at - 1, at > 0)}
+    <span class="pgn">page ${at + 1}</span>
+    ${btn("next ›", at + 1, p.hasMore)}
   </nav>`;
 }
 
 /** The board element on its own — shared by the SSE patch and the SSR shell. */
-export function boardEl(todos: Todo[], blockers: Map<number, Blocker[]>, f: Filter, pager?: Pager): string {
+export function boardEl(
+  todos: Todo[],
+  blockers: Map<number, Blocker[]>,
+  f: Filter,
+  pager?: Pager,
+  pgset?: number,
+): string {
   const bl = (id: number) => blockers.get(id) ?? [];
   const rows = (items: Todo[]) => items.map((t) => row(t, bl(t.id))).join("");
 
@@ -235,7 +249,11 @@ export function boardEl(todos: Todo[], blockers: Map<number, Blocker[]>, f: Filt
     ).join("");
   }
 
-  return `<div id="board" data-xray="board">${body}${pager ? pagerEl(pager) : ""}</div>`;
+  // `data-pgset` is how the x-ray's "runnable in lab" knows which page-set to
+  // bind. It is leased by the STREAM, so the server-rendered first paint has
+  // none and the first SSE patch supplies it.
+  const ps = pgset === undefined ? "" : ` data-pgset="${pgset}"`;
+  return `<div id="board" data-xray="board"${ps}>${body}${pager ? pagerEl(pager) : ""}</div>`;
 }
 
 /** What the title pill shows for "visible": the rows on this page, or `50+` when
@@ -243,8 +261,14 @@ export function boardEl(todos: Todo[], blockers: Map<number, Blocker[]>, f: Filt
 export const visibleLabel = (shown: number, hasMore: boolean): string => (hasMore ? `${shown}+` : String(shown));
 
 /** The SSE payload: the board plus count-visible, morphed into the title pill. */
-export function boardFragment(todos: Todo[], blockers: Map<number, Blocker[]>, f: Filter, pager?: Pager): string {
-  return `${boardEl(todos, blockers, f, pager)}
+export function boardFragment(
+  todos: Todo[],
+  blockers: Map<number, Blocker[]>,
+  f: Filter,
+  pager?: Pager,
+  pgset?: number,
+): string {
+  return `${boardEl(todos, blockers, f, pager, pgset)}
   ${cnum("count-visible", visibleLabel(todos.length, pager?.hasMore === true))}`;
 }
 
@@ -279,30 +303,31 @@ export function palette(globalCmds: ProjectedCommand[]): string {
 
 // ---- Desktop sidebar (shown ≥900px; reuses the same filter endpoints) ----
 
-const sbView = (sid: number, label: string, active: boolean, view: string, count?: number) =>
-  `<button class="sb-item ${active ? "on" : ""}" data-on:click="@post('${B}/s/${sid}/filter/view/${view}')">
+const sbView = (s: BoardState, label: string, active: boolean, view: string, count?: number) =>
+  `<a class="sb-item ${active ? "on" : ""}" href="${chipHref(s, "view", view)}">
     <span class="sb-txt">${esc(label)}</span>${count !== undefined ? `<span class="sb-n">${count}</span>` : ""}
-  </button>`;
+  </a>`;
 
-const sbStatus = (sid: number, s: Status, active: boolean, count: number) =>
-  `<button class="sb-item ${active ? "on" : ""}" data-on:click="@post('${B}/s/${sid}/filter/status/${s}')">
+const sbStatus = (state: BoardState, s: Status, active: boolean, count: number) =>
+  `<a class="sb-item ${active ? "on" : ""}" href="${chipHref(state, "status", s)}">
     <span class="sb-dot p-${s === "blocked" ? "high" : s === "doing" ? "med" : s === "done" ? "done" : "low"}"></span>
     <span class="sb-txt">${esc(STATUS_LABEL[s])}</span><span class="sb-n">${count}</span>
-  </button>`;
+  </a>`;
 
-export function sidebar(sid: number, f: Filter, statusCounts: Record<string, number>): string {
+export function sidebar(state: BoardState, statusCounts: Record<string, number>): string {
+  const f = state.filter;
   const total = Object.values(statusCounts).reduce((a, b) => a + b, 0);
   return `<aside id="sidebar">
     <div class="sb-brand">Todos<span class="sb-ws">· Default</span></div>
     <button class="sb-add" data-on:click="$addOpen = true; $error = ''">＋ New task</button>
     <nav class="sb-nav">
       <div class="sb-label">views</div>
-      ${sbView(sid, "All", f.view === "all", "all", total)}
-      ${sbView(sid, "Ready", f.view === "ready", "ready")}
-      ${sbView(sid, "Overdue", f.view === "overdue", "overdue")}
-      ${sbView(sid, "Mine", f.view === "mine", "mine")}
+      ${sbView(state, "All", f.view === "all", "all", total)}
+      ${sbView(state, "Ready", f.view === "ready", "ready")}
+      ${sbView(state, "Overdue", f.view === "overdue", "overdue")}
+      ${sbView(state, "Mine", f.view === "mine", "mine")}
       <div class="sb-label">status</div>
-      ${STATUS_ORDER.map((s) => sbStatus(sid, s, f.status.includes(s), statusCounts[s] ?? 0)).join("")}
+      ${STATUS_ORDER.map((s) => sbStatus(state, s, f.status.includes(s), statusCounts[s] ?? 0)).join("")}
     </nav>
     <div class="sb-foot">
       <div class="sb-valabel">view as</div>
@@ -329,7 +354,7 @@ export interface BoardView {
   total: number;
 }
 
-export function page(sid: number, view?: BoardView): string {
+export function page(state: BoardState, view?: BoardView): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -387,6 +412,7 @@ export function page(sid: number, view?: BoardView): string {
     .chiprow::-webkit-scrollbar{display:none;}
     .vchip{flex:0 0 auto;font-family:var(--mono);font-size:12.5px;color:var(--muted);
       background:transparent;border:1px solid var(--line);border-radius:999px;padding:6px 13px;cursor:pointer;
+      display:inline-flex;align-items:center;text-decoration:none;white-space:nowrap;
       transition:color .12s,border-color .12s,background .12s;}
     .vchip:hover{color:var(--fg);}
     .vchip.on{color:var(--orange);background:rgba(254,128,25,.16);border-color:rgba(254,128,25,.4);}
@@ -402,7 +428,8 @@ export function page(sid: number, view?: BoardView): string {
     .flabel{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.12em;
       color:var(--faint);margin-right:2px;min-width:52px;}
     .fchip{font-family:var(--mono);font-size:11.5px;color:var(--muted);background:var(--elev2);
-      border:1px solid var(--line);border-radius:999px;padding:3px 9px;cursor:pointer;display:inline-flex;gap:5px;}
+      border:1px solid var(--line);border-radius:999px;padding:3px 9px;cursor:pointer;display:inline-flex;gap:5px;
+      align-items:center;text-decoration:none;white-space:nowrap;}
     .fchip.on{color:var(--orange);background:rgba(254,128,25,.16);border-color:rgba(254,128,25,.4);}
     .fc-n{opacity:.65;}
 
@@ -416,8 +443,9 @@ export function page(sid: number, view?: BoardView): string {
     /* 5b — pager (only rendered when there is more than one page) */
     .pager{display:flex;align-items:center;justify-content:center;gap:14px;margin:22px 0 4px;}
     .pgbtn{background:var(--elev);color:var(--fg);border:1px solid var(--line);border-radius:999px;
-      font-family:var(--mono);font-size:12px;padding:5px 13px;cursor:pointer;}
-    .pgbtn:disabled{color:var(--faint);opacity:.5;cursor:default;}
+      font-family:var(--mono);font-size:12px;padding:5px 13px;cursor:pointer;
+      display:inline-block;text-decoration:none;}
+    .pgbtn.off{color:var(--faint);opacity:.5;cursor:default;}
     .pgn{font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.08em;}
 
     /* 6 — rows (edge-to-edge, hairline divider, no card) */
@@ -510,6 +538,7 @@ export function page(sid: number, view?: BoardView): string {
       color:var(--faint);margin:16px 0 6px 6px;}
     .sb-label:first-child{margin-top:0;}
     .sb-item{display:flex;align-items:center;gap:9px;width:100%;text-align:left;border:0;background:transparent;
+      text-decoration:none;
       color:var(--muted);border-radius:9px;padding:8px 10px;cursor:pointer;font-family:var(--sans);font-size:14px;}
     .sb-item:hover{background:var(--elev);color:var(--fg);}
     .sb-item.on{background:rgba(254,128,25,.12);color:var(--orange);}
@@ -535,7 +564,8 @@ export function page(sid: number, view?: BoardView): string {
     .sh-label{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.14em;
       color:var(--faint);margin:16px 0 8px 2px;}
     .sh-grid{display:flex;flex-wrap:wrap;gap:8px;}
-    .sh-grid button{border:1px solid var(--line);background:var(--elev2);color:var(--fg);border-radius:999px;
+    .sh-grid button,.sh-grid .shbtn{border:1px solid var(--line);background:var(--elev2);color:var(--fg);border-radius:999px;
+      text-decoration:none;display:inline-flex;align-items:center;justify-content:center;
       padding:8px 15px;font-family:var(--mono);font-size:13px;cursor:pointer;}
     .sh-grid button:hover{border-color:var(--orange);color:var(--orange);}
     .you-sub{font-size:13px;line-height:1.55;color:var(--muted);margin-bottom:4px;}
@@ -597,13 +627,11 @@ export function page(sid: number, view?: BoardView): string {
     ${view ? view.filterbar : `<div id="filterbar"></div>`}
 
     <!-- 5/6. long-lived read stream drives #filterbar + #board -->
-    <div data-init="@get('${B}/s/${sid}/stream', {retryInterval: 300, retryMaxCount: 100000})">
+    <div data-init="@get('${B}/stream${encodeFilter(state)}', {retryInterval: 300, retryMaxCount: 100000})">
       ${view ? view.board : `<div id="board"></div>`}
     </div>
 
     <div class="toast" style="display:none" data-text="$toast" data-show="$toast"></div>
-
-    <!-- demo: copy-paste curl commands for THIS session (patched by /stream) -->
 
     <!-- kept so existing SSE patches have targets -->
     <div id="wsbar"></div>
@@ -622,7 +650,7 @@ export function page(sid: number, view?: BoardView): string {
         ${svg(`<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>`)}
       </button>
     </span>
-    <button class="tab" type="button" data-on:click="@post('${B}/s/${sid}/filter/view/done')">${ICON.clock}done</button>
+    <a class="tab" href="${chipHref(state, "view", "done")}">${ICON.clock}done</a>
     <button class="tab" type="button" data-on:click="$youOpen = true">${ICON.contrast}you</button>
   </nav>
 
@@ -656,17 +684,17 @@ export function page(sid: number, view?: BoardView): string {
     <h2>Views</h2>
     <div class="sh-label">show</div>
     <div class="sh-grid">
-      <button data-on:click="@post('${B}/s/${sid}/filter/view/all'); $viewsOpen = false">All</button>
-      <button data-on:click="@post('${B}/s/${sid}/filter/view/ready'); $viewsOpen = false">Ready</button>
-      <button data-on:click="@post('${B}/s/${sid}/filter/view/overdue'); $viewsOpen = false">Overdue</button>
-      <button data-on:click="@post('${B}/s/${sid}/filter/view/mine'); $viewsOpen = false">Mine</button>
-      <button data-on:click="@post('${B}/s/${sid}/filter/view/done'); $viewsOpen = false">Done</button>
+      <a class="shbtn" href="${chipHref(state, "view", "all")}">All</a>
+      <a class="shbtn" href="${chipHref(state, "view", "ready")}">Ready</a>
+      <a class="shbtn" href="${chipHref(state, "view", "overdue")}">Overdue</a>
+      <a class="shbtn" href="${chipHref(state, "view", "mine")}">Mine</a>
+      <a class="shbtn" href="${chipHref(state, "view", "done")}">Done</a>
     </div>
     <div class="sh-label">group by</div>
     <div class="sh-grid">
-      <button data-on:click="@post('${B}/s/${sid}/filter/group/status'); $viewsOpen = false">Status</button>
-      <button data-on:click="@post('${B}/s/${sid}/filter/group/priority'); $viewsOpen = false">Priority</button>
-      <button data-on:click="@post('${B}/s/${sid}/filter/group/none'); $viewsOpen = false">None</button>
+      <a class="shbtn" href="${chipHref(state, "group", "status")}">Status</a>
+      <a class="shbtn" href="${chipHref(state, "group", "priority")}">Priority</a>
+      <a class="shbtn" href="${chipHref(state, "group", "none")}">None</a>
     </div>
   </div>
 

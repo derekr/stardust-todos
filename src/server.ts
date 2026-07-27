@@ -1,10 +1,21 @@
 // Datastar web UI: workspace-aware, with Linear-style filtering/grouping/
 // aggregates (all powered by Stardust queries) and a dependency action menu.
 //
-// The board is per BROWSER: `/` mints a session and redirects to /s/<sid>, and that
-// session's facts ARE the filter state, so this process holds none. Live updates are
-// Stardust subscriptions — the bound reactor for the board, `GET /entities/{id}` for
-// the detail pane — not app code watching for changes.
+// The board is per URL. `/?st=todo&v=ready&p=2` IS the filter — decoded, domain-
+// checked and compiled into the query on every read — so this process holds no
+// per-user filter state and two readers of one link get two independent views.
+// Live updates are Stardust subscriptions: `page-rows` bound to the fifty rows an
+// open stream is showing, and `GET /entities/{id}` for the detail pane. Not app
+// code watching for changes.
+//
+// What that replaced is worth naming, because it was the app's headline claim: the
+// filter used to be FACTS on a per-browser `session` entity, and `/` minted one and
+// redirected to `/s/<sid>`. filter.ts carries the three measurements that retired
+// it. The one this file is the evidence for is that a filter write re-emitted
+// NOTHING — `session-page` never had an `sf` clause — so `remount()` here aborted
+// the SSE stream and re-opened it by hand on every click. A filter change is a new
+// URL now, so it is a new stream, and the client re-opening it is the whole
+// mechanism.
 //
 //   node src/server.ts        # http://localhost:3000
 
@@ -35,33 +46,15 @@ import type { EntityId } from "./stardust.ts";
 import { createPersona, createWorkspace, ensureUser, grantAccess, listPersonas, roleOf } from "./tenancy.ts";
 import { authorizeCommand, ensureCommandCatalog, visibleCommands } from "./commands.ts";
 import { addDependency, removeDependency, tagsOf } from "./features.ts";
-import {
-  type Filter,
-  aggregateCounts,
-  availableTags,
-  blockerMap,
-  blockersOf,
-  effectiveStatus,
-  emptyFilter,
-  todoOptions,
-} from "./board.ts";
-import {
-  type SessionHandle,
-  type Snapshot,
-  createSession,
-  readFilter,
-  readSnapshot,
-  retargetSession,
-  setFilter,
-  setPage,
-} from "./session.ts";
+import { aggregateCounts, availableTags, blockerMap, blockersOf, effectiveStatus, todoOptions } from "./board.ts";
+import { type BoardScope, boardQuery, readSnapshot } from "./board-query.ts";
+import { type BoardState, FilterError, decodeFilter } from "./filter.ts";
 import { BASE, TxConflictError, lastTx, readEntity, readReactorRon, watchEntity } from "./stardust.ts";
-import { DECLARED, blockedByTodo, sessionPage } from "./queries.ts";
-import { watchPage, writePageSet } from "./pageset.ts";
+import { DECLARED, blockedByTodo, pageRows } from "./queries.ts";
+import { leasePageSet, releasePageSet, watchPage, writePageSet } from "./pageset.ts";
 import { statusHistory } from "./history.ts";
 import {
   type BoardView,
-  type Pager,
   boardEl,
   boardFragment,
   filterBar,
@@ -99,19 +92,19 @@ import {
  * bare returns every todo once per SESSION (208 rows against 8), which is how this
  * was found.
  *
- * `sid` and `todo` come from the page the x-ray was opened on, so what you paste is
+ * `ps` and `todo` come from the page the x-ray was opened on, so what you paste is
  * scoped to what you were looking at; the rest come from the current workspace.
  */
-function runnableBinds(name: string, from: { sid?: string; todo?: string }): Record<string, string> {
+function runnableBinds(name: string, from: { ps?: string; todo?: string }): Record<string, string> {
   const ws = `{# ${ctx.workspaceId}}`;
   const viewer = `{# ${ctx.personaId}}`;
   switch (name) {
-    // The board's live subscription. It is bound by the session, so pasting it
-    // bare returns every session's page at once — the same trap the board reactor
-    // had. (The board's ROW query is not here: it is a dry-run whose body is built
-    // per read with no free vars at all, so there is nothing to bind.)
-    case "session-page":
-      return from.sid ? { sid: from.sid } : {};
+    // The board's live subscription. It is bound by the page-set, so pasting it
+    // bare returns every open stream's page at once — the same trap the board
+    // reactor had. (The board's ROW query is not here: it is a dry-run whose body
+    // is built per read with no free vars at all, so there is nothing to bind.)
+    case "page-rows":
+      return from.ps ? { ps: `{# ${from.ps}}` } : {};
     case "board-counts":
     case "todo-options":
       return { ws, viewer };
@@ -181,28 +174,11 @@ process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 // worker would be a second writer racing the first; the choke point (todos.ts,
 // patchTodo/refreshDerived) is one writer that already knows what changed.
 
-/**
- * Point every live session at the current workspace + viewer.
- *
- * This is the ONLY reason the server touches a session now, and it writes the two
- * fields that actually moved — no revision counter, because both are top-level
- * clauses in the reactor and so re-emit by themselves.
- *
- * Data writes deliberately do nothing here: the reactor pushes them on its own.
- * Measured against Stardust directly, with no app involvement — a priority change,
- * a status change, a todo retraction and a publish each produced exactly one
- * emission. The old rerenderAll() poked EVERY live session on every write, which
- * made one browser's filter click re-emit every other browser's board.
- */
-async function retargetAll(): Promise<void> {
-  for (const sid of liveSessions) {
-    await retargetSession(sessionOf(sid), ctx.workspaceId, viewPersona).catch((e) => console.error("retarget:", e));
-  }
-}
+/** The half of the board's inputs a client does not get to supply. */
+const scopeNow = (): BoardScope => ({ workspace: ctx.workspaceId, viewer: viewPersona, actor: actorName() });
 
 const noopStream = (req: http.IncomingMessage, res: http.ServerResponse) =>
   ServerSentEventGenerator.stream(req, res, () => {});
-const toggle = <T>(arr: T[], v: T): T[] => (arr.includes(v) ? arr.filter((x) => x !== v) : [...arr, v]);
 
 // Glass-box inspector state. The live feed keeps a small shared ring buffer;
 // replay caches the last full log read so scrubbing doesn't re-replay each step.
@@ -218,113 +194,27 @@ const getSignals = (req: http.IncomingMessage): Record<string, unknown> => {
   }
 };
 
-// Board SEARCH SESSION — one per BROWSER, not one per process.
+// ---- Open board streams ------------------------------------------------------
 //
-// The filter state and viewer visibility live as facts in Stardust, and the sid
-// travels in the URL (/s/<sid>) and as a Datastar signal, so two browsers on the
-// same board hold two independent filters. The server keeps no filter state at
-// all; every render reads the session back with readFilter().
+// The only per-stream state this process keeps, and it is not filter state: a
+// repaint hook, so a change to something the URL does NOT carry can still reach an
+// open board. There are exactly two of those — the active workspace and the "view
+// as" persona — and both are genuinely server-side (one workspace per server is a
+// demo simplification, and the viewer decides which drafts exist at all).
 //
-// It used to be a single module-level session keyed by workspace+viewer, which
-// meant every browser shared one filter AND every restart abandoned a session
-// entity — the same accumulation the board reactor had.
-const sessionOf = (sessionId: EntityId): SessionHandle => ({ sessionId, workspaceId: ctx.workspaceId });
+// A filter or page change does not come through here. It is a different URL, so it
+// is a different document and a different stream, and the old one is closed by the
+// browser. That is what `remount()` + `boardGate` used to do by hand: abort the
+// subscription, wait for the filter facts to land, re-subscribe. The subscription
+// (`page-rows`) watches the rows ON the page, so it was never going to fire for a
+// write that changes which rows BELONG on it.
+const openBoards = new Set<{ repaint: () => void }>();
+const repaintAll = () => {
+  for (const b of openBoards) b.repaint();
+};
 
-/** sids with a live stream, so a write can nudge every open board to re-emit. */
-const liveSessions = new Set<EntityId>();
-
-// ---- Re-opening a stream after a write the subscription cannot see -----------
-//
-// The board's live subscription is `session-page`: it watches the `pg` facts that
-// name the rows on screen, so it fires when one of THOSE rows changes and stays
-// silent about everything else. That is the point of it, and it is also its blind
-// spot. A filter or a page write changes which rows BELONG on the page without
-// touching any row already on it, so nothing re-emits and the board would sit
-// there showing the previous answer.
-//
-// So those two writes drop the stream and re-open it, in that order: `boardStreams`
-// is the open subscription, `boardGate` holds the re-open until the write has
-// landed. Without the gate the loop races the write, re-subscribes, and paints one
-// frame from the state it just left. Data writes do not come through here at all —
-// a row on the page changing is exactly what the subscription is for.
-const boardStreams = new Map<EntityId, AbortController>();
-const boardGate = new Map<EntityId, Promise<void>>();
-
-/** Drop this session's stream, run `write`, then let the loop re-open and paint
- *  whatever the write left behind. The gate is what stops the loop re-subscribing
- *  before the write has landed and painting one frame of the previous answer. */
-async function remount(sid: EntityId, write: () => Promise<void>): Promise<void> {
-  if (!boardStreams.has(sid)) {
-    await write();
-    return;
-  }
-  let release!: () => void;
-  boardGate.set(sid, new Promise<void>((r) => (release = r)));
-  boardStreams.get(sid)?.abort();
-  try {
-    await write();
-  } finally {
-    boardGate.delete(sid);
-    release();
-  }
-}
-
-/**
- * Write a session's filter and re-open its stream on the answer.
- *
- * Always a remount. It used to be conditional — only when the filter moved the
- * session to a differently-shaped board reactor — and that condition stopped being
- * true when the subscription became the page-set rather than the filtered board:
- * `session-page` watches the rows currently on screen, and a filter write changes
- * which rows should BE on screen without touching any of them. Most filter clicks
- * therefore repainted nothing at all. The remount is what makes them repaint.
- */
-async function applyFilter(sid: EntityId, next: Filter): Promise<void> {
-  await remount(sid, () => setFilter(sessionOf(sid), next, actorName()));
-}
-
-/**
- * Move a session to another page.
- *
- * Always a remount, for the same reason: an offset is not a fact anything watches,
- * and the rows the page-set names are the ones being navigated away from.
- */
-async function applyPage(sid: EntityId, n: number): Promise<void> {
-  await remount(sid, () => setPage(sessionOf(sid), n));
-}
-
-/**
- * Move every live session to the current workspace + viewer, resetting its
- * filter. Needed because a session stores its own scope as facts: without this a
- * workspace switch would leave open boards rendering the workspace they were
- * created in. (One active workspace per server is a demo simplification.)
- */
-async function rescope(): Promise<void> {
-  await retargetAll();
-  // A different workspace has different tags and todos, so the old filter is
-  // meaningless there — unlike a "view as" switch, which keeps it.
-  for (const sid of liveSessions) {
-    await applyFilter(sid, { ...emptyFilter }).catch((e) => console.error("rescope filter:", e));
-  }
-}
-
-/** A fresh session for a newly-arrived browser. */
-async function newSession(): Promise<SessionHandle> {
-  const h = await createSession(ctx.workspaceId, viewPersona, actorName());
-  await setFilter(h, { ...emptyFilter }, actorName());
-  return h;
-}
-
-/** The demo affordance (/session.json, the startup banner) needs *a* session. */
-let demoSession: SessionHandle | null = null;
-const ensureDemoSession = async (): Promise<SessionHandle> => (demoSession ??= await newSession());
-
-/** The session a request names in its path: /s/<sid>/… */
-function sidIn(seg: string[]): EntityId | null {
-  if (seg[0] !== "s") return null;
-  const v = Number(seg[1]);
-  return Number.isFinite(v) && v > 0 ? v : null;
-}
+/** Page-sets with a stream behind them, so /page.json can offer a real bind. */
+const livePageSets = new Set<EntityId>();
 
 // ---- Vendored static assets ------------------------------------------------
 // `public/` is populated by scripts/vendor-assets.sh. Names are content-pinned
@@ -368,61 +258,73 @@ async function serveStatic(parts: string[], res: http.ServerResponse): Promise<v
 // queries. So this function is still O(workspace) — paging bounded the board's
 // response and its render, not the cost of a page view. Saying so here because the
 // obvious next question is why the page is not fast yet.
-async function boardData(session: SessionHandle, pushed?: Snapshot) {
-  const [snap, counts, tags, blockers] = await Promise.all([
-    pushed ? Promise.resolve(pushed) : readSnapshot(session),
+async function boardData(state: BoardState, pgset: EntityId | null, tags: string[]) {
+  const [snap, counts, blockers] = await Promise.all([
+    readSnapshot(boardQuery(scopeNow(), state.filter), state.page),
     aggregateCounts(ctx, viewPersona), // counts over the SAME visible set
-    availableTags(ctx),
     blockerMap(ctx),
   ]);
-  // Record what this session is now looking at, so the page subscription follows
-  // it. Only on a real read: a `pushed` emission IS the subscription firing, and
-  // rewriting the set from inside it would churn fifty facts per update and wake
-  // the reader again.
-  if (!pushed)
+  // Record what this stream is now looking at, so the page subscription follows it.
+  if (pgset !== null)
     await writePageSet(
-      session.sessionId,
+      pgset,
       snap.rows.map((r) => r.id),
     );
   return { snap, todos: snap.rows as unknown as Todo[], counts, tags, blockers }; // SnapshotRow is Todo-shaped
 }
 
-/** The prev/next state for a rendered page. */
-const pagerOf = (session: SessionHandle, snap: Snapshot): Pager => ({
-  sid: session.sessionId,
-  page: snap.page,
-  hasMore: snap.hasMore,
-});
-
-// Render the filter bar + board over the stream, for ONE session. `pushed` is the
-// page Stardust just emitted — passing it through avoids re-reading a snapshot we
-// were handed a moment ago.
-async function renderBoard(stream: any, session: SessionHandle, pushed?: Snapshot) {
-  const [{ snap, todos, counts, tags, blockers }, filter] = await Promise.all([
-    boardData(session, pushed),
-    readFilter(session),
-  ]);
-  const sid = session.sessionId;
-  stream.patchElements(filterBar(sid, filter, counts.status, counts.priority, tags));
-  stream.patchElements(boardFragment(todos, blockers, filter, pagerOf(session, snap)));
-  stream.patchElements(sidebar(sid, filter, counts.status)); // desktop rail (hidden < 900px)
+// Render the filter bar + board over the stream, for ONE open board. The filter
+// arrives with the stream's own URL and does not change for its lifetime — a
+// different filter is a different stream — so it is captured once and passed down.
+async function renderBoard(stream: any, state: BoardState, pgset: EntityId) {
+  const tags = await availableTags(ctx);
+  const { snap, todos, counts, blockers } = await boardData(state, pgset, tags);
+  stream.patchElements(filterBar(state, counts.status, counts.priority, tags));
+  stream.patchElements(boardFragment(todos, blockers, state.filter, { state, hasMore: snap.hasMore }, pgset));
+  stream.patchElements(sidebar(state, counts.status)); // desktop rail (hidden < 900px)
 }
 
 // The same board, rendered into the initial HTML so the first paint is the real
 // page. Datastar morphs its first patch over identical markup, so this is purely
 // additive — nothing downstream changes.
-async function boardView(session: SessionHandle): Promise<BoardView> {
-  const [{ snap, todos, counts, tags, blockers }, filter] = await Promise.all([
-    boardData(session),
-    readFilter(session),
-  ]);
+//
+// No page-set: the SSR pass has no subscription to point at one. The stream that
+// the document opens a moment later leases its own and writes it.
+async function boardView(state: BoardState, tags: string[]): Promise<BoardView> {
+  const { snap, todos, counts, blockers } = await boardData(state, null, tags);
   return {
-    sidebar: sidebar(session.sessionId, filter, counts.status),
-    filterbar: filterBarEl(session.sessionId, filter, counts.status, counts.priority, tags),
-    board: boardEl(todos, blockers, filter, pagerOf(session, snap)),
+    sidebar: sidebar(state, counts.status),
+    filterbar: filterBarEl(state, counts.status, counts.priority, tags),
+    board: boardEl(todos, blockers, state.filter, { state, hasMore: snap.hasMore }),
     visible: visibleLabel(todos.length, snap.hasMore),
     total: visibleTotal(counts.status),
   };
+}
+
+/**
+ * The board state a request's query string describes, or a 400.
+ *
+ * The tag vocabulary is read first because it IS the tag filter's domain: a label
+ * is free text, so the only honest check on one arriving from a URL is "is this a
+ * tag this workspace actually uses". It is the same read the chips are drawn from,
+ * so it is passed back rather than fetched twice.
+ */
+async function boardStateOf(
+  parsed: URL,
+  res: http.ServerResponse,
+): Promise<{ state: BoardState; tags: string[] } | null> {
+  const tags = await availableTags(ctx);
+  try {
+    return { state: decodeFilter(parsed.searchParams, tags), tags };
+  } catch (e) {
+    if (!(e instanceof FilterError)) throw e;
+    // A hand-edited or stale URL is a CLIENT error, and it is answered rather than
+    // silently narrowed: dropping the value the app does not recognise would widen
+    // the board, which is the failure nobody notices.
+    res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+    res.end(`bad filter: ${e.message}\n`);
+    return null;
+  }
 }
 
 // Assemble everything the DETAIL route (/todo/<id>) needs from Stardust.
@@ -479,43 +381,33 @@ const server = http.createServer(async (req, res) => {
       await serveStatic(seg.slice(1), res);
       return;
     }
-    // Root → a NEW session for this browser, then redirect so the sid is in the
-    // URL. Reloading /s/<sid> reuses it; arriving at / again starts a fresh one,
-    // which is what "a session per browser session" means here.
+    // The board. Everything narrowing it is in the query string, so this route is
+    // the whole of "a filtered board is a URL": bookmarkable, shareable, and back
+    // and forward do what they say. Two people opening one link get two
+    // independent views — where `/s/<sid>` handed them the same mutable session
+    // and let them overwrite each other's clicks.
     if (url === "/" && method === "GET") {
-      const s = await newSession();
-      res.writeHead(302, { location: `/s/${s.sessionId}` });
-      res.end();
-      return;
-    }
-    // Session-scoped page. The sid in the path IS the session — it is handed to
-    // the client as a signal so every later request carries it.
-    if (seg[0] === "s" && seg.length === 2 && method === "GET") {
-      const sid = Number(seg[1]);
-      if (!Number.isFinite(sid) || sid <= 0) {
-        res.writeHead(404, { "content-type": "text/plain" });
-        res.end("not found");
-        return;
-      }
+      const got = await boardStateOf(parsed, res);
+      if (!got) return;
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      res.end(page(sid, await boardView(sessionOf(sid))));
+      res.end(page(got.state, await boardView(got.state, got.tags)));
       return;
     }
-    // Demo helper: copy-paste curl commands to watch THIS session's page (the
-    // `session-page` reactor + a per-stream sid bind) and the transaction bus.
-    // The board's ROW query is deliberately not offered here: it is a dry-run
-    // built per read with the filter inlined, so there is no stored reactor to
-    // subscribe to and nothing to bind.
-    if (url === "/session.json" && method === "GET") {
-      const s = await ensureDemoSession();
-      const rid = await sessionPage.id();
+    // Demo helper: copy-paste curl commands to watch a page-set (the `page-rows`
+    // reactor + a per-stream `ps` bind) and the transaction bus. The board's ROW
+    // query is deliberately not offered here: it is a dry-run built per read with
+    // the filter inlined, so there is no stored reactor to subscribe to and
+    // nothing to bind.
+    if (url === "/page.json" && method === "GET") {
+      const rid = await pageRows.id();
+      const open = [...livePageSets];
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify(
           {
-            sid: s.sessionId,
             reactorId: rid,
-            page: `curl -N -H 'Accept: application/x-ndjson' -G --data-urlencode 'bind={sid ${s.sessionId}}' "${BASE}/reactors/${rid}/results"`,
+            openPageSets: open,
+            page: `curl -N -H 'Accept: application/x-ndjson' -G --data-urlencode 'bind={ps {# ${open[0] ?? "<open a board first>"}}}' "${BASE}/reactors/${rid}/results"`,
             transactions: `curl -N -H 'Accept: application/x-ndjson' "${BASE}/events/bus/stardust/transactions"`,
           },
           null,
@@ -525,89 +417,46 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Long-lived stream: renders wsbar once per iteration, then the filtered
-    // board on every change; re-iterates on switch/filter (inner abort).
-    if (seg[0] === "s" && seg[2] === "stream" && method === "GET") {
-      const sid = sidIn(seg);
-      if (sid === null) {
-        res.writeHead(404, { "content-type": "text/plain" });
-        res.end("not found");
-        return;
-      }
-      const session = sessionOf(sid);
-      liveSessions.add(sid);
+    // Long-lived stream for ONE board. Its query string is the filter, fixed for
+    // the life of the stream: a filter change is a navigation, so it is a new
+    // document opening a new stream, and this one is closed by the browser.
+    if (url === "/stream" && method === "GET") {
+      const got = await boardStateOf(parsed, res);
+      if (!got) return;
+      const { state } = got;
+      // One page-set per STREAM. It is the identity the `page-rows` subscription
+      // binds to, and a stream is exactly the lifetime that identity has meaning
+      // for — a session entity outlived the tab that made it, and the demo had 84
+      // of them for twelve todos.
+      const pgset = await leasePageSet();
+      livePageSets.add(pgset);
       let closed = false;
       let inner: AbortController | null = null;
+      const board = { repaint: () => {} };
       req.on("close", () => {
         closed = true;
-        liveSessions.delete(sid);
-        boardStreams.delete(sid);
         inner?.abort();
+        openBoards.delete(board);
+        livePageSets.delete(pgset);
+        void releasePageSet(pgset).catch((e) => console.error("page-set release:", e));
       });
       ServerSentEventGenerator.stream(req, res, async (stream) => {
-        // The board is driven by Stardust, not by the app watching the commit bus:
-        // the reactor re-emits the whole result when this session's `rev` changes or
-        // a todo field in its top-level `where` moves, and each emission is rendered
-        // as-is. Nothing here decides what is relevant — the query already did.
+        const paint = () => void renderBoard(stream, state, pgset).catch((e) => console.error("render:", e));
+        board.repaint = paint;
+        openBoards.add(board);
         while (!closed) {
-          await boardGate.get(sid); // a shape change is mid-write; re-open after it
           inner = new AbortController();
-          boardStreams.set(sid, inner);
           // Subscribe to the PAGE, not the whole filtered set. The reactor is an
           // invalidation signal rather than a data source: it fires when a row on
           // screen changes, and the render re-reads the page properly so ordering
           // and shape come from one place. Edits to rows NOT on the page are
           // silent — membership moves only when the app rewrites the page-set.
-          await watchPage(
-            session.sessionId,
-            () => void renderBoard(stream, session).catch((e) => console.error("render:", e)),
-            inner.signal,
-          );
+          await watchPage(pgset, paint, inner.signal);
           // Only a client close aborts inner now. A dropped upstream stream (idle
           // timeout) did NOT abort → back off before resubscribing.
           if (!closed && !inner.signal.aborted) await new Promise((r) => setTimeout(r, 500));
         }
       });
-      return;
-    }
-
-    // Filter toggles: /filter/<facet>/<value>
-    if (seg[0] === "s" && seg[2] === "filter" && method === "POST") {
-      const [, , , facet, raw] = seg;
-      const value = decodeURIComponent(raw ?? "");
-      const sid = sidIn(seg);
-      if (sid === null) {
-        res.writeHead(404, { "content-type": "text/plain" });
-        res.end("not found");
-        return;
-      }
-      const session = sessionOf(sid);
-      // Read-modify-write against THIS session: the filter is not server state,
-      // so a toggle starts from what Stardust currently holds for this browser.
-      const before = await readFilter(session);
-      const filter = { ...before };
-      if (facet === "status") filter.status = toggle(filter.status, value as Status);
-      else if (facet === "priority") filter.priority = toggle(filter.priority, value as Priority);
-      else if (facet === "tag") filter.tags = toggle(filter.tags, value);
-      else if (facet === "view") filter.view = filter.view === (value as any) ? "all" : (value as any);
-      else if (facet === "group") filter.group = value as any;
-      await applyFilter(sid, filter);
-      noopStream(req, res);
-      return;
-    }
-
-    // Paging: /s/<sid>/page/<n>. The page is a fact on the session like every
-    // filter, so the server holds nothing and two browsers page independently.
-    if (seg[0] === "s" && seg[2] === "page" && method === "POST") {
-      const sid = sidIn(seg);
-      const n = Number(seg[3]);
-      if (sid === null || !Number.isFinite(n) || n < 0) {
-        res.writeHead(404, { "content-type": "text/plain" });
-        res.end("not found");
-        return;
-      }
-      await applyPage(sid, n);
-      noopStream(req, res);
       return;
     }
 
@@ -655,10 +504,10 @@ const server = http.createServer(async (req, res) => {
     // "View as" role switch (RBAC demo) — drives visibility + command projection.
     if (seg[0] === "viewas" && method === "POST") {
       viewPersona = seg[1] === "member" ? MEMBER_PERSONA : OWNER_PERSONA;
-      // The reactor reads visibility from the session's `viewer` FACT, so switching
-      // has to move it. Previously this only forced a repaint, which re-rendered
-      // with the old viewer still recorded.
-      await retargetAll();
+      // The viewer is inlined into the board body from process state, so there is
+      // nothing to write — every open board just has to paint again. It used to be
+      // a fact on each session, which is why this used to be a write per session.
+      repaintAll();
       noopStream(req, res);
       return;
     }
@@ -738,7 +587,12 @@ const server = http.createServer(async (req, res) => {
     const switchMatch = url.match(/^\/switch\/(\d+)$/);
     if (switchMatch && method === "POST") {
       ctx = await openWorkspace(personaId, Number(switchMatch[1]));
-      await rescope();
+      // The workspace is inlined from process state too. The filter stays what the
+      // reader's URL says — a different workspace has different tags, so a tag chip
+      // may now select nothing, which is a visibly empty board rather than a wrong
+      // one. (One active workspace per server is a demo simplification; a real one
+      // would put the workspace in the URL beside the filter.)
+      repaintAll();
       noopStream(req, res);
       return;
     }
@@ -750,7 +604,7 @@ const server = http.createServer(async (req, res) => {
         if (!name) return;
         const ws = await createWorkspace(personaId, name);
         ctx = await openWorkspace(personaId, ws.id);
-        await rescope();
+        repaintAll();
         stream.patchSignals(JSON.stringify({ newWs: "" }));
       });
       return;
@@ -840,7 +694,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readReactorRon(id);
       const binds = parsed.searchParams.get("runnable")
         ? runnableBinds(name, {
-            sid: parsed.searchParams.get("sid") ?? undefined,
+            ps: parsed.searchParams.get("ps") ?? undefined,
             todo: parsed.searchParams.get("todo") ?? undefined,
           })
         : {};
@@ -926,13 +780,13 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, async () => {
   console.log(`todo web UI  -> http://localhost:${PORT}`);
   console.log(`stardust     -> ${process.env.STARDUST_URL ?? "http://localhost:1981"}`);
-  // Pre-create the board session so `/` can redirect to /s/<sid>, and print the
-  // copy-paste demo commands (also at GET /session.json).
-  const s = await ensureDemoSession();
-  const rid = await sessionPage.id();
-  console.log(`\n  session ${s.sessionId} · page reactor ${rid}`);
+  // The copy-paste demo commands (also at GET /page.json). A page-set is leased
+  // per open stream, so there is no id to print until a board is open — the bind
+  // below takes one from /page.json.
+  const rid = await pageRows.id();
+  console.log(`\n  page reactor ${rid}`);
   console.log(
-    `  page     :  curl -N -H 'Accept: application/x-ndjson' -G --data-urlencode 'bind={sid ${s.sessionId}}' "${BASE}/reactors/${rid}/results"`,
+    `  page     :  curl -N -H 'Accept: application/x-ndjson' -G --data-urlencode 'bind={ps {# <pgset>}}' "${BASE}/reactors/${rid}/results"`,
   );
   console.log(`  tx bus   :  curl -N -H 'Accept: application/x-ndjson' "${BASE}/events/bus/stardust/transactions"\n`);
 });
