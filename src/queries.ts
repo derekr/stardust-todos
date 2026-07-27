@@ -73,6 +73,43 @@ export const blockersOfTodo = define("todo-blockers", {
   then: { project: { blocker: "?b", title: "?bt", status: "?bs" } },
 } as const);
 
+/**
+ * The rows a session currently has on screen, joined back from its `pg` facts.
+ *
+ * Bound by `?sid`, so one definition serves every session. This is the ONE place a
+ * stored reactor is unambiguously right: it is a subscription, its cost is bounded
+ * by the page size rather than the workspace, and membership changes only when the
+ * app rewrites the page-set — so a reader is woken by edits to what they are
+ * looking at and by nothing else.
+ */
+export const sessionPage = define("session-page", {
+  find: ["?t", "?title", "?status", "?priority", "?eff", "?blocked", "?done"],
+  where: [
+    ["?sess", "kind", "session"],
+    ["?sess", "sid", "?sid"],
+    ["?p", "kind", "pg"],
+    ["?p", "session", "?sess"],
+    ["?p", "todo", "?t"],
+    ["?t", "title", "?title"],
+    ["?t", "status", "?status"],
+    ["?t", "priority", "?priority"],
+    ["?t", "effectiveStatus", "?eff"],
+    ["?t", "blocked", "?blocked"],
+    ["?t", "done", "?done"],
+  ],
+  then: {
+    project: {
+      id: "?t",
+      title: "?title",
+      status: "?status",
+      priority: "?priority",
+      effectiveStatus: "?eff",
+      blocked: "?blocked",
+      done: "?done",
+    },
+  },
+} as const);
+
 /** Distinct tag labels in use across the workspace (deduped by the caller). */
 export const workspaceTags = define("board-tags", {
   find: ["?label"],
@@ -216,6 +253,7 @@ export const DECLARED = [
   tagsOfTodo,
   blockedByTodo,
   blockersOfTodo,
+  sessionPage,
   commandMenu,
   commandAuthz,
 ] as const;

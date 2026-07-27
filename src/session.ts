@@ -81,7 +81,6 @@ import {
   query,
   readEntity,
   readResults,
-  streamResults,
   transact,
 } from "./stardust.ts";
 import { sessionSchema } from "./schemas.ts";
@@ -503,59 +502,6 @@ const paged = (rows: SnapshotRow[], page: number): Snapshot => ({
   page,
   hasMore: rows.length > PAGE_SIZE,
 });
-
-/**
- * Watch this session's board. Stardust pushes the complete new result whenever the
- * result CHANGES — a filter write, a scope change, or a todo field in the top-level
- * `where` — so the server does not have to notice anything itself. An emission means
- * the rows differ; writing a field without changing the result pushes nothing.
- *
- * TOP-LEVEL clauses are the reliable trigger, and they cover rows that did not
- * exist when the stream opened: a brand-new entity the top-level clauses match
- * invalidates too, and only for the binds it actually matches (measured on the
- * `command-menu` reactor — see AGENTS.md, "What a subscription pushes").
- *
- * The one measured gap is TAG edges. Adding a tag pushes nothing — verified from a
- * background script and again with the tag filter active, so even an edge that
- * changes which rows match is invisible here. DEP edges do push (measured twice),
- * as do todo field writes from anywhere including the CLI, so this is narrower than
- * "subqueries don't invalidate": it is specifically the tag path. Treat the board as
- * a snapshot that advances on its own filter writes, on field writes, and on
- * dependency changes.
- *
- * A second gap arrives with the shaped body: this subscription is pinned to ONE
- * reactor, and a filter change can move the session to another. The caller has to
- * drop and re-open when `boardShape` changes — server.ts does, in `applyFilter`.
- * The `now` bind is likewise fixed for the life of the subscription, so an overdue
- * board that stays open past midnight is stale until something re-opens it.
- */
-export async function watchSnapshot(
-  h: SessionHandle,
-  onPage: (snap: Snapshot) => void,
-  signal: AbortSignal,
-): Promise<void> {
-  const { rid, bind, page, owned } = await boardTarget(h);
-  if (!owned) {
-    await streamResults(rid, (rows) => onPage(paged(rows as SnapshotRow[], page)), signal, bind);
-    return;
-  }
-  // A page past the first is NOT live, and this is where that is decided rather
-  // than hidden. Subscribing would mean holding an ephemeral reactor open for as
-  // long as a browser sits on page 7 — durable state whose lifetime is a scroll
-  // position, and a leak the moment the process dies with the tab still open.
-  // Deep pages are a snapshot: painted once, then still until the reader navigates.
-  // Making them live is what the page-set subscription is for; it is not this
-  // change, and pretending otherwise would be worse than saying so.
-  try {
-    onPage(paged(((await readResults(rid, bind)) as SnapshotRow[]) ?? [], page));
-  } finally {
-    await deleteReactor(rid).catch((e) => console.error("page reactor:", e));
-  }
-  await new Promise<void>((resolve) => {
-    if (signal.aborted) return resolve();
-    signal.addEventListener("abort", () => resolve(), { once: true });
-  });
-}
 
 /**
  * Move a session to page `n`.

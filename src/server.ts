@@ -60,10 +60,10 @@ import {
   retargetSession,
   setFilter,
   setPage,
-  watchSnapshot,
 } from "./session.ts";
 import { BASE, TxConflictError, lastTx, readEntity, readReactorRon, watchEntity } from "./stardust.ts";
 import { DECLARED, blockedByTodo } from "./queries.ts";
+import { watchPage, writePageSet } from "./pageset.ts";
 import { statusHistory } from "./history.ts";
 import {
   type BoardView,
@@ -390,6 +390,15 @@ async function boardData(session: SessionHandle, pushed?: Snapshot) {
     availableTags(ctx),
     blockerMap(ctx),
   ]);
+  // Record what this session is now looking at, so the page subscription follows
+  // it. Only on a real read: a `pushed` emission IS the subscription firing, and
+  // rewriting the set from inside it would churn fifty facts per update and wake
+  // the reader again.
+  if (!pushed)
+    await writePageSet(
+      session.sessionId,
+      snap.rows.map((r) => r.id),
+    );
   return { snap, todos: snap.rows as unknown as Todo[], counts, tags, blockers }; // SnapshotRow is Todo-shaped
 }
 
@@ -556,9 +565,14 @@ const server = http.createServer(async (req, res) => {
           await boardGate.get(sid); // a shape change is mid-write; re-open after it
           inner = new AbortController();
           boardStreams.set(sid, inner);
-          await watchSnapshot(
-            session,
-            (snap) => void renderBoard(stream, session, snap).catch((e) => console.error("render:", e)),
+          // Subscribe to the PAGE, not the whole filtered set. The reactor is an
+          // invalidation signal rather than a data source: it fires when a row on
+          // screen changes, and the render re-reads the page properly so ordering
+          // and shape come from one place. Edits to rows NOT on the page are
+          // silent — membership moves only when the app rewrites the page-set.
+          await watchPage(
+            session.sessionId,
+            () => void renderBoard(stream, session).catch((e) => console.error("render:", e)),
             inner.signal,
           );
           // Only a client close aborts inner now. A dropped upstream stream (idle
