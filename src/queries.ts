@@ -33,7 +33,7 @@ const VISIBLE = visibleTo("?viewer");
  *  10,000 for the whole query) and it is fixed the same way: `effectiveStatus` is a
  *  stored fact, so this is an ordinary join and the tally is a plain count. */
 export const counts = define("board-counts", {
-  find: ["?t", "?eff", "?priority"],
+  find: ["?eff", "?priority", ["count", "?t"]],
   where: [
     ["?t", "app", APP],
     ["?t", "workspace", "?ws"],
@@ -41,7 +41,7 @@ export const counts = define("board-counts", {
     ["?t", "priority", "?priority"],
     ...VISIBLE,
   ],
-  then: { project: { effectiveStatus: "?eff", priority: "?priority" } },
+  groupBy: ["?eff", "?priority"],
 } as const);
 
 /** Every dependency edge in the workspace: todo -> blocker (+ its title/status). */
@@ -111,15 +111,15 @@ export const pageRows = define("page-rows", {
 
 /** Distinct tag labels in use across the workspace (deduped by the caller). */
 export const workspaceTags = define("board-tags", {
-  find: ["?label"],
+  find: ["?label", ["count", "?e"]],
   where: [
     ["?e", "kind", "tag"],
     ["?e", "todo", "?t"],
     ["?t", "workspace", "?ws"],
     ["?e", "label", "?label"],
   ],
+  groupBy: ["?label"],
   orderBy: ["?label"],
-  then: { project: { label: "?label" } },
 } as const);
 
 /** Viewer-visible todos as pickable options (the dependency picker). */
