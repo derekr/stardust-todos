@@ -16,7 +16,7 @@
 // entities would mean fifty subscriptions. One join over one session's page-set is
 // one subscription, and the set is data the app already had to compute.
 
-import { type EntityId, query, transact } from "./stardust.ts";
+import { type EntityId, query, refId, transact } from "./stardust.ts";
 import { sessionPage } from "./queries.ts";
 
 /**
@@ -30,12 +30,27 @@ import { sessionPage } from "./queries.ts";
  */
 export async function writePageSet(sessionId: EntityId, ids: readonly EntityId[]): Promise<void> {
   const existing = (await query({
-    find: ["?p"],
+    find: ["?p", "?todo"],
     where: [
       ["?p", "kind", "pg"],
       ["?p", "session", { "#": sessionId }],
+      ["?p", "todo", "?todo"],
     ],
-  })) as [EntityId][];
+  })) as [EntityId, { "#": EntityId }][];
+
+  // Nothing to do when the page has not moved — and it usually has not, because
+  // every render calls this and most renders are the same rows again.
+  //
+  // This is not a micro-optimisation. Stardust is APPEND-ONLY: a retraction is
+  // more facts, so rewriting an identical set costs ~50 facts and 9 entity ids and
+  // never gives them back. Before this check, merely LOOKING at the board wrote to
+  // the database, and a demo with twelve todos had accumulated 22,872 facts.
+  //
+  // The engine already suppresses unchanged writes — but only for the same entity
+  // with the same value, and retract-then-recreate mints new ids, so it could never
+  // see one. The cheapest write remains the one not sent.
+  const before = existing.map(([, todo]) => refId(todo));
+  if (before.length === ids.length && before.every((id, i) => id === ids[i])) return;
 
   const patch: Record<string, Record<string, unknown>> = {};
   for (const [id] of existing) patch[id] = { kind: null, session: null, todo: null };
