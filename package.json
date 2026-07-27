@@ -9,6 +9,7 @@
     "cli": "node src/cli.ts",
     "seed": "node src/seed-demo.ts",
     "stardust:setup": "node scripts/setup.ts",
+    "seed:scale": "node scripts/seed-scale.ts",
     "fmt": "oxfmt src scripts",
     "fmt:check": "oxfmt --check src scripts",
     "lint": "oxlint src scripts",

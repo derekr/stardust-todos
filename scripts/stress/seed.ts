@@ -19,11 +19,39 @@ export interface Seeded {
   n: number;
 }
 
-async function tx(base: string, patch: Record<string, unknown>): Promise<Record<string, number>> {
+export async function tx(base: string, patch: Record<string, unknown>): Promise<Record<string, number>> {
   const res = await fetch(`${base}/commands/transact`, { method: "POST", headers: H, body: JSON.stringify(patch) });
   const body = await res.text();
   if (!res.ok) throw new Error(`transact: ${res.status} ${body.slice(0, 300)}`);
   return JSON.parse(body).tempIds ?? {};
+}
+
+/**
+ * Write `n` entities in batches, `make(k)` producing each — the batching, shared
+ * with the demo's own bulk seed (`scripts/seed-scale.ts`).
+ *
+ * The batch size is the only constant here that matters: 100 entities per transact
+ * ran at 7k facts/s and 5,000 ran at 70k, a 10x difference. The ceiling is not the
+ * write — the response echoes a before/after patch for every entity, so a big batch
+ * also returns a megabyte that is immediately thrown away.
+ */
+export async function bulk(
+  base: string,
+  n: number,
+  make: (k: number) => Record<string, unknown>,
+  batchSize: number,
+  onBatch?: (done: number) => void,
+): Promise<Int32Array> {
+  const ids = new Int32Array(n);
+  for (let off = 0; off < n; off += batchSize) {
+    const size = Math.min(batchSize, n - off);
+    const patch: Record<string, unknown> = {};
+    for (let i = 0; i < size; i++) patch[`#_t${i}`] = make(off + i);
+    const got = await tx(base, patch);
+    for (let i = 0; i < size; i++) ids[off + i] = got[`t${i}`]!;
+    onBatch?.(off + size);
+  }
+  return ids;
 }
 
 /**
@@ -44,18 +72,17 @@ export async function seed(base: string, n: number, batchSize = 5000, log = cons
     member = ids.member!;
   log(`  workspace #${workspace}  owner #${owner}  member #${member}`);
 
-  const idByK = new Int32Array(n);
   const t0 = Date.now();
-  for (let off = 0; off < n; off += batchSize) {
-    const size = Math.min(batchSize, n - off);
-    const patch: Record<string, unknown> = {};
-    for (let i = 0; i < size; i++) {
-      const r = row(off + i);
+  const idByK = await bulk(
+    base,
+    n,
+    (k) => {
+      const r = row(k);
       const t: Record<string, unknown> = {
         kind: "todo",
         app: "todo-app",
         workspace: { "#": workspace },
-        title: `stress ${String(off + i).padStart(7, "0")}`,
+        title: `stress ${String(k).padStart(7, "0")}`,
         status: r.status,
         priority: r.priority,
         done: r.done,
@@ -66,21 +93,21 @@ export async function seed(base: string, n: number, batchSize = 5000, log = cons
         // it. The dep edges arrive later in this same seed, but the generator
         // already knows which ones it is going to write, so the consequence is
         // known before the cause — the same position the app's write paths are in.
-        blocked: blocked(off + i),
-        effectiveStatus: effectiveStatus(off + i),
-        prank: prank(off + i),
+        blocked: blocked(k),
+        effectiveStatus: effectiveStatus(k),
+        prank: prank(k),
       };
       if (r.due !== null) t.due = { "#utc": new Date(r.due).toISOString() };
-      patch[`#_t${i}`] = t;
-    }
-    const got = await tx(base, patch);
-    for (let i = 0; i < size; i++) idByK[off + i] = got[`t${i}`]!;
-    if ((off / batchSize) % 20 === 0 || off + size >= n) {
-      const done = off + size,
-        secs = (Date.now() - t0) / 1000;
-      log(`  todos ${done.toLocaleString()}/${n.toLocaleString()}  ${Math.round(done / secs).toLocaleString()}/s`);
-    }
-  }
+      return t;
+    },
+    batchSize,
+    (done) => {
+      if (done % (batchSize * 20) === 0 || done >= n) {
+        const secs = (Date.now() - t0) / 1000;
+        log(`  todos ${done.toLocaleString()}/${n.toLocaleString()}  ${Math.round(done / secs).toLocaleString()}/s`);
+      }
+    },
+  );
 
   // Edges second: they reference todos, so every id must already exist.
   const edges: Record<string, unknown> = {};
