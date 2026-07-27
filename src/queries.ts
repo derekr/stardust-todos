@@ -58,6 +58,21 @@ export const blockers = define("board-blockers", {
   then: { project: { todo: "?t", blocker: "?b", title: "?bt", status: "?bs" } },
 } as const);
 
+/** The blockers OF one todo. The same dependency edge as `board-blockers`, walked
+ *  from the other end: bound by `?todo` rather than `?ws`, so the detail page reads
+ *  the handful of rows it renders instead of every edge in the workspace. */
+export const blockersOfTodo = define("todo-blockers", {
+  find: ["?b", "?bt", "?bs"],
+  where: [
+    ["?d", "kind", "dep"],
+    ["?d", "todo", "?todo"],
+    ["?d", "blocker", "?b"],
+    ["?b", "title", "?bt"],
+    ["?b", "status", "?bs"],
+  ],
+  then: { project: { blocker: "?b", title: "?bt", status: "?bs" } },
+} as const);
+
 /** Distinct tag labels in use across the workspace (deduped by the caller). */
 export const workspaceTags = define("board-tags", {
   find: ["?label"],
@@ -200,6 +215,7 @@ export const DECLARED = [
   todoPicker,
   tagsOfTodo,
   blockedByTodo,
+  blockersOfTodo,
   commandMenu,
   commandAuthz,
 ] as const;

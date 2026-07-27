@@ -40,6 +40,7 @@ import {
   aggregateCounts,
   availableTags,
   blockerMap,
+  blockersOf,
   effectiveStatus,
   emptyFilter,
   todoOptions,
@@ -443,7 +444,7 @@ async function detailData(id: number): Promise<{ todo: any; opts: DetailOpts } |
     draft: e.draft === true,
     lastActor: (e.lastActor as string) ?? undefined,
   };
-  const blockers = (await blockerMap(ctx)).get(id) ?? [];
+  const blockers = await blockersOf(id);
   const openBlockers = blockers.filter((b) => b.status !== "done");
   const effStatus = effectiveStatus({ status: todo.status, blocked: openBlockers.length > 0 });
   const blockerIds = new Set(blockers.map((b) => b.id));

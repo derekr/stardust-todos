@@ -10,7 +10,7 @@ import type { WorkspaceCtx } from "./workspace.ts";
 import type { Priority, Status, Todo } from "./todos.ts";
 import { effectiveStatusOf } from "./todos.ts";
 import { type EntityId, refId } from "./stardust.ts";
-import { blockers, counts, todoPicker, workspaceTags } from "./queries.ts";
+import { blockers, blockersOfTodo, counts, todoPicker, workspaceTags } from "./queries.ts";
 
 /** Effective display status for one row. `done` wins over blocked.
  *
@@ -110,6 +110,17 @@ export async function blockerMap(ctx: WorkspaceCtx): Promise<Map<EntityId, Block
     map.get(id)!.push({ id: refId(r.blocker), title: r.title as string, status: r.status as Status });
   }
   return map;
+}
+
+/**
+ * The blockers of ONE todo.
+ *
+ * The detail page used to call `blockerMap` — a whole-workspace read of every
+ * dependency edge — and then keep exactly one entry. This asks for that entry.
+ */
+export async function blockersOf(todoId: EntityId): Promise<Blocker[]> {
+  const rows = await blockersOfTodo.read({ todo: { "#": todoId } });
+  return rows.map((r) => ({ id: refId(r.blocker), title: r.title as string, status: r.status as Status }));
 }
 
 /** Distinct tag labels used in the workspace. */
