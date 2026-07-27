@@ -93,7 +93,9 @@ import {
   replayView,
   scrubber,
   streamTxFeed,
+  timingTable,
 } from "./inspect.ts";
+import { Trace, debugComment, recentRequests } from "./timing.ts";
 
 /** Reactors the x-ray may hand out as RON: exactly the ones it documents. */
 /**
@@ -198,6 +200,9 @@ process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 /** The half of the board's inputs a client does not get to supply. */
 const scopeNow = (): BoardScope => ({ workspace: ctx.workspaceId, viewer: viewPersona, actor: actorName() });
 
+/** `?debug=1` — hand this request's own timing record back in the response. */
+const debug = (parsed: URL): boolean => parsed.searchParams.get("debug") === "1";
+
 const noopStream = (req: http.IncomingMessage, res: http.ServerResponse) =>
   ServerSentEventGenerator.stream(req, res, () => {});
 
@@ -280,21 +285,46 @@ async function serveStatic(parts: string[], res: http.ServerResponse): Promise<v
 // The blocker read cannot join the snapshot's `Promise.all`, because it takes the
 // ids the snapshot returned. It costs nothing when no row on the page is blocked,
 // which is the common case — the query is not issued at all.
-async function boardData(state: BoardState, pgset: PageSet | null, tags: string[]) {
-  const snap = await readSnapshot(boardQuery(scopeNow(), state.filter), state.page);
+//
+// Every read here goes through `t.read`, which will not time anything that cannot
+// say how many rows it produced (src/timing.ts). The `rows` count on the SNAPSHOT
+// is the rows the query returned, which is 51 on a page with a next one — the
+// 51st is never rendered but it was read, and the number in the log is what the
+// engine did rather than what the template used.
+async function boardData(t: Trace, state: BoardState, pgset: PageSet | null, tags: string[]) {
+  const snap = await t.read(
+    "rows",
+    () => readSnapshot(boardQuery(scopeNow(), state.filter), state.page),
+    (s) => s.rows.length + (s.hasMore ? 1 : 0),
+  );
   const todos = snap.rows as unknown as Todo[]; // SnapshotRow is Todo-shaped
   // Only the rows that will actually draw a ⊘ need their blockers, and `row()` draws
   // one exactly when the effective status is `blocked` — the same stored fact the
   // snapshot carries. So this asks about those rows and no others.
-  const blockers = await blockersFor(todos.filter((t) => effectiveStatus(t) === "blocked").map((t) => t.id));
+  //
+  // `in` is what makes that legible afterwards: this read costs ~0ms both when no
+  // row on the page is blocked (no query is issued at all) and when the query runs
+  // and finds nothing, and those mean different things. `in 0` is the first.
+  const blockedIds = todos.filter((x) => effectiveStatus(x) === "blocked").map((x) => x.id);
+  const blockers = await t.read(
+    "blockers",
+    () => blockersFor(blockedIds),
+    (m) => [...m.values()].reduce((n, bs) => n + bs.length, 0),
+    blockedIds.length,
+  );
   // Record what this stream is now looking at, so the page subscription follows it.
   // Costs nothing at all when the rows have not moved: `showPage` diffs against
-  // what this process last wrote to those slots and sends no transaction.
-  if (pgset !== null)
-    await showPage(
-      pgset,
-      snap.rows.map((r) => r.id),
+  // what this process last wrote to those slots and sends no transaction — which is
+  // exactly what `rows 0` means on this line, and why it is worth logging.
+  if (pgset !== null) {
+    const ids = snap.rows.map((r) => r.id);
+    await t.read(
+      "pgset",
+      () => showPage(pgset, ids),
+      (w) => (w ? w.asserted + w.retracted : 0),
+      ids.length,
     );
+  }
   return { snap, todos, tags, blockers };
 }
 
@@ -316,13 +346,35 @@ async function boardData(state: BoardState, pgset: PageSet | null, tags: string[
 // fifty cannot say. What it CAN be is late. This is deliberately not the same move
 // as the empty SSR shell that was reversed for flashing (see `BoardView`): the
 // board arrives complete and it is three numerals that follow, not the content.
-async function renderBoard(stream: any, state: BoardState, pgset: PageSet, tags: string[]): Promise<string> {
-  const counting = aggregateCounts(ctx, viewPersona); // in flight, not awaited
-  const { snap, todos, blockers } = await boardData(state, pgset, tags);
-  stream.patchElements(boardFragment(todos, blockers, state.filter, { state, hasMore: snap.hasMore }, pgset.id));
+//
+// `why` says what provoked this paint — `open` for the one every stream starts
+// with, `push` for one the page subscription woke, `repaint` for a workspace or
+// "view as" switch. It is the field that answers a question nobody could ask
+// before: a filter change repaints over a NEW stream, so it should produce exactly
+// one `open` record, and three of them would mean three reads of the board where a
+// reader saw one page.
+async function renderBoard(
+  stream: any,
+  state: BoardState,
+  pgset: PageSet,
+  tags: string[],
+  why: string,
+): Promise<string> {
+  const t = new Trace("board-paint", why);
+  t.describe(shapeOf(state, tags));
+  const counting = t.read(
+    "counts",
+    () => aggregateCounts(ctx, viewPersona),
+    (c) => Object.values(c.status).reduce((n, x) => n + x, 0), // todos the tally covered
+  ); // in flight, not awaited
+  const { snap, todos, blockers } = await boardData(t, state, pgset, tags);
+  stream.patchElements(
+    t.render(() => boardFragment(todos, blockers, state.filter, { state, hasMore: snap.hasMore }, pgset.id)),
+  );
   const counts = await counting; // counts over the SAME visible set as the board
-  stream.patchElements(filterBar(state, counts, tags));
-  stream.patchElements(sidebar(state, counts)); // desktop rail (hidden < 900px)
+  stream.patchElements(t.render(() => filterBar(state, counts, tags)));
+  stream.patchElements(t.render(() => sidebar(state, counts))); // desktop rail (hidden < 900px)
+  t.done();
   // The emission this render's own page-set write is about to provoke, described in
   // the subscription's own terms. Returning it is what lets the stream loop drop the
   // echo instead of reading the whole board a second time to discover it changed
@@ -343,15 +395,34 @@ async function renderBoard(stream: any, state: BoardState, pgset: PageSet, tags:
 //
 // No page-set: the SSR pass has no subscription to point at one. The stream that
 // the document opens a moment later leases its own and writes it.
-async function boardView(state: BoardState, tags: string[]): Promise<BoardView> {
-  const { snap, todos, blockers } = await boardData(state, null, tags);
-  return {
+async function boardView(t: Trace, state: BoardState, tags: string[]): Promise<BoardView> {
+  const { snap, todos, blockers } = await boardData(t, state, null, tags);
+  return t.render(() => ({
     sidebar: sidebar(state, null),
     filterbar: filterBarEl(state, null, tags),
     board: boardEl(todos, blockers, state.filter, { state, hasMore: snap.hasMore }),
     visible: visibleLabel(todos.length, snap.hasMore),
-  };
+  }));
 }
+
+/**
+ * The filter, as a log line describes it.
+ *
+ * Facets and view are domain-checked values out of a fixed list, so they are
+ * written out. TAG LABELS are free text a browser sent, so only how MANY were
+ * selected is recorded, next to the size of the vocabulary they were checked
+ * against — enough to read a timing by, and nothing a reader typed. Same rule the
+ * query bodies follow: a value from outside is data, never text.
+ */
+const shapeOf = (state: BoardState, tags: string[]): Record<string, unknown> => ({
+  st: state.filter.status,
+  pr: state.filter.priority,
+  v: state.filter.view,
+  g: state.filter.group,
+  tags: state.filter.tags.length,
+  vocab: tags.length,
+  page: state.page,
+});
 
 /**
  * The board state a request's query string describes, or a 400.
@@ -364,10 +435,17 @@ async function boardView(state: BoardState, tags: string[]): Promise<BoardView> 
 async function boardStateOf(
   parsed: URL,
   res: http.ServerResponse,
+  t: Trace,
 ): Promise<{ state: BoardState; tags: string[] } | null> {
-  const tags = await availableTags(ctx);
+  const tags = await t.read(
+    "tags",
+    () => availableTags(ctx),
+    (v) => v.length,
+  );
   try {
-    return { state: decodeFilter(parsed.searchParams, tags), tags };
+    const state = decodeFilter(parsed.searchParams, tags);
+    t.describe(shapeOf(state, tags));
+    return { state, tags };
   } catch (e) {
     if (!(e instanceof FilterError)) throw e;
     // A hand-edited or stale URL is a CLIENT error, and it is answered rather than
@@ -409,11 +487,19 @@ const candQuery = (v: unknown): string => (typeof v === "string" ? v.trim().slic
  * and shrinking it does not mean more rows exist.
  */
 async function pickerCandidates(
+  t: Trace,
   id: number,
   blockerIds: Set<number>,
   term: string,
 ): Promise<{ candidates: { id: number; title: string }[]; capped: boolean }> {
-  const found = term ? await searchTodoOptions(ctx, viewPersona, term) : await todoOptions(ctx, viewPersona);
+  // Named for which read it was: an fts search and the unsearched list are two
+  // different queries with two different costs, and a breakdown that called both
+  // "picker" would average them into something true of neither.
+  const found = await t.read(
+    term ? "search" : "picker",
+    () => (term ? searchTodoOptions(ctx, viewPersona, term) : todoOptions(ctx, viewPersona)),
+    (rows) => rows.length,
+  );
   return {
     candidates: found.filter((o) => o.id !== id && !blockerIds.has(o.id)),
     capped: found.length >= (term ? SEARCH_LIMIT : PICKER_LIMIT),
@@ -421,8 +507,16 @@ async function pickerCandidates(
 }
 
 // Assemble everything the DETAIL route (/todo/<id>) needs from Stardust.
-async function detailData(id: number): Promise<{ todo: any; opts: DetailOpts } | null> {
-  const e = await readEntity(id);
+async function detailData(t: Trace, id: number): Promise<{ todo: any; opts: DetailOpts } | null> {
+  // The detail page is eight reads deep, which is not obvious from reading it and
+  // was not visible from outside at all. Each one carries its row count for the
+  // same reason the board's do: `blocks 0` after a rewrite is either the truth or a
+  // silently broken join, and only the count tells you which.
+  const e = await t.read(
+    "entity",
+    () => readEntity(id),
+    (x) => (x && x.title ? 1 : 0),
+  );
   if (!e || !e.title) return null;
   const todo = {
     id,
@@ -433,7 +527,11 @@ async function detailData(id: number): Promise<{ todo: any; opts: DetailOpts } |
     draft: e.draft === true,
     lastActor: (e.lastActor as string) ?? undefined,
   };
-  const blockers = await blockersOf(id);
+  const blockers = await t.read(
+    "blockers",
+    () => blockersOf(id),
+    (bs) => bs.length,
+  );
   const openBlockers = blockers.filter((b) => b.status !== "done");
   const effStatus = effectiveStatus({ status: todo.status, blocked: openBlockers.length > 0 });
   const blockerIds = new Set(blockers.map((b) => b.id));
@@ -442,18 +540,44 @@ async function detailData(id: number): Promise<{ todo: any; opts: DetailOpts } |
   // signals were captured when it connected — so a repaint arriving mid-search puts
   // the default list back under a filled search box. That needs a concurrent change
   // to THIS todo while the picker is open, and the next keystroke corrects it.
-  const { candidates, capped } = await pickerCandidates(id, blockerIds, "");
-  const tags = await tagsOf(ctx, id);
-  const history = ((await statusHistory(id)) as HistEntry[]).slice(-8); // most recent changes
+  const { candidates, capped } = await pickerCandidates(t, id, blockerIds, "");
+  const tags = await t.read(
+    "tags",
+    () => tagsOf(ctx, id),
+    (v) => v.length,
+  );
+  // The row count is the WHOLE history the read returned; the page shows the last
+  // eight of it. A timing next to "8" would be a timing next to the template.
+  const history = (
+    (await t.read(
+      "history",
+      () => statusHistory(id),
+      (h) => h.length,
+    )) as HistEntry[]
+  ).slice(-8);
   const role = await curRole();
-  const commands = await visibleCommands("todo", role);
+  const commands = await t.read(
+    "commands",
+    () => visibleCommands("todo", role),
+    (c) => c.length,
+  );
   const canPublish = e.draft === true && (e.author as { "#": number } | undefined)?.["#"] === viewPersona;
   // "Blocks" = titles of todos that depend on THIS one (reverse dep edge).
-  const blocks = (await blockedByTodo.read({ todo: { "#": id } })).map((r) => r.title as string);
+  const blocks = (
+    await t.read(
+      "blocks",
+      () => blockedByTodo.read({ todo: { "#": id } }),
+      (r) => r.length,
+    )
+  ).map((r) => r.title as string);
   const due = (e.due as { "#utc"?: string } | undefined)?.["#utc"];
   // The entity's last transaction NOW — the CTA embeds it as its Tx-Check-Last
   // guard, so a transition only commits if the todo hasn't moved since render.
-  const expectTx = await lastTx(id);
+  const expectTx = await t.read(
+    "lastTx",
+    () => lastTx(id),
+    (tx) => (tx ? 1 : 0),
+  );
   return {
     todo,
     opts: {
@@ -472,10 +596,16 @@ async function detailData(id: number): Promise<{ todo: any; opts: DetailOpts } |
   };
 }
 
-// Re-patch #detail (the whole detail fragment) after a mutation.
-async function sendDetail(stream: any, id: number) {
-  const d = await detailData(id);
-  if (d) stream.patchElements(detailFragment(d.todo, d.opts));
+// Re-patch #detail (the whole detail fragment) after a mutation. `why` names what
+// asked for it — the paint a stream opens with, a pushed entity snapshot, or the
+// write the reader just made — so a repeated repaint is countable rather than
+// inferred from how the page felt.
+async function sendDetail(stream: any, id: number, why: string) {
+  const t = new Trace("detail-paint", why);
+  t.describe({ todo: id });
+  const d = await detailData(t, id);
+  if (d) stream.patchElements(t.render(() => detailFragment(d.todo, d.opts)));
+  t.done();
 }
 
 const server = http.createServer(async (req, res) => {
@@ -497,10 +627,17 @@ const server = http.createServer(async (req, res) => {
     // independent views — where `/s/<sid>` handed them the same mutable session
     // and let them overwrite each other's clicks.
     if (url === "/" && method === "GET") {
-      const got = await boardStateOf(parsed, res);
+      const t = new Trace("board");
+      const got = await boardStateOf(parsed, res, t);
       if (!got) return;
+      const view = await boardView(t, got.state, got.tags);
+      const html = t.render(() => page(got.state, view));
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      res.end(page(got.state, await boardView(got.state, got.tags)));
+      // `?debug=1` returns the SAME document with the record appended as a comment,
+      // so what an agent measures is the response a browser gets rather than a
+      // debug-only code path. `curl -s '…?debug=1' | tail -2` is the whole protocol.
+      const rec = t.done();
+      res.end(debug(parsed) ? html + debugComment(rec) : html);
       return;
     }
     // Demo helper: copy-paste curl commands to watch a page-set (the `page-rows`
@@ -531,14 +668,23 @@ const server = http.createServer(async (req, res) => {
     // the life of the stream: a filter change is a navigation, so it is a new
     // document opening a new stream, and this one is closed by the browser.
     if (url === "/stream" && method === "GET") {
-      const got = await boardStateOf(parsed, res);
+      // The stream's own setup is its own record — the tag vocabulary is read once
+      // per STREAM rather than once per paint, so charging it to the first paint
+      // would misattribute it to every filter change that follows.
+      const t = new Trace("board-stream", "connect");
+      const got = await boardStateOf(parsed, res, t);
       if (!got) return;
       const { state, tags } = got;
       // One page-set per STREAM. It is the identity the `page-rows` subscription
       // binds to, and a stream is exactly the lifetime that identity has meaning
       // for — a session entity outlived the tab that made it, and the demo had 84
       // of them for twelve todos.
-      const pgset = await leasePageSet();
+      const pgset = await t.read(
+        "lease",
+        () => leasePageSet(),
+        (ps) => ps.slots.length,
+      );
+      t.done();
       let closed = false;
       let inner: AbortController | null = null;
       const board = { repaint: () => {} };
@@ -556,14 +702,15 @@ const server = http.createServer(async (req, res) => {
         // fields the subscription is sensitive to, so nothing a reader would have
         // seen can be dropped by it.
         let painted = "";
-        const paint = () =>
-          void renderBoard(stream, state, pgset, tags)
+        const paint = (why: string) =>
+          void renderBoard(stream, state, pgset, tags, why)
             .then((k) => {
               painted = k;
             })
             .catch((e) => console.error("render:", e));
-        board.repaint = paint;
+        board.repaint = () => paint("repaint");
         openBoards.add(board);
+        let first = true; // the paint every stream opens with, vs one after a drop
         while (!closed) {
           inner = new AbortController();
           // Paint BEFORE subscribing. The page-set has to be written for the
@@ -571,11 +718,12 @@ const server = http.createServer(async (req, res) => {
           // reactor — so subscribing first meant an empty first emission, a full
           // render, and then an echo that triggered a second identical render. One
           // board read per stream instead of two.
-          await renderBoard(stream, state, pgset, tags)
+          await renderBoard(stream, state, pgset, tags, first ? "open" : "reopen")
             .then((k) => {
               painted = k;
             })
             .catch((e) => console.error("render:", e));
+          first = false;
           // Subscribe to the PAGE, not the whole filtered set. The reactor is an
           // invalidation signal rather than a data source: it fires when a row on
           // screen changes, and the render re-reads the page properly so ordering
@@ -585,7 +733,7 @@ const server = http.createServer(async (req, res) => {
             pgset,
             (rows) => {
               if (frameKey(rows) === painted) return; // our own echo
-              paint();
+              paint("push");
             },
             inner.signal,
           );
@@ -600,14 +748,18 @@ const server = http.createServer(async (req, res) => {
     // DETAIL page (real route): GET /todo/<id> — replaces the old menu overlay.
     if (seg[0] === "todo" && seg.length === 2 && method === "GET") {
       const id = Number(seg[1]);
-      const d = await detailData(id);
+      const t = new Trace("detail");
+      t.describe({ todo: id });
+      const d = await detailData(t, id);
       if (!d) {
         res.writeHead(404, { "content-type": "text/plain" });
         res.end("not found");
         return;
       }
+      const html = t.render(() => detailPage(d.todo, d.opts));
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      res.end(detailPage(d.todo, d.opts));
+      const rec = t.done();
+      res.end(debug(parsed) ? html + debugComment(rec) : html);
       return;
     }
 
@@ -622,9 +774,24 @@ const server = http.createServer(async (req, res) => {
       const id = Number(seg[1]);
       const term = candQuery(getSignals(req).candQ);
       ServerSentEventGenerator.stream(req, res, async (stream) => {
-        const blockerIds = new Set((await blockersOf(id)).map((b) => b.id));
-        const { candidates, capped } = await pickerCandidates(id, blockerIds, term);
-        stream.patchElements(candidateList(id, candidates, { q: term, capped }));
+        const t = new Trace("picker", term ? "search" : "clear");
+        // The term itself never reaches the log — it is text a person typed. Its
+        // LENGTH is what a timing needs, because what bounds an fts read is the
+        // term, and a one-character term and a ten-character one are different
+        // questions with different answers.
+        t.describe({ todo: id, qlen: term.length });
+        const blockerIds = new Set(
+          (
+            await t.read(
+              "blockers",
+              () => blockersOf(id),
+              (bs) => bs.length,
+            )
+          ).map((b) => b.id),
+        );
+        const { candidates, capped } = await pickerCandidates(t, id, blockerIds, term);
+        stream.patchElements(t.render(() => candidateList(id, candidates, { q: term, capped })));
+        t.done();
       });
       return;
     }
@@ -638,6 +805,7 @@ const server = http.createServer(async (req, res) => {
         closed = true;
         ac.abort();
       });
+      let first = true; // the paint the pane opens with, vs one Stardust pushed
       ServerSentEventGenerator.stream(req, res, async (stream) => {
         // `GET /entities/{id}` without `max` is Stardust's own live form: current
         // snapshot, then one per change to this todo's facts. So the repaint trigger
@@ -648,8 +816,9 @@ const server = http.createServer(async (req, res) => {
         // land here. The browser that makes such a change repaints from its own
         // request; another browser sees it on next load.
         while (!closed) {
-          await sendDetail(stream, id); // paint, then repaint per pushed snapshot
-          await watchEntity(id, () => void sendDetail(stream, id).catch(() => {}), ac.signal);
+          await sendDetail(stream, id, first ? "open" : "reopen"); // paint, then repaint per pushed snapshot
+          first = false;
+          await watchEntity(id, () => void sendDetail(stream, id, "push").catch(() => {}), ac.signal);
           if (!closed && !ac.signal.aborted) await new Promise((r) => setTimeout(r, 500));
         }
       });
@@ -734,7 +903,7 @@ const server = http.createServer(async (req, res) => {
         if (conflict) {
           stream.patchSignals(JSON.stringify({ toast: "Someone changed this task — refreshed to the latest." }));
         }
-        await sendDetail(stream, id); // deterministically refresh the detail (covers dep changes + conflict)
+        await sendDetail(stream, id, action ?? "write"); // deterministically refresh (covers dep changes + conflict)
       });
       return;
     }
@@ -808,7 +977,7 @@ const server = http.createServer(async (req, res) => {
       ServerSentEventGenerator.stream(req, res, async (stream) => {
         if (conflict) stream.patchSignals(JSON.stringify({ toast: "This draft changed — refreshed to the latest." }));
         else if (!ok) stream.patchSignals(JSON.stringify({ toast: "Only the author can publish this draft." }));
-        await sendDetail(stream, id);
+        await sendDetail(stream, id, "publish");
       });
       return;
     }
@@ -863,7 +1032,26 @@ const server = http.createServer(async (req, res) => {
       // The standalone page.
       if (seg.length === 1 && method === "GET") {
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-        res.end(inspectPage());
+        res.end(inspectPage(recentRequests()));
+        return;
+      }
+
+      // The request records, as the glass box shows them and as a machine reads
+      // them. The table is rendered from the same ring on page load; this refreshes
+      // it in place, which is what makes the panel useful while you drive the board
+      // in the other tab.
+      if (seg[1] === "timings" && method === "GET") {
+        ServerSentEventGenerator.stream(req, res, (stream) => {
+          stream.patchElements(timingTable(recentRequests()));
+        });
+        return;
+      }
+      // The same ring as JSON — the only way to get the SSE paints out, since a
+      // stream cannot carry the HTML comment `?debug=1` appends to a document. An
+      // agent that changed a filter reads its paint records here.
+      if (seg[1] === "timings.json" && method === "GET") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(recentRequests(), null, 2));
         return;
       }
 

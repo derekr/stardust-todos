@@ -13,6 +13,7 @@
 //                board's history, event-sourced, played back for real.
 
 import { type EntityId, readEntity, streamRecords } from "./stardust.ts";
+import type { RequestRecord } from "./timing.ts";
 import { B } from "./base.ts";
 
 const esc = (s: string) =>
@@ -354,11 +355,64 @@ export function replayView(list: TxView[], nRaw: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// Where the time went. The other three panels answer "what did the database do";
+// this one answers "what did this server spend, and on how many rows" — which is
+// the question every wrong number in this project's history was an answer to.
+//
+// Every read is drawn as `name ms · Nr`, and the row count is never omitted or
+// abbreviated away, because the whole point is that 17ms over 0 rows and 17ms over
+// 9,947 are not the same measurement. A read that was never issued (no row on the
+// page is blocked, so no blocker query happens) is drawn `—` rather than `0r`, so
+// "it matched nothing" and "it was not asked" stay distinguishable on the page as
+// well as in the log.
+// ---------------------------------------------------------------------------
+
+const readChip = (r: RequestRecord["reads"][number]): string => {
+  const rows = r.in === 0 && r.rows === 0 ? "—" : `${r.rows}r`;
+  const asked = r.in !== undefined && r.in > 0 ? `<span class="tin">/${r.in}</span>` : "";
+  return `<span class="tread"><span class="trn">${esc(r.read)}</span><span class="trms">${r.ms}</span><span class="trr">${rows}${asked}</span></span>`;
+};
+
+/** The filter, as one cell. Only what was NARROWED: an unfiltered board reads `—`,
+ *  because a column that says "all, all, page 0" every row is a column nobody
+ *  scans. The vocabulary size is only interesting next to a tag selection. */
+const shapeText = (s: Record<string, unknown>): string =>
+  Object.entries(s)
+    .filter(([k]) => !(k === "vocab" && !s.tags))
+    .filter(([, v]) => v !== 0 && !(Array.isArray(v) && !v.length) && v !== "all" && v !== "status")
+    .map(([k, v]) => `${k}=${Array.isArray(v) ? v.join("+") : String(v)}`)
+    .join(" ") || "—";
+
+export function timingTable(recs: readonly RequestRecord[]): string {
+  if (!recs.length) {
+    return `<div id="timings"><div class="hint">No requests yet. Load the <a href="${B}/" target="_blank">board</a> — every rendered request lands here with its per-read breakdown, and the same record is on stdout (<code>journalctl … | grep '"t":"req"'</code>) and in the response itself with <code>?debug=1</code>.</div></div>`;
+  }
+  const rows = recs
+    .map(
+      (r) => `<tr>
+      <td class="tseq">#${r.seq}</td>
+      <td><span class="troute">${esc(r.route)}</span>${r.why ? `<span class="twhy">${esc(r.why)}</span>` : ""}</td>
+      <td class="tshape">${esc(shapeText(r.shape))}</td>
+      <td class="ttot">${r.ms}<span class="tms">ms</span></td>
+      <td class="tren">${r.render}</td>
+      <td class="treads">${r.reads.map(readChip).join("")}</td>
+    </tr>`,
+    )
+    .join("");
+  return `<div id="timings">
+    <table class="ttab">
+      <thead><tr><th></th><th>route</th><th>filter</th><th>total</th><th>render</th><th>reads · ms · rows</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
+}
+
+// ---------------------------------------------------------------------------
 // Standalone page shell.
 // ---------------------------------------------------------------------------
 const DATASTAR = "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.2/bundles/datastar.js";
 
-export function inspectPage(): string {
+export function inspectPage(recs: readonly RequestRecord[]): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -422,8 +476,25 @@ export function inspectPage(): string {
     .ptx { font-family:var(--mono); color:var(--faint); font-size:10px; }
     .pactor { font-size:10px; color:var(--accent); } .pactor.wf { color:var(--wf); }
     .ptime { margin-left:auto; font-family:var(--mono); font-size:10px; color:var(--faint); }
+    /* timings */
+    .ttab { width:100%; border-collapse:collapse; font-size:12px; }
+    .ttab th { text-align:left; font-weight:500; color:var(--faint); font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; padding:0 8px 6px 0; }
+    .ttab td { padding:4px 8px 4px 0; border-top:1px solid var(--line); vertical-align:top; }
+    .tseq { font-family:var(--mono); color:var(--faint); font-size:10.5px; }
+    .troute { font-family:var(--mono); color:var(--accent); }
+    .twhy { margin-left:6px; font-size:10px; color:var(--mut); border:1px dashed var(--line); border-radius:5px; padding:0 4px; }
+    .tshape { font-family:var(--mono); color:var(--mut); font-size:11px; max-width:210px; }
+    .ttot { font-family:var(--mono); color:var(--fg); text-align:right; white-space:nowrap; }
+    .tms { color:var(--faint); font-size:10px; margin-left:1px; }
+    .tren { font-family:var(--mono); color:var(--faint); text-align:right; }
+    .treads { display:flex; flex-wrap:wrap; gap:4px; }
+    .tread { display:inline-flex; align-items:baseline; gap:5px; border:1px solid var(--line); border-radius:6px; padding:0 6px; background:var(--card2); }
+    .trn { font-family:var(--mono); font-size:10.5px; color:var(--mut); }
+    .trms { font-family:var(--mono); font-size:11.5px; color:var(--fg); }
+    .trr { font-family:var(--mono); font-size:10.5px; color:var(--add); }
+    .tin { color:var(--faint); }
     /* replay */
-    #replaywrap { margin-top:16px; }
+    #replaywrap, #timingwrap { margin-top:16px; }
     .rphead { font-size:11.5px; color:var(--mut); margin-bottom:9px; }
     .rprange { width:100%; accent-color:var(--accent); margin-bottom:11px; }
     .rvmeta { font-size:11.5px; color:var(--mut); margin-bottom:8px; }
@@ -452,6 +523,19 @@ export function inspectPage(): string {
         <div class="pbody">
           <div id="prov"><div class="hint">Click any entity in the transaction feed to see every field's history: the value, the transaction that set it, who did it, and when — read straight from temporal facts.</div></div>
         </div>
+      </div>
+    </div>
+
+    <div class="panel" id="timingwrap">
+      <div class="phead">Where the time went <span class="n">last ${recs.length} rendered request(s) · in memory, never a fact</span></div>
+      <div class="pbody">
+        <p class="sub" style="margin:0 0 10px">Server-side, per read, with the ROW COUNT beside every timing — because a read
+        that matched nothing is fast, and from outside it looks exactly like a read that was quick.
+        <code>—</code> means the query was never issued; <code>12r/50</code> means twelve rows came back for fifty asked about.
+        The same records are one JSON line each on stdout, in any response with <code>?debug=1</code>, and at
+        <a href="${B}/inspect/timings.json" target="_blank">/inspect/timings.json</a>.</p>
+        <button class="provbar" style="border:1px solid var(--line);background:var(--card2);color:var(--fg);border-radius:7px;padding:6px 13px;cursor:pointer;display:inline-block;margin-bottom:10px" data-on:click="@get('${B}/inspect/timings')">Refresh ↻</button>
+        ${timingTable(recs)}
       </div>
     </div>
 

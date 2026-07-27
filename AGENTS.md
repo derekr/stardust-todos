@@ -39,6 +39,109 @@ Things that will otherwise cost you a confused half hour:
 - Failures are a terminal record, `{"stardust/error": true, code, message}`, not
   only an HTTP status.
 
+## A timing without a row count is not evidence
+
+This is the standing rule, and the app now enforces it rather than asking. Every
+rendered request writes ONE JSON line to stdout — `journalctl --user -u
+app@todo-stardust | grep '"t":"req"'` on the demo box — carrying the route, the
+filter shape, the total, the render time, and every read it made with the number
+of ROWS that read produced:
+
+```json
+{"t":"req","seq":157,"route":"board","ms":244.3,"render":0.4,
+ "shape":{"st":["blocked"],"pr":[],"v":"all","g":"status","tags":0,"vocab":10,"page":0},
+ "reads":[{"read":"tags","ms":30.3,"rows":10},
+          {"read":"rows","ms":194.8,"rows":51},
+          {"read":"blockers","ms":18.7,"rows":50,"in":50}]}
+```
+
+The rule is enforced by the SHAPE of the helper, not by discipline: `Trace.read`
+in `src/timing.ts` takes the work AND a function that says how many rows it
+produced, there is no overload that omits it, and there is no `start()`/`stop()`
+pair to reach around it. A read that cannot say what it returned cannot be timed.
+That is deliberate — three of the wrong numbers this file records were single
+durations with no count beside them, and every one of them was a read that had not
+actually done the work it was credited with.
+
+`in` is the second half of it, and it exists because "fast" has two innocent
+explanations that look identical from outside. `blockers` records how many ids it
+was ASKED about: `rows 0 in 50` is a query that ran over fifty candidates and
+found nothing, `rows 0 in 0` is a query that was never issued (no row on the page
+is blocked, so the app does not ask). Those mean opposite things and neither is a
+performance result.
+
+How to read one:
+
+- **Reads OVERLAP, so the numbers do not have to add up to the total.** The
+  board's tally is started before the rows and awaited after them, which is the
+  point of that design — a paint of 311ms containing `counts 223` and `rows 276`
+  is one read hidden behind another, not 499ms of work.
+- **A read is timed where it is CALLED, so its `ms` includes the round trip.** The
+  engine's own time is inside it and cannot be separated from here. If a read
+  looks wrong, take the body to a throwaway server, as the top of this file says.
+- **`why` says what provoked a render.** `open` is the paint every stream starts
+  with, `push` is one the `page-rows` subscription woke, `repaint` is a workspace
+  or "view as" switch, `reopen` follows a dropped upstream stream. A filter change
+  is a NAVIGATION, so it should produce exactly one `board-stream connect` and one
+  `board-paint open` — measured, and it does. Three would mean three reads of the
+  board for one page a reader saw, which is the kind of thing nobody could see
+  before this existed.
+- **Tag labels never appear.** They are free text from a browser, so the shape
+  records how MANY were selected and how big the vocabulary they were checked
+  against was. Same rule the query bodies follow.
+
+Three ways to read the same records, for three different callers:
+
+- `?debug=1` on `/` or `/todo/<id>` appends the request's own record to the
+  document as an HTML comment. A comment rather than a JSON body on purpose: a
+  debug flag that returns a different response is a debug flag that measures a code
+  path nobody is served. `curl -s 'http://127.0.0.1:3011/?st=blocked&debug=1' |
+  grep -o '{"t":"req".*}'`.
+- `/inspect` has a "Where the time went" panel — the last 60 requests with their
+  breakdowns, next to the commit feed they caused.
+- `/inspect/timings.json` is the same ring as JSON. This is the only way to see the
+  SSE PAINTS, which cannot carry an HTML comment: a filter change repaints over the
+  stream, and whether that was one repaint or three is a question this answers and
+  `curl` cannot.
+
+It is in memory and bounded to 60 records, and it never touches Stardust. A
+request record is not a fact — writing telemetry into an append-only store is
+exactly the churn the filter-as-facts entry below is about.
+
+**What it costs.** 5.4µs per request against 0.6µs for the same awaits without it,
+measured over 20,000 synthetic requests of four reads each with the line written
+out — so the whole instrument is about 0.005% of a first paint. End to end, the
+same three interactions run alternately against a server at HEAD and one with this
+in, twenty rounds each on the demo's 10,003 todos: first paint 94.8ms → 89.1ms, a
+filter change 90.4ms → 96.8ms, a page turn 82.0ms → 82.4ms. The signs disagree and
+every delta is inside the run-to-run spread of a single configuration (p10–p90 is
+25ms wide), which is the honest way to say it is free.
+
+**What it revealed the day it landed.** `?st=blocked` costs 249ms where the
+unfiltered board costs 94ms, and the previous guess was that a sparse filter over
+an index-ordered scan walks a long way to find 51 matches. Eight paired reads, p50:
+
+| read | `/` | `?st=blocked` |
+| --- | --- | --- |
+| tags | 28.9ms · 10 rows | 30.4ms · 10 rows |
+| rows | 58.2ms · **51 rows** | 200.8ms · **51 rows** |
+| blockers | 6.1ms · 2 rows (of 2) | 16.6ms · 50 rows (of 50) |
+| render | 0.3ms | 0.3ms |
+| total | 94.4ms | 248.8ms |
+
+The whole difference is one read, and the row count is what makes that a finding
+rather than a guess: BOTH return 51 rows, so this is not a filter that matched less
+and finished sooner, and it is not the tag vocabulary, not the badge decoration
+(+10ms, and its `in` says why — fifty blocked rows to decorate instead of two), and
+not the render. 124 todos of 9,947 are blocked, so the body fills the same 51-row
+window out of a 1.2% match set, and 143 of the 154ms sit inside that single read.
+That does not prove what the engine is doing — nothing here can see inside it — but
+it eliminates every app-side explanation, which is what the next person needs
+before taking the body to a throwaway.
+
+It found one thing nobody was looking for, too: the detail page is 90ms and 44ms of
+it is `history` — one read, 17 rows.
+
 ## Assume Stardust can carry more than you think
 
 Default to asking whether the engine can hold something before writing code that
@@ -218,7 +321,10 @@ about 180 seconds, and the same body with a made-up sid takes 17–93ms. That is
 a fast query, it is no query — and it is exactly the range phase 2 recorded as
 evidence that "the app path is verified at 10,000". **When you time a bound read,
 assert the ROW COUNT in the same breath.** A read that returns nothing costs
-nothing, whatever it was supposed to be measuring.
+nothing, whatever it was supposed to be measuring. Through the app that is no
+longer something to remember — every read the server makes records its row count
+beside its duration, and the helper will not time one that cannot say. See "A
+timing without a row count is not evidence" above.
 
 The invariant that always held is the useful one: **an omitted expression-only
 bind yields an error or a subset, never a superset.** So it is a real safety

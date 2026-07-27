@@ -21,6 +21,7 @@ import {
 import { validators } from "./field-registry.ts";
 import { TAG_LABEL_MAX, TagLabelError, canonicalTags, tagClauses, tagLabel } from "./tags.ts";
 import { validationPlan } from "./typed-query.ts";
+import { Trace, recentRequests } from "./timing.ts";
 
 test("visibleTo builds the published-OR-mine predicate (bound scalars + expression or)", () => {
   assert.deepEqual(visibleTo(154), [
@@ -305,4 +306,45 @@ test("validationPlan maps projected keys to their field validators", () => {
   const statusCheck = plan.find((p) => p.key === "status")!;
   assert.equal(statusCheck.check("done"), true);
   assert.equal(statusCheck.check("archived"), false); // the boundary catches drift
+});
+
+test("a timing is never recorded without the row count it was measured over", async () => {
+  // The invariant the helper exists for. Three reads that all cost about nothing,
+  // and only the row count tells them apart: one returned rows, one was ASKED about
+  // fifty and matched none, and one was never issued at all. Those are the three
+  // things that have been confused for each other in this repo's measurements.
+  const t = new Trace("test", "unit");
+  t.describe({ st: ["blocked"], page: 0 });
+  await t.read(
+    "rows",
+    async () => [1, 2, 3],
+    (r) => r.length,
+  );
+  await t.read(
+    "blockers",
+    async () => new Map<number, number[]>(),
+    (m) => m.size,
+    50,
+  );
+  await t.read(
+    "tags",
+    async () => [] as string[],
+    (r) => r.length,
+    0,
+  );
+  const rec = t.done();
+
+  assert.deepEqual(
+    rec.reads.map((r) => [r.read, r.rows, r.in]),
+    [
+      ["rows", 3, undefined], // rows, no input cardinality to report
+      ["blockers", 0, 50], // asked about fifty, matched nothing — a real empty answer
+      ["tags", 0, 0], // asked about nothing, so no query happened
+    ],
+  );
+  assert.equal(rec.route, "test");
+  assert.equal(rec.why, "unit");
+  assert.deepEqual(rec.shape, { st: ["blocked"], page: 0 });
+  for (const r of rec.reads) assert.equal(typeof r.ms, "number");
+  assert.equal(recentRequests()[0], rec); // newest first, so /inspect reads top-down
 });

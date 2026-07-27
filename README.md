@@ -226,6 +226,18 @@ Highlights of the later stages:
   analyzer over 10,003 titles took 3.6s inside the `PATCH`, built 49,880 postings,
   grew the database from 32.2 to 48.4 MiB, and costs a title write 2.7ms against
   1.8ms.
+- **Every rendered request says where its time went, with the row counts**
+  (`src/timing.ts`, `/inspect`). One JSON line per request on stdout — route, filter
+  shape, total, render time, and each read with the number of ROWS it produced. The
+  row count is not optional and cannot be omitted: `Trace.read` takes the work and a
+  function that counts what came back, so a read that cannot say what it returned
+  cannot be timed. That is aimed at one specific failure this project kept having —
+  a read that matched nothing is fast, and from outside it looks exactly like a read
+  that was quick. `?debug=1` returns the same record in the response as an HTML
+  comment (the same document a browser gets, so the numbers are about the real code
+  path), `/inspect` shows the last 60, and `/inspect/timings.json` is the machine
+  form — the only way to see the SSE repaints, which no `curl` timing can separate.
+  It costs 5.4µs a request and nothing it records is ever written to Stardust.
 - **One reactor = the source of truth for the UI.** Commands (add/toggle/remove) only
   *write facts*; they never render the list. The reactor recomputes and Stardust
   pushes the new result down the open record stream, so every connected client
@@ -261,5 +273,7 @@ Highlights of the later stages:
 - `src/cli.ts`           — the CLI (operates in the default workspace).
 - `src/server.ts`        — Node HTTP + Datastar web server (CQRS + workspace switching).
 - `src/view.ts`          — server-rendered HTML: `#wsbar` switcher + morph-friendly `#list`.
+- `src/timing.ts`        — per-request timings; a read is timed only together with its row count.
 - `src/xray.ts`          — the in-situ "how is this resolved?" overlay.
+- `src/inspect.ts`       — the glass box: commit feed, fact provenance, log replay, and where each request's time went.
 - `src/app.test.ts`      — unit tests for the pure query/derivation helpers.
