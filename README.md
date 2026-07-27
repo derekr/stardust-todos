@@ -3,8 +3,9 @@
 A todo app backed by [Stardust](http://localhost:1980/docs/) facts, with **two frontends** —
 a CLI and a **Datastar** web UI. Both read a *reactor*, and Stardust pushes the new
 result when one changes, so a todo written from either side turns up in the other
-without anything polling. They do not share a reactor: the web board reads one
-canonical session reactor bound per browser, the CLI reads its workspace's own.
+without anything polling. They do not share a reactor: the web board subscribes to
+the fifty rows it is showing (`session-page`, bound per browser), the CLI reads its
+workspace's own.
 
 Nothing in the app watches for changes. Every live update is a Stardust
 subscription re-emitting — see [AGENTS.md](./AGENTS.md) for what that does and does
@@ -65,7 +66,8 @@ Run `node src/cli.ts add "..."` in a terminal and watch the browser update too.
 | create             | `POST /schemas/{id}/entities` — one validated write carrying `workspace` + `app` |
 | complete / reopen  | `PATCH /schemas/{id}/entities/{id}` with `{ done: true|false }` |
 | delete             | `DELETE /entities/{id}` (retracts every field)               |
-| the live list      | a **reactor** (`find`/`where`/`then.project`) read as a record stream — one canonical session reactor for the web board, a per-workspace reactor for the CLI |
+| the live list      | a **reactor** (`find`/`where`/`then.project`) read as a record stream — `session-page` for the web board, a per-workspace reactor for the CLI |
+| the board's rows   | a one-shot **dry-run**, built per read from the session's own filter facts (`src/session.ts`) |
 
 ## Multi-tenancy: user → persona → workspace
 
@@ -82,11 +84,11 @@ rewrite** — see the jj history (`jj log`). The model is plain facts:
 1. **Types.** Every todo read/write requires a `WorkspaceCtx`, and the only way to
    get one is `openWorkspace(persona, workspace)`, which runs the grant check first.
    "Forgot to scope by tenant" is unrepresentable — it won't compile.
-2. **Reads.** Reads go through a reactor whose scope is fixed server-side — the
+2. **Reads.** Reads go through a query whose scope is fixed server-side — the
    per-workspace reactor (CLI) is pinned to `[?t workspace {# id}]` at workspace
-   creation, and the canonical board reactor (web) takes its workspace and viewer
-   from the session's own facts. Either way the client holds only an **id** —
-   never the filter — so it cannot widen the scope. Stardust also does the ordering and shapes the output (`then.project`
+   creation, and the board (web) takes its workspace and viewer from the session's
+   own facts. Either way the client holds only an **id** — never the filter — so it
+   cannot widen the scope. Stardust also does the ordering and shapes the output (`then.project`
    returns `{id,title,done,priority}`), so there's no positional mapping to get wrong.
 3. **Writes.** `authorizeWrite` re-checks ownership before every mutation, so a
    stray cross-tenant id can't be toggled or deleted even if it reached the server.
@@ -118,6 +120,7 @@ commit; `jj log` is the record:
 | 4 | derive-on-read | correlated `exists` bound to a var, so a DERIVED value is filterable |
 | 5 | the session reactor | ONE reactor computes effectiveStatus + every filter server-side |
 | 6 | it has to scale | derived facts recorded on WRITE; the board returns one PAGE |
+| 7 | filters read, not joined | selected facet values compiled into the body as literals |
 
 Highlights of the later stages:
 
@@ -125,7 +128,7 @@ Highlights of the later stages:
   dependencies are **edge entities** (like `grant`), so membership and graph
   questions are plain datalog joins rather than array gymnastics. Due dates are
   Stardust instants, queried with a field predicate (`[< ?due {#utc now}]`) in
-  the session reactor's `overdue` subquery.
+  the board's `overdue` clauses.
 - **Derived state, no worker** (`src/session.ts`, `src/derive.ts`, `src/todos.ts`).
   Blocked-ness and the derived views used to be materialized onto `status` by a
   background worker reacting to the transaction bus. They became DERIVED on read by
@@ -142,9 +145,20 @@ Highlights of the later stages:
   board costs 7.6s unlimited, 7.5s with `limit 50`, and 7.5s for a bare count over
   the same `where`, so paging bounds the response and the render, not the query,
   and a "showing 50 of N" pill would have doubled the work of every page view.
-  `limit` also refuses a bind, so a page is part of the query text: page 1 is the
-  provisioned reactor and the only page with a live subscription, and a deeper page
-  is a reactor created for that read and deleted after it.
+- **Filters are facts, read and INLINED** (`src/session.ts`). The filter state has
+  always been `sf` facts on a per-browser session; what changed is that the query
+  no longer JOINS them. Every read reads the session back, checks each selected
+  value against its fixed domain, and compiles it into the body as a literal
+  (`[or [= ?eff todo] [= ?eff doing]]`) instead of matching the facet rows against
+  every candidate. At 5,005 todos with value indexes on, one page of fifty: 51ms
+  with no filter at all, **1,972ms** joined, **24ms** inlined — inlining is faster
+  than not filtering, because a literal narrows the candidate set and a join adds
+  work proportional to it. The trade is that one stored body no longer serves every
+  filter combination, so the rows are a dry-run built per read and there is no
+  `board` reactor at all; a page past the first stops needing an ephemeral one as
+  well. Tag labels are the exception and stay a correlated `exists`: they are free
+  text you typed, so there is no domain to check them against, and only a
+  domain-checked value gets to become part of a query.
 - **Workspace switching in the web UI** (`src/server.ts`, `#wsbar`). One active
   workspace at a time; switching updates the server context and closes streams,
   and Datastar auto-reconnects to re-render against the new workspace.
@@ -174,9 +188,8 @@ Highlights of the later stages:
   re-renders. This is exactly Datastar's
   CQRS pattern — long-lived read stream, short-lived command posts.
 - **The server holds no view state.** A browser's filter is facts on its own
-  `session` entity, read back per render, so two tabs filter independently and the
-  process keeps nothing. Writing a facet is what makes the reactor re-emit — there
-  is no revision counter and no refresh call.
+  `session` entity, read back per render — and the board query is BUILT from that
+  read — so two tabs filter independently and the process keeps nothing.
 - **Two streams meet in the middle.** Stardust's reactor results arrive as an
   NDJSON **record stream** (0.0.6 dropped machine SSE) → the Node server →
   Datastar `patch-elements` SSE → the browser DOM. The server (`src/server.ts`,
@@ -192,7 +205,7 @@ Highlights of the later stages:
 - `src/todos.ts`         — workspace-scoped schema (evolved 3×) + commands + projected reads.
 - `src/features.ts`      — tags & dependencies (edge entities).
 - `src/derive.ts`        — the correlated `exists` fragments (blocked, visibility).
-- `src/session.ts`       — the search session + the ONE canonical board reactor.
+- `src/session.ts`       — the search session; reads its filter facts and compiles the board query from them.
 - `src/queries.ts`       — the declared reactors (one definition each, typed readers out).
 - `src/indexes.ts`       — value-index policy for the fields those reactors key on.
 - `src/commands.ts`      — commands as entities; the role gate lives in the query.

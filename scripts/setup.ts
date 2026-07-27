@@ -7,34 +7,25 @@
 // reactor body — the app provisions on boot too, but doing it explicitly means a
 // deploy fails here rather than on a user's first request.
 
-import { type Provisioned, ensureReactor } from "../src/reactors.ts";
+import type { Provisioned } from "../src/reactors.ts";
 import { KEYED_FIELDS, ensureValueIndex } from "../src/indexes.ts";
 import { ensureSchema } from "../src/registry.ts";
 import { DECLARED } from "../src/queries.ts";
 import { DECLARED_SCHEMAS } from "../src/schemas.ts";
-import { BOARD_SHAPES, boardReactorName, canonicalBody, pageWindow } from "../src/session.ts";
 import { ensureTodoSchema } from "../src/todos.ts";
 import { BASE } from "../src/stardust.ts";
 
-// The board reactors are provisioned directly (they are hand-written, not declared
-// queries); everything else provisions itself from the query catalog. There is one
-// board body per SHAPE — the tag `exists` and the wall-clock `overdue` clauses are
-// compiled out when the session does not need them, and a body that differs is a
-// different reactor. All four are provisioned here so the first browser to pick a
-// tag does not pay for creating one.
-//
-// What is provisioned is the FIRST PAGE of each shape. `limit`/`offset` refuse a
-// bind, so a page is part of the query text and a deeper one cannot be reached by
-// parameterising these; it is created for the read and deleted after (session.ts,
-// `boardTarget`). Page 0 is the page every session opens on and the only one with a
-// live subscription, so it is the one worth storing.
-const REACTORS: { name: string; provision: () => Promise<Provisioned> }[] = [
-  ...BOARD_SHAPES.map((shape) => {
-    const name = boardReactorName(shape);
-    return { name, provision: () => ensureReactor(name, canonicalBody(shape, pageWindow(0))) };
-  }),
-  ...DECLARED.map((d) => ({ name: d.name, provision: () => d.provision() })),
-];
+// Everything provisions itself from the query catalog now. The four hand-written
+// `board*` reactors used to be provisioned here as well — one per body SHAPE, the
+// tag `exists` and the wall-clock `overdue` clauses compiled in or out — and they
+// are gone. The board's rows are a dry-run whose body inlines the session's
+// selected facet values, so the body is a function of the FILTER and there is no
+// finite set of shapes to store. What keeps the board live is `session-page`,
+// which is a declared query like the rest.
+const REACTORS: { name: string; provision: () => Promise<Provisioned> }[] = DECLARED.map((d) => ({
+  name: d.name,
+  provision: () => d.provision(),
+}));
 
 const MARK = {
   created: "\x1b[32m+ created\x1b[0m",

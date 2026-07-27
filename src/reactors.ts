@@ -3,7 +3,10 @@
 // A reactor is stored state: creating one is a write, and a reactor created per
 // process start accumulates forever. The board reactor used to do exactly that —
 // `ensureBoardReactor()` memoized in a module variable, so every restart minted
-// another live reactor.
+// another live reactor. (There is no board reactor at all now: its body varies
+// with the session's filter, so it is a dry-run. Every reactor left here is one
+// whose body is fixed and whose parameters are binds — which is the test for
+// whether something belongs in this file.)
 //
 // Reactors are therefore looked up by NAME, not by id (see registry.ts for the
 // marker mechanism, shared with the Todo schema). Provisioning is: find the ref,
@@ -60,7 +63,7 @@ function stable(v: unknown): string {
  * `enabled` is stored beside the query rather than inside it, so it is compared
  * separately from the body Stardust echoes back under `reactor`.
  */
-export async function ensureReactor(name: string, body: Record<string, unknown>): Promise<Provisioned> {
+async function ensureReactor(name: string, body: Record<string, unknown>): Promise<Provisioned> {
   const existing = await lookupRef("reactorRef", name);
   if (existing === undefined) {
     const id = await createReactor(body);

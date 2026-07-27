@@ -35,13 +35,14 @@ interface XraySpec {
 
 const XRAY: Record<string, XraySpec> = {
   board: {
-    title: "The board — one reactor, no subqueries, one page",
-    mech: 'The board is not re-queried per render, and it derives nothing per row. A stored reactor reads the session\'s own facts (viewer, view, workspace) plus its `sf` facet children, JOINS the stored blocked/effectiveStatus/prank the write paths recorded, applies EVERY filter, orders and projects the finished row. Every browser reads it through a per-stream bind (?bind={sid …}), so one definition serves all sessions and the client only ever holds a reactor id and its sid — it cannot widen the scope. It used to compute effectiveStatus with a correlated `exists` per row; that shares a 10,000-execution budget with the whole query, so the board hard-FAILED past a few thousand todos. Joining a stored fact is a scan, so this body answers at 10,000 and beyond. It also returns ONE PAGE — `limit 51 offset 0` on the body, fifty rows shown and a fifty-first read only to know whether a next page exists, which is why the pill says "50+" instead of a number. Be precise about what that bought: `limit` is a POST-FILTER, measured at 2,000 unindexed todos as 7.6s unlimited and 7.5s with `limit 50` — and a bare count over the same `where` costs the same 7.5s, which is why the pill does not just count. Paging bounds the response, the render and the memory a result set occupies; it does not bound the query. And `limit`/`offset` refuse a bind (`limit must be number`), so a page is part of the query TEXT: page 1 is this stored reactor, and a deeper page is an ephemeral reactor created for that read and deleted after it — which is also why only page 1 is live. Two clauses cannot be cheap and are compiled OUT when unused: the tag filter (still one `exists`, because a plain join would return a two-label todo twice) and `overdue` (wall-clock, so `now` is a per-read bind) — one provisioned reactor per shape, and the server re-opens the stream when a filter moves a session between them. readSnapshot() is a point-in-time read; the live stream re-emits whenever the RESULT changes. There is no revision counter: the writes are the trigger.',
-    code: `// One body per shape. This is the plain one — zero subqueries:
+    title: "The board — filters are facts, read and inlined",
+    mech: 'Your filter is FACTS on your own session entity — `sf` children, one per selected value — and the server holds none of it. What changed is how they reach the query. They used to be JOINED: the body carried `[?fp facet priority] [?fp value ?priority]` and the engine matched the facet rows against every candidate. Now every read reads the session back, checks each selected value against its fixed domain, and compiles it into the body as a LITERAL: `[or [= ?eff todo] [= ?eff doing]]`. Measured on 5,000 todos with value indexes on, one page of fifty: the value-join costs 2,303ms and the inlined form 56ms — 41x, and faster than no filter at all, because a literal NARROWS the candidate set while a join adds work proportional to it. The cost is that one stored body no longer serves every filter, so the rows are a DRY-RUN built per read. That has a nice consequence: nothing is left unbound, so the "forgot a bind and silently matched everything" failure cannot happen here, and a deep page — which used to be an ephemeral reactor created and deleted around the read, ~158 entity ids a time — is now the same read as page one. One filter is deliberately NOT inlined: tag labels are free text you typed, with no domain to check them against, so the tag filter stays a correlated `exists` correlated to your session\'s own rows, placed last. The rest of the body is unchanged: it derives nothing per row (blocked/effectiveStatus/prank are stored facts the write paths recorded, JOINED here) and returns ONE PAGE — `limit 51`, fifty shown and a fifty-first read only to know whether a next page exists, which is why the pill says "50+". `limit` is a POST-FILTER, measured at 2,000 unindexed todos as 7.6s unlimited and 7.5s with `limit 50`, and a bare count over the same `where` costs the same — so paging bounds the response and the render, not the query. Narrowing the filter is what bounds the query. Liveness is a different reactor: `session-page` subscribes to the rows on screen.',
+    code: `// Built per read, from the session's own facts. The two facet
+// filters are LITERALS — this is what a value-join used to be:
 {
   find: ["?t"],
   where: [
-    ["?sess", "sid", "?sid"],        // ?sid supplied per-stream via ?bind
+    ["?sess", "sid", 574],           // inlined: a dry-run has no bind
     ["?sess", "viewer", "?viewer"], ["?sess", "view", "?view"],
     ["?t", "workspace", "?ws"], ["?t", "status", "?status"], /* … */
 
@@ -50,25 +51,26 @@ const XRAY: Record<string, XraySpec> = {
     ["?t", "effectiveStatus", "?eff"],
     ["?t", "prank", "?prank"],
     ["or", ["=", "?draft", false], ["=", "?author", "?viewer"]],
-    ["?fs", "facet", "status"], ["?fs", "value", "?eff"],   // value-join
+
+    ["=", "?priority", "high"],                        // was 4 clauses
+    ["or", ["=", "?eff", "todo"], ["=", "?eff", "doing"]],  // was 4 clauses
   ],
   orderBy: ["?prank", "?title", "?t"],   // high→med→low, then a total order
   limit: 51, offset: 0,                  // one page — 50 shown, 1 read-ahead
   then: { project: { id: "?t", effectiveStatus: "?eff",
                      blocked: "?blocked", /* … */ } },
 }
-// the overdue shape swaps the view filter for plain clauses + a bind:
-//   ["?t", "due", "?due"], ["<", "?due", "?now"]
-// page 2+ is the same body with offset 50, 100, … — NOT a bind, so it is a
-// reactor made for that one read and deleted after it.
+// what it replaced, per facet — matched against every candidate row:
+//   ["?fs","kind","sf"], ["?fs","session","?sess"],
+//   ["?fs","facet","status"], ["?fs","value","?eff"]
 
-// read it:   readResults(reactorId, { sid })     // ?bind={sid 574}
-// watch it:  streamResults(reactorId, onRows, signal, { sid })`,
+// a value is checked against its domain BEFORE it becomes query:
+//   'archived' is not one of todo, doing, blocked, done   → refused
+// tag labels have no domain, so they are never inlined at all.
+
+// read it:  await query(canonicalBody(boardQuery(sid, filter), win))`,
     src: "src/session.ts · canonicalBody() + readSnapshot()",
-    reactors: [
-      { name: "board", bind: "{sid 1519}" },
-      { name: "board-overdue", bind: "{sid 1519 now {#utc '2026-07-26T00:00:00Z'}}" },
-    ],
+    reactors: [{ name: "session-page", bind: "{sid 1519}" }],
   },
   counts: {
     title: "Counts — a viewer-scoped tally",
@@ -117,11 +119,11 @@ await reconcileBlocked()   // [] means every write path kept its promise
 // and the board just reads it back:
 ["?t", "blocked", "?blocked"], ["?t", "effectiveStatus", "?eff"]`,
     src: "src/todos.ts · refreshDerived() + reconcileBlocked() · src/session.ts · canonicalBody() (which now joins them)",
-    reactors: [{ name: "board", bind: "{sid 1519}" }],
+    reactors: [{ name: "session-page", bind: "{sid 1519}" }],
   },
   visibility: {
     title: "Draft visibility — an app predicate, server-side",
-    mech: "Stardust does authentication, not authorization — so row-level visibility is an APP predicate: a todo is visible if it's published OR you authored it. ONE definition of that rule (visibleTo) serves every read. On the board the viewer is a FACT on the session; on the counts/options reactors it is a per-read bind. Either way the rule is an expression-`or` over two bound vars, the browser never sends a persona id — it holds only a reactor id and a sid, so it cannot widen the scope — and it stays join-free, paginates, and keeps hidden rows off the wire.",
+    mech: "Stardust does authentication, not authorization — so row-level visibility is an APP predicate: a todo is visible if it's published OR you authored it. ONE definition of that rule (visibleTo) serves every read. On the board the viewer is a FACT on the session; on the counts/options reactors it is a per-read bind. Either way the rule is an expression-`or` over two bound vars, the browser never sends a persona id — it holds only its sid, and the board query is built server-side from that session's own facts, so it cannot widen the scope — and it stays join-free, paginates, and keeps hidden rows off the wire.",
     code: `// One rule. A "?var" leaves the viewer to a per-read bind (reactors);
 // a persona id pins it into the query (one-shot dry-runs).
 function visibleTo(viewer) {

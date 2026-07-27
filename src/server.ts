@@ -46,23 +46,17 @@ import {
   todoOptions,
 } from "./board.ts";
 import {
-  BOARD_SHAPES,
   type SessionHandle,
   type Snapshot,
-  boardReactorName,
-  boardShape,
-  boardShapeKey,
   createSession,
-  ensureBoardReactor,
   readFilter,
-  readPage,
   readSnapshot,
   retargetSession,
   setFilter,
   setPage,
 } from "./session.ts";
 import { BASE, TxConflictError, lastTx, readEntity, readReactorRon, watchEntity } from "./stardust.ts";
-import { DECLARED, blockedByTodo } from "./queries.ts";
+import { DECLARED, blockedByTodo, sessionPage } from "./queries.ts";
 import { watchPage, writePageSet } from "./pageset.ts";
 import { statusHistory } from "./history.ts";
 import {
@@ -111,17 +105,13 @@ import {
 function runnableBinds(name: string, from: { sid?: string; todo?: string }): Record<string, string> {
   const ws = `{# ${ctx.workspaceId}}`;
   const viewer = `{# ${ctx.personaId}}`;
-  // Every board shape takes `sid`; the overdue ones also take `now`, because
-  // wall-clock time is the one input that cannot be a fact. Pasting one of those
-  // without it fails with `unbound input var ?now` rather than answering wrongly —
-  // the same fail-closed shape as the command gate's ?rank.
-  if (BOARD_SHAPES.some((s) => boardReactorName(s) === name)) {
-    if (!from.sid) return {};
-    const binds: Record<string, string> = { sid: from.sid };
-    if (name.includes("overdue")) binds.now = `{#utc '${new Date().toISOString()}'}`;
-    return binds;
-  }
   switch (name) {
+    // The board's live subscription. It is bound by the session, so pasting it
+    // bare returns every session's page at once — the same trap the board reactor
+    // had. (The board's ROW query is not here: it is a dry-run whose body is built
+    // per read with no free vars at all, so there is nothing to bind.)
+    case "session-page":
+      return from.sid ? { sid: from.sid } : {};
     case "board-counts":
     case "todo-options":
       return { ws, viewer };
@@ -147,7 +137,7 @@ function withBindClause(body: string, binds: Record<string, string>): string {
   return `bind {${pairs.map(([k, v]) => `${k} ${v}`).join(" ")}}\n${body}`;
 }
 
-const RON_EXPORTABLE = new Set<string>([...BOARD_SHAPES.map(boardReactorName), ...DECLARED.map((d) => d.name)]);
+const RON_EXPORTABLE = new Set<string>(DECLARED.map((d) => d.name));
 
 const PORT = Number(process.env.PORT ?? 3000);
 
@@ -243,26 +233,26 @@ const sessionOf = (sessionId: EntityId): SessionHandle => ({ sessionId, workspac
 /** sids with a live stream, so a write can nudge every open board to re-emit. */
 const liveSessions = new Set<EntityId>();
 
-// ---- Following a session onto a different board body ------------------------
+// ---- Re-opening a stream after a write the subscription cannot see -----------
 //
-// The board is no longer ONE reactor: the tag `exists` and the wall-clock overdue
-// clauses are compiled out of the body when the session does not need them, so a
-// filter change can move a session to a differently-shaped reactor (session.ts).
-// A subscription is pinned to the reactor it opened on and cannot follow.
+// The board's live subscription is `session-page`: it watches the `pg` facts that
+// name the rows on screen, so it fires when one of THOSE rows changes and stays
+// silent about everything else. That is the point of it, and it is also its blind
+// spot. A filter or a page write changes which rows BELONG on the page without
+// touching any row already on it, so nothing re-emits and the board would sit
+// there showing the previous answer.
 //
-// So a filter write that changes the SHAPE drops the stream and re-opens it, in
-// that order: `boardStreams` is the open subscription, `boardGate` holds the
-// re-open until the write has landed. Without the gate the loop races the write,
-// re-subscribes to the body it just left, and paints one frame from a reactor that
-// no longer models the question. Same-shape writes — most of them — do not touch
-// this at all; the reactor re-emits on its own, which is still the contract.
+// So those two writes drop the stream and re-open it, in that order: `boardStreams`
+// is the open subscription, `boardGate` holds the re-open until the write has
+// landed. Without the gate the loop races the write, re-subscribes, and paints one
+// frame from the state it just left. Data writes do not come through here at all —
+// a row on the page changing is exactly what the subscription is for.
 const boardStreams = new Map<EntityId, AbortController>();
 const boardGate = new Map<EntityId, Promise<void>>();
 
-/** Drop this session's stream, run `write`, then let the loop re-open on whatever
- *  the write moved it to. The gate is what stops the loop re-subscribing to the
- *  body it just left and painting one frame from a reactor that no longer models
- *  the question. */
+/** Drop this session's stream, run `write`, then let the loop re-open and paint
+ *  whatever the write left behind. The gate is what stops the loop re-subscribing
+ *  before the write has landed and painting one frame of the previous answer. */
 async function remount(sid: EntityId, write: () => Promise<void>): Promise<void> {
   if (!boardStreams.has(sid)) {
     await write();
@@ -279,28 +269,25 @@ async function remount(sid: EntityId, write: () => Promise<void>): Promise<void>
   }
 }
 
-/** Write a session's filter, moving its live stream if the body shape changed. */
-async function applyFilter(sid: EntityId, next: Filter, before?: Filter): Promise<void> {
-  const session = sessionOf(sid);
-  const moved = !before || boardShapeKey(boardShape(before)) !== boardShapeKey(boardShape(next));
-  const write = () => setFilter(session, next, actorName());
-  // A filter write also resets the page (session.ts), so it always moves a session
-  // that was NOT on page 0 — the stream has to be re-opened on the stored reactor
-  // it is going back to.
-  if (!moved && (await readPage(session)) === 0) {
-    await write();
-    return;
-  }
-  await remount(sid, write);
+/**
+ * Write a session's filter and re-open its stream on the answer.
+ *
+ * Always a remount. It used to be conditional — only when the filter moved the
+ * session to a differently-shaped board reactor — and that condition stopped being
+ * true when the subscription became the page-set rather than the filtered board:
+ * `session-page` watches the rows currently on screen, and a filter write changes
+ * which rows should BE on screen without touching any of them. Most filter clicks
+ * therefore repainted nothing at all. The remount is what makes them repaint.
+ */
+async function applyFilter(sid: EntityId, next: Filter): Promise<void> {
+  await remount(sid, () => setFilter(sessionOf(sid), next, actorName()));
 }
 
 /**
  * Move a session to another page.
  *
- * Always a remount, never a re-emit: `offset` is body text, not a clause, so
- * writing the page cannot invalidate anything. Page 0 re-opens on the provisioned
- * reactor and is live; a deeper page paints once from a reactor made for that read
- * (session.ts) and then holds still.
+ * Always a remount, for the same reason: an offset is not a fact anything watches,
+ * and the rows the page-set names are the ones being navigated away from.
  */
 async function applyPage(sid: EntityId, n: number): Promise<void> {
   await remount(sid, () => setPage(sessionOf(sid), n));
@@ -315,9 +302,7 @@ async function applyPage(sid: EntityId, n: number): Promise<void> {
 async function rescope(): Promise<void> {
   await retargetAll();
   // A different workspace has different tags and todos, so the old filter is
-  // meaningless there — unlike a "view as" switch, which keeps it. The reset can
-  // land on any shape, so it goes through applyFilter with no `before`: treat it as
-  // a move and re-open the stream.
+  // meaningless there — unlike a "view as" switch, which keeps it.
   for (const sid of liveSessions) {
     await applyFilter(sid, { ...emptyFilter }).catch((e) => console.error("rescope filter:", e));
   }
@@ -372,10 +357,10 @@ async function serveStatic(parts: string[], res: http.ServerResponse): Promise<v
   }
 }
 
-// Everything the board renders from. The todo list is the session snapshot — the
-// canonical reactor applies EVERY filter (priority, status, tags, views) +
-// visibility + derivation server-side, so there is ONE read path feeding both the
-// SSE patches and the server-rendered first paint.
+// Everything the board renders from. The todo list is the session snapshot — one
+// query applies EVERY filter (priority, status, tags, views) + visibility +
+// derivation server-side, so there is ONE read path feeding both the SSE patches
+// and the server-rendered first paint.
 //
 // NOTE what paging does and does not bound here. The board is one page now, but the
 // three reads beside it are not: `aggregateCounts` tallies every visible row (that
@@ -516,18 +501,21 @@ const server = http.createServer(async (req, res) => {
       res.end(page(sid, await boardView(sessionOf(sid))));
       return;
     }
-    // Demo helper: copy-paste curl commands to watch THIS session's snapshot
-    // stream (canonical reactor + per-stream sid bind) and the transaction bus.
+    // Demo helper: copy-paste curl commands to watch THIS session's page (the
+    // `session-page` reactor + a per-stream sid bind) and the transaction bus.
+    // The board's ROW query is deliberately not offered here: it is a dry-run
+    // built per read with the filter inlined, so there is no stored reactor to
+    // subscribe to and nothing to bind.
     if (url === "/session.json" && method === "GET") {
       const s = await ensureDemoSession();
-      const rid = await ensureBoardReactor();
+      const rid = await sessionPage.id();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify(
           {
             sid: s.sessionId,
             reactorId: rid,
-            snapshot: `curl -N -H 'Accept: application/x-ndjson' -G --data-urlencode 'bind={sid ${s.sessionId}}' "${BASE}/reactors/${rid}/results"`,
+            page: `curl -N -H 'Accept: application/x-ndjson' -G --data-urlencode 'bind={sid ${s.sessionId}}' "${BASE}/reactors/${rid}/results"`,
             transactions: `curl -N -H 'Accept: application/x-ndjson' "${BASE}/events/bus/stardust/transactions"`,
           },
           null,
@@ -603,9 +591,7 @@ const server = http.createServer(async (req, res) => {
       else if (facet === "tag") filter.tags = toggle(filter.tags, value);
       else if (facet === "view") filter.view = filter.view === (value as any) ? "all" : (value as any);
       else if (facet === "group") filter.group = value as any;
-      // `before` is what decides whether this write moves the session to another
-      // board body — a tag going on or off, or the overdue view opening or closing.
-      await applyFilter(sid, filter, before);
+      await applyFilter(sid, filter);
       noopStream(req, res);
       return;
     }
@@ -943,10 +929,10 @@ server.listen(PORT, async () => {
   // Pre-create the board session so `/` can redirect to /s/<sid>, and print the
   // copy-paste demo commands (also at GET /session.json).
   const s = await ensureDemoSession();
-  const rid = await ensureBoardReactor();
-  console.log(`\n  session ${s.sessionId} · canonical reactor ${rid}`);
+  const rid = await sessionPage.id();
+  console.log(`\n  session ${s.sessionId} · page reactor ${rid}`);
   console.log(
-    `  snapshot :  curl -N -H 'Accept: application/x-ndjson' -G --data-urlencode 'bind={sid ${s.sessionId}}' "${BASE}/reactors/${rid}/results"`,
+    `  page     :  curl -N -H 'Accept: application/x-ndjson' -G --data-urlencode 'bind={sid ${s.sessionId}}' "${BASE}/reactors/${rid}/results"`,
   );
   console.log(`  tx bus   :  curl -N -H 'Accept: application/x-ndjson' "${BASE}/events/bus/stardust/transactions"\n`);
 });

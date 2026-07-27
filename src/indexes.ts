@@ -22,8 +22,11 @@ import { BASE } from "./stardust.ts";
 
 /**
  * Fields matched by value somewhere in `queries.ts`, `session.ts` or the
- * provisioning path — as a constant (`kind`, `scope`), as a bind (`sid`, `ws`),
- * or as a join key between two clauses (`facet`/`value`, `session`, `todo`).
+ * provisioning path — as a constant (`kind`, `scope`), as a bind (`ws`), as an
+ * inlined literal (`sid`, `priority`, `effectiveStatus`), or as a join key between
+ * two clauses (`facet`/`value`, `session`, `todo`). An inlined literal keys the
+ * same way a bind does: the engine is still asked for the rows whose field equals
+ * a value, and without an index it still scans every fact of that field.
  *
  * Deliberately NOT indexed: fields only ever READ out of a matched row (`title`,
  * `order`, `danger`, `minRank`, `showWhenDenied`, `due`). Projection does not need
@@ -41,13 +44,15 @@ export const KEYED_FIELDS = [
   "blocker",
   "status",
   "priority",
-  // v4 derived fields. `effectiveStatus` is what the board's status facet will
-  // value-join on and `prank` is what it will order by, so both are keys the
-  // moment that rewrite lands. `blocked` is the borderline one and is listed
-  // honestly: `reconcileBlocked` reads it as a VAR, which the plain field path
-  // already covers for free, so nothing today keys on it. It is here for the
-  // filter the board will obviously grow (`[?t blocked true]`), and it is the one
-  // entry on this list to drop again if that never happens.
+  // v4 derived fields. `effectiveStatus` is what the board's status filter matches
+  // — as a LITERAL now (`[or [= ?eff todo] …]`) rather than as a value-join, which
+  // needs the index just as much: an inlined comparison still has to find the rows
+  // whose `effectiveStatus` is that value. `prank` is what the board orders by.
+  // `blocked` is the borderline one and is listed honestly: `reconcileBlocked`
+  // reads it as a VAR, which the plain field path already covers for free, so
+  // nothing today keys on it. It is here for the filter the board will obviously
+  // grow (`[?t blocked true]`), and it is the one entry on this list to drop again
+  // if that never happens.
   "blocked",
   "effectiveStatus",
   "prank",

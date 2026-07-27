@@ -47,10 +47,18 @@ holds it. What that has already removed:
 - A 194-line bus subscriber that watched every commit and decided what was
   relevant. The reactor pushes its own result; the query already said what matters.
 - All server-side filter state. Filters are facts on a session, so two browsers
-  have two filters and the server holds none.
+  have two filters and the server holds none. Note what that does NOT settle: the
+  filter being a fact says nothing about how it reaches the query. It was a JOIN
+  for a long time and it is now READ AND INLINED, which was worth 82x — see the
+  entry in the tension section.
 - A revision counter used to force re-emits. Writing the facts re-emits.
 - Per-render dry-runs, promoted to stored reactors read with a per-call bind, so
-  one reactor serves every workspace, viewer and todo.
+  one reactor serves every workspace, viewer and todo. Partly REVERSED for the
+  board, and for a reason worth carrying: a stored reactor is only a fit when the
+  body is fixed and every input can be a bind. The board's body varies with the
+  filter, so it went back to a dry-run — which cost nothing, because reading a
+  stored reactor with a bind was already about the same price as a dry-run (27ms
+  vs 29ms on the demo data).
 
 Derived state especially: prefer computing on read (a correlated `exists` bound to
 a variable) over materialising a field and then having to un-write it — but read
@@ -77,15 +85,26 @@ computes `enabled`/`visible` with `>=` and `or`, and still woke on both writes.
 'global'}` and `{scope 'todo'}`, were woken separately: a new global command
 emitted on the global stream and the todo stream stayed silent. A bind is the
 subscription's scope, not a client-side filter over a shared firehose — which is
-what makes one stored reactor per shape, rather than one per caller, sound.
+what makes one stored reactor serving many callers sound.
 
 **The gap is what only enters through a bound `exists`.** Adding a TAG to a todo
-pushes nothing to the board reactor — verified from a background script, and again
-with the tag filter active, so even an edge that changes which rows match is
-invisible. Adding a DEP does push (measured twice). Both reach the board only
+pushed nothing to the board reactor — verified from a background script, and again
+with the tag filter active, so even an edge that changes which rows match was
+invisible. Adding a DEP does push (measured twice). Both reached the board only
 through a bound `exists`, so "subqueries don't invalidate" is the wrong lesson.
 The rule that has never missed is the first one: reason about what appears as a
 top-level clause. If liveness matters for a fact, put it there.
+
+**And a query that is not a reactor pushes nothing at all, which is a liveness
+decision and not only a performance one.** The board's rows are a dry-run now, so
+NOTHING about the filtered set is live; the app's only board subscription is
+`session-page`, which watches the fifty rows on screen. That is deliberate — a
+subscription over the whole filtered set pushes membership churn at you while you
+are reading — but it means every write the app makes that changes WHICH rows
+belong (a filter, a page) has to re-open the stream by hand (`remount` in
+server.ts). Forgetting that is silent: the board simply keeps showing the previous
+answer. It has happened once already, and no test caught it, because every test
+opens a fresh stream.
 
 ## An omitted bind is usually silent, and once is not
 
@@ -193,22 +212,30 @@ The engine evaluates the whole `where` and then discards rows; only the projecti
 and the response get smaller. Three consequences worth carrying:
 
 - Paging bounds the RESPONSE, the render, and the memory a result set occupies. It
-  does not bound the query. The board is still O(corpus) per page view, and so are
-  the counts/blockers/tags reads beside it, which are not paged at all.
+  does not bound the query. Narrowing the FILTER is what bounds the query, and that
+  is what the inlining change turned out to be about — see the tension entry. The
+  counts/blockers/tags reads beside the board are still whole-workspace and not
+  paged at all, so a page view is still O(workspace) even when the board is not.
 - A count for a "showing 50 of N" pill costs a second full board. That is why the
   pill says `50+`: the board asks for `PAGE_SIZE + 1` rows and spends the extra one
   on "is there a next page", which is the only question the pager has.
 - `limit` and `offset` are BODY fields and refuse a bind — `limit ?n`, `offset
   ?off` and `offset {#bind off}` are all `limit/offset must be number`. So a page is
-  part of the query TEXT and one stored reactor cannot serve every page. The split
-  taken here: page 0 is the provisioned reactor (every session opens there, and it
-  is the only page with a live subscription), and a deeper page is an ephemeral
-  reactor created for the read and deleted after it. Creating one is 31–44ms and
-  deleting it 21–38ms — under 1% of a 7.6s unindexed read, but more than double the
-  27ms the demo's indexed board costs, which is the whole reason page 0 is stored
-  rather than made the same way. It also consumes a BLOCK of entity ids: consecutive
-  board reactors came back 158 apart, because every clause is an entity, and
-  deleting the reactor does not return them.
+  part of the query TEXT and one stored reactor cannot serve every page. That used
+  to force a split: page 0 was a provisioned reactor and a deeper page an ephemeral
+  one, created for the read and deleted after it (31–44ms to create, 21–38ms to
+  delete, and a BLOCK of entity ids — consecutive board reactors came back 158
+  apart, because every clause is an entity too, and deleting the reactor does not
+  return them). The board's body varies with the filter now, so it is a dry-run and
+  the split is gone: a window is two more numbers in a body that was being built
+  anyway. Measured at 5,000 indexed, page 1 / 21 / 61 cost 418 / 489 / 434ms as a
+  dry-run against 453 / 450 / 454ms through an ephemeral reactor — the same query
+  plus the reactor's overhead, on every page but the first.
+
+  The general form is still worth carrying, because the next stored reactor will
+  hit it: a stored reactor fits a query whose BODY is fixed and whose inputs can
+  all be binds. `limit`/`offset` cannot be binds, and neither can a clause that is
+  present or absent. If either varies, it is a dry-run.
 
 Also measured while establishing this: the plain board at 2,000 unindexed todos
 allocates about 400MB of transient heap per read, and at 10,000 it peaks around
@@ -230,9 +257,35 @@ Pushing everything into Stardust is not automatically right, and finding where i
 stops being right is the interesting part. Real trades already made here, each
 worth reading before you re-litigate one:
 
-- A complex reactor body vs a simpler query plus app code. The board reactor
-  computes effectiveStatus and every filter server-side. It is genuinely hard to
-  read, and it is why the board needs no filtering layer at all.
+- A complex query body vs a simpler query plus app code. The board body computes
+  effectiveStatus and every filter server-side. It is genuinely hard to read, and
+  it is why the board needs no filtering layer at all.
+- The facet filters: JOINED vs READ AND INLINED. REVERSED, by measurement, and this
+  is the one to read before assuming "let the engine do it" means "make it a join".
+  The filter is facts either way — that part never moved and is not up for
+  discussion. The question was only whether the query MATCHES those facts or is
+  BUILT from them. Matching them means the engine joins the session's `sf` children
+  against every candidate row, and its cost therefore grows with the corpus times
+  the number of values selected. Building the query from them means one literal
+  comparison that NARROWS the candidate set. Measured at 5,005 todos, 50 rows,
+  value indexes on: no facet filter at all is 51ms, the value-joins are 1,972ms,
+  the inlined literals are 24ms. Unindexed the join is 32,775ms. Reproduced by the
+  harness at 5,000 (`npm run stress`): 2,303ms → 56ms for one page under a narrow
+  filter, 4,305ms → 403ms unfiltered.
+
+  What it gives up, precisely. **One stored body no longer serves every filter
+  combination.** There is no `board` reactor any more, in any shape; the body is a
+  function of the selection (15 x 7 x 5 x 2 of them) so the rows are a dry-run built
+  per read. Three consequences: the query is no longer a durable artifact you can
+  read out of the database or hand to the lab with a bind, so what the x-ray offers
+  is the `session-page` subscription instead; the app now OWNS the correctness of a
+  compiler, where before it owned only a body; and every value that reaches that
+  compiler has to be checked against a domain, because a value that becomes part of
+  a query is not data any more. Tag labels have no domain — they are free text from
+  `addTag` — so the tag filter is deliberately NOT inlined and stays the correlated
+  `exists` it always was. What it gains beyond the speed: the body has no free vars
+  left, so the "an omitted bind matches everything" hazard two sections up cannot
+  apply to it, and a deep page stops costing an ephemeral reactor.
 - The compile-time query checker only models plain 3-tuple fact clauses. Queries
   using `or` or a bound `exists` cannot use it, so they keep runtime validation and
   lose the compile-time check. That is why `define()` does not apply `CheckQuery`.

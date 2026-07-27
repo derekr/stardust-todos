@@ -6,7 +6,7 @@
 // per configuration. The query under test is the app's own canonicalBody(),
 // imported rather than copied, so this exercises what ships.
 //
-// Six questions, in increasing cost:
+// Eight questions, in increasing cost:
 //   1. data loss  — is every todo written still there, with every fact it needs?
 //   2. invariants — metamorphic relations that hold whatever the data is
 //   3. oracle     — does the board agree with the SPEC, row for row?
@@ -17,6 +17,11 @@
 //   7. paging     — do the WINDOWS of a body tile the body? The board returns one
 //                   page now, so "the board agrees with the spec" only means
 //                   something if the pages a reader walks add up to it.
+//   8. inline==join — does the body that INLINES the session's selected facet
+//                   values return exactly what the body that JOINED them returned?
+//                   That is the change this section exists to hold down, and it is
+//                   asked against the engine rather than against the oracle, so a
+//                   spec and an implementation being wrong together cannot hide it.
 // Plus timings, because a query that is right at 10k and unusable at 1M is a bug —
 // including the tag body, which is the one that still runs a subquery and so is the
 // one that still has a ceiling.
@@ -26,10 +31,10 @@
 // join multiplies and the harness invents its own duplicates. And the unfiltered
 // board at a million rows is a ~200MB response, so it is measured, never parsed.
 //
-// There is no longer ONE board body: the app compiles the tag `exists` and the
-// wall-clock overdue clauses out when a session does not need them, so this creates
-// one reactor per shape and reads whichever the app would have read for the same
-// filter. Getting that wrong here would silently test a body nobody runs.
+// Every board read here is a DRY-RUN of `canonicalBody`, which is what the app does
+// now. It used to create one stored reactor per body SHAPE and read whichever the
+// app would have read for the same filter; there are no shapes any more, because
+// the body inlines the selection and so varies with the filter itself.
 //
 // 4 and 5 ask something different from the rest. `blocked` is a STORED fact now,
 // maintained by the app's write paths rather than by the query, so its correctness
@@ -40,7 +45,7 @@
 // when a single `refreshDerived` call is removed, which is the only evidence that
 // the property is load-bearing rather than decorative.
 
-import { type BoardShape, PAGE_SIZE, type PageWindow, canonicalBody, pageWindow } from "../../src/session.ts";
+import { type BoardQuery, PAGE_SIZE, type PageWindow, canonicalBody, pageWindow } from "../../src/session.ts";
 import { BASE as APP_BASE, readEntity } from "../../src/stardust.ts";
 import { addTodo, reconcileBlocked, removeTodo, setDone, setStatus, toggleTodo } from "../../src/todos.ts";
 import { addDependency, removeDependency } from "../../src/features.ts";
@@ -93,6 +98,11 @@ const full: Facets = {
 let nextSid = 900_000 + (Date.now() % 90_000_000);
 let lastError = "";
 
+/** Todos the CLOCK phase writes into the corpus's workspace (section 6). The
+ *  oracle is a pure function of N and cannot see them, so anything that compares a
+ *  whole-corpus count against it after section 6 has to add them back. */
+const CLOCK_TODOS = 2;
+
 async function main() {
   console.log(`\n\x1b[1mstress: ${N.toLocaleString()} todos against ${BASE}\x1b[0m\n`);
   // The write-path phase calls the APP's commands, and those resolve their own
@@ -109,7 +119,6 @@ async function main() {
   const secs = (Date.now() - t0) / 1000;
   console.log(`  seeded in ${secs.toFixed(1)}s (${Math.round(N / secs).toLocaleString()} todos/s)\n`);
 
-  await createReactors();
   const sessionFor = async (f: Facets) => {
     const sid = ++nextSid;
     await session(s, sid, f);
@@ -152,6 +161,11 @@ async function main() {
   ok("repeat read is stable", !!rHi2 && same(rHi.rows.map(kOf), rHi2.rows.map(kOf)));
   ok("no duplicate ids", new Set(rHi.rows.map((r) => r.id)).size === rHi.rows.length, `${rHi.rows.length} rows`);
 
+  // Kept, and worth saying what it means NOW: it used to prove that a value-join
+  // correlated to `?sess` could not pick up another session's facet rows. The
+  // facets are inlined, so what it proves today is that the body a session is
+  // handed was compiled from THAT session's facts — a different failure with the
+  // same symptom, and the one this change could plausibly introduce.
   const rLo = (await board(lo, sidLo))!;
   ok(
     "a session sees only its own filter",
@@ -343,7 +357,7 @@ async function main() {
   console.log("\n\x1b[1moverdue reads the wall clock\x1b[0m");
   const day = 86_400_000;
   const recent = await freshTodo(s, "recent due", NOW - 3 * day);
-  const future = await freshTodo(s, "future due", NOW + 30 * day);
+  const future = await freshTodo(s, "future due", NOW + 30 * day); // CLOCK_TODOS of them
   const odFacets: Facets = { ...full, view: "overdue" };
   const od = await board(odFacets, await sessionFor(odFacets));
   ok("a todo due three days ago is overdue", !!od && od.rows.some((r) => r.id === recent), `#${recent}`);
@@ -443,13 +457,66 @@ async function main() {
     }
   }
 
-  // ---- 8. performance ----------------------------------------------------
+  // ---- 8. the shape this change replaced ---------------------------------
+  //
+  // The facet filters used to be VALUE-JOINS: four clauses each, matching the
+  // session's `sf` children against every candidate row. They are inlined literal
+  // comparisons now. That is a rewrite of the query, so the property that matters
+  // is that it did not change the ANSWER — asked of the engine, on the real corpus,
+  // rather than of the oracle, which both bodies are checked against separately.
+  //
+  // The joined body is reconstructed from the app's own body by swapping the two
+  // inlined clauses back out, so it cannot drift into testing something else: if
+  // `canonicalBody` stops producing the clauses this expects, `replaced` is not 2
+  // and the assertion fails rather than quietly comparing a body to itself.
+  console.log("\n\x1b[1minlined facets vs the value-join they replaced\x1b[0m");
+  for (const [label, f] of [
+    ["priority=high status=todo", hi],
+    ["priority=high,low status=todo", both],
+    ["every facet selected", full],
+  ] as const) {
+    const sid = await sessionFor(f);
+    const joined = joinedBody(f, sid, null);
+    const inline = await runBoard(canonicalBody(queryOf(f, sid), null));
+    const join = await runBoard(joined.body);
+    if (!inline || !join) {
+      ok(`${label}: both bodies read`, false, lastError);
+      continue;
+    }
+    // Compared by entity id, not by corpus index: section 6 writes two todos whose
+    // titles are not `stress NNNNNNN`, so `kOf` gives them NaN and NaN never equals
+    // itself. An id is what the rows actually are.
+    ok(
+      `${label}: inlined == joined, row for row`,
+      joined.replaced === 2 &&
+        same(
+          inline.rows.map((r) => r.id),
+          join.rows.map((r) => r.id),
+        ),
+      `${joined.replaced}/2 clauses swapped · ${inline.rows.length.toLocaleString()} vs ` +
+        `${join.rows.length.toLocaleString()} rows · inlined ${inline.ms}ms, joined ${join.ms}ms`,
+    );
+    // The same two bodies at the size the APP asks for — one page. Reported
+    // separately because the assertion above compares whole result sets and this is
+    // the read a browser actually waits on, and the row count travels with the
+    // timing: a body that matched nothing would be the fastest line here.
+    const pageInline = await runBoard(canonicalBody(queryOf(f, sid), pageWindow(0)));
+    const pageJoin = await runBoard(joinedBody(f, sid, pageWindow(0)).body);
+    console.log(
+      `        one page (${PAGE_SIZE} + read-ahead): inlined ${String(pageInline?.ms ?? -1).padStart(5)}ms, ` +
+        `joined ${String(pageJoin?.ms ?? -1).padStart(5)}ms   ` +
+        `${(pageInline?.rows.length ?? 0).toLocaleString()} rows either way`,
+    );
+  }
+
+  // ---- 9. performance ----------------------------------------------------
   console.log("\n\x1b[1mperformance\x1b[0m");
   const size = (r: { bytes: number }, unit: number, suffix: string) =>
     r.bytes < 0
       ? `\x1b[33mnot returned\x1b[0m — ${lastError}`
       : `${(r.bytes / unit).toFixed(unit === 1024 ? 0 : 1)}${suffix}`;
-  const wide = await raw(full, await sessionFor(full));
+  const sidWide = await sessionFor(full);
+  const wide = await raw(full, sidWide);
   console.log(
     `  unfiltered board   ${String(wide.ms).padStart(6)}ms   ${size(wide, 1048576, "MB")}   ` +
       `expected ${expectedCount(N, full, NOW).toLocaleString()} rows`,
@@ -495,10 +562,46 @@ async function main() {
   }
   // The count a "showing 50 of N" pill would need: the board's OWN `where`, with
   // the projection replaced by a tally. It has to be that query — a count over the
-  // todo facts alone omits the session joins, the facet value-joins and the
-  // visibility `or`, and comes back in milliseconds, which would be a comforting
-  // and completely wrong number.
-  console.log(`  ${"count over the same".padEnd(22)} ${await countLikeTheBoard(full, sidPerf)}`);
+  // todo facts alone omits the session join, the facet filters and the visibility
+  // `or`, and comes back in milliseconds, which would be a comforting and
+  // completely wrong number.
+  //
+  // It is also the one place a ROW COUNT is asserted against a timing, which is a
+  // rule this file learned expensively: a read that matches nothing is fast, and a
+  // fast number with no count beside it is not evidence of anything.
+  const tally = await countLikeTheBoard(full, sidPerf);
+  console.log(
+    `  ${"count over the same".padEnd(22)} ${String(tally.ms).padStart(6)}ms   ${tally.n.toLocaleString()} matching`,
+  );
+  // `+ CLOCK_TODOS` because section 6 wrote two of them into the corpus's own
+  // workspace, and both are visible under the unfiltered facets. The oracle is a
+  // function of N and does not know about them — which is the sort of thing an
+  // assertion over a perturbed corpus has to say out loud rather than absorb.
+  const wantWide = expectedCount(N, full, NOW) + CLOCK_TODOS;
+  ok(
+    "the timed board matches the number of rows the spec expects",
+    tally.n === wantWide,
+    `${tally.n.toLocaleString()} vs ${wantWide.toLocaleString()}`,
+  );
+
+  // What a DEEP page costs, and what it used to cost. Page 0 was a provisioned
+  // reactor read with a bind; every other page was a reactor created for the read
+  // and deleted after it (31-44ms + 21-38ms on this box, plus ~158 entity ids that
+  // never come back). A dry-run body carries its own window, so a deep page is now
+  // the same read as page 1 — and the two lines below are the same query, once the
+  // way the app does it and once the way it used to.
+  console.log("\n\x1b[1mdeep paging: a dry-run vs the ephemeral reactor it replaced\x1b[0m");
+  for (const page of [0, 20, 60]) {
+    const t0 = Date.now();
+    const rows = await windowRows(full, sidPerf, pageWindow(page));
+    const dryMs = Date.now() - t0;
+    const via = await windowViaReactor(full, sidPerf, pageWindow(page));
+    console.log(
+      `  page ${String(page + 1).padEnd(4)} dry-run ${String(dryMs).padStart(6)}ms (${(rows?.length ?? 0).toLocaleString()} rows)` +
+        `   ephemeral reactor ${String(via.ms).padStart(6)}ms (${via.n.toLocaleString()} rows` +
+        `, ${via.createMs}ms create + ${via.deleteMs}ms delete)`,
+    );
+  }
 
   console.log(`\n${failures ? `\x1b[31m${failures} failing\x1b[0m` : "\x1b[32mall green\x1b[0m"}\n`);
   process.exit(failures ? 1 : 0);
@@ -573,61 +676,105 @@ async function derivedHolds(
 }
 
 // ---------------------------------------------------------------------------
-// One reactor per body SHAPE, because the app has one per shape: the tag `exists`
-// and the wall-clock overdue clauses are compiled out when a session does not need
-// them. The harness picks the same body the app would pick for the same filter, so
-// a configuration that reads the wrong one is a bug here, not a wrong answer.
+// The board read, done the app's way: one DRY-RUN of `canonicalBody`, with this
+// configuration's selected facet values compiled into it as literals. There is no
+// stored reactor to pick, for the reference read or for a page — a body that
+// inlines the selection is a function of the filter, so there is nothing a bind
+// could parameterise and nothing to provision ahead of time.
 // ---------------------------------------------------------------------------
-const shapeOf = (f: Facets): BoardShape => ({ tag: f.tagActive, overdue: f.view === "overdue" });
-const shapeKey = (s: BoardShape) => `${s.overdue}|${s.tag}`;
-const rids = new Map<string, number>();
 
-async function createReactors(): Promise<void> {
-  for (const shape of [
-    { tag: false, overdue: false },
-    { tag: true, overdue: false },
-    { tag: false, overdue: true },
-    { tag: true, overdue: true },
-  ] as BoardShape[]) {
-    const res = await fetch(`${BASE}/reactors`, {
-      method: "POST",
-      headers: H,
-      // UNWINDOWED, deliberately: these four are the oracle's reference, and every
-      // assertion above compares against the whole expected set. The app reads a
-      // page of this same body; that the pages tile this result exactly is a
-      // property, and it is asserted below rather than assumed here.
-      body: JSON.stringify(canonicalBody(shape, null)),
-    });
-    const text = await res.text();
-    if (!res.ok) throw new Error(`reactor: ${res.status} ${text.slice(0, 200)}`);
-    const rec = JSON.parse(text.trim().split("\n")[0]!);
-    rids.set(shapeKey(shape), typeof rec.reactorId === "object" ? rec.reactorId["#"] : rec.reactorId);
+/** The app's BoardQuery for a harness configuration. `now` is the harness's fixed
+ *  clock, so the overdue body is the same on every read of a run. */
+const queryOf = (f: Facets, sid: number): BoardQuery => ({
+  sid,
+  status: f.status,
+  priority: f.priority,
+  view: f.view,
+  tag: f.tagActive,
+  now: new Date(NOW),
+});
+
+/**
+ * Run a board body and parse the rows. `null` when the engine refused it.
+ *
+ * The refusal is reported WITH the body that provoked it. That is not decoration:
+ * a `ron: invalid #utc payload at byte 0` at 10,000 rows cost most of a day,
+ * because the message describes what the engine thinks it RECEIVED and the harness
+ * only printed the message — so every hypothesis about what had been SENT was
+ * unfalsifiable.
+ */
+async function runBoard(body: unknown): Promise<{ rows: BoardRow[]; ms: number } | null> {
+  const t0 = Date.now();
+  let parsed: any;
+  try {
+    const res = await fetch(`${BASE}/reactors/dry-run`, { method: "POST", headers: H, body: JSON.stringify(body) });
+    parsed = JSON.parse((await res.text()).trim().split("\n")[0] ?? "[]");
+  } catch (e) {
+    parsed = { "stardust/error": true, message: describe(e) };
   }
-  console.log(`\x1b[1mboard reactors\x1b[0m ${[...rids.entries()].map(([k, v]) => `${k} #${v}`).join("  ")}\n`);
+  if (parsed && parsed["stardust/error"]) {
+    lastError = `${parsed.message}\n        body ${JSON.stringify(body).slice(0, 400)}`;
+    console.log(`\x1b[31m  refused after ${Date.now() - t0}ms\x1b[0m ${lastError}`);
+    return null;
+  }
+  return { rows: parsed as BoardRow[], ms: Date.now() - t0 };
 }
 
 /**
- * The results request for a configuration: the right body, and `now` when it needs
- * one. Returned as URL *and* bind, because a refusal has to be reported with the
- * exact wire form that provoked it.
+ * The board body with the two INLINED facet filters swapped back out for the
+ * value-joins they replaced — the shape that shipped before this change.
  *
- * That is not decoration. A `ron: invalid #utc payload at byte 0` at 10,000 rows
- * cost most of a day, because the message describes what the engine thinks it
- * RECEIVED and the harness only printed the message — so every hypothesis about
- * what had been SENT was unfalsifiable. Whatever fails next, it should fail with
- * its request attached.
+ * Built by surgery on the app's own body rather than written out again, so it
+ * cannot drift into testing a query nobody ever ran. `replaced` is how the caller
+ * knows the surgery found what it was looking for: anything other than 2 means
+ * `canonicalBody` no longer emits the clauses this expects, and the comparison
+ * would otherwise be a body against itself.
  */
-function resultsReq(f: Facets, sid: number): { url: string; bind: string; rid: number } {
-  const shape = shapeOf(f);
-  const bind = shape.overdue ? `{sid ${sid} now {#utc '${new Date(NOW).toISOString()}'}}` : `{sid ${sid}}`;
-  const rid = rids.get(shapeKey(shape))!;
-  return { rid, bind, url: `${BASE}/reactors/${rid}/results?max=1&bind=${encodeURIComponent(bind)}` };
+function joinedBody(f: Facets, sid: number, window: PageWindow | null): { body: unknown; replaced: number } {
+  const inlined = (v: string, values: readonly string[]) =>
+    values.length === 1 ? ["=", v, values[0]] : ["or", ...values.map((x) => ["=", v, x])];
+  const whole = (vals: readonly string[], domain: readonly string[]) => (vals.length ? vals : domain);
+  const swaps: [string, unknown[]][] = [
+    [
+      JSON.stringify(inlined("?priority", whole(f.priority, PRIORITY))),
+      [
+        ["?fp", "kind", "sf"],
+        ["?fp", "session", "?sess"],
+        ["?fp", "facet", "priority"],
+        ["?fp", "value", "?priority"],
+      ],
+    ],
+    [
+      JSON.stringify(inlined("?eff", whole(f.status, STATUS))),
+      [
+        ["?fs", "kind", "sf"],
+        ["?fs", "session", "?sess"],
+        ["?fs", "facet", "status"],
+        ["?fs", "value", "?eff"],
+      ],
+    ],
+  ];
+  const body = canonicalBody(queryOf(f, sid), window) as { where: unknown[] };
+  const where: unknown[] = [];
+  let replaced = 0;
+  for (const clause of body.where) {
+    const hit = swaps.find(([json]) => json === JSON.stringify(clause));
+    if (hit) {
+      where.push(...hit[1]);
+      replaced++;
+    } else where.push(clause);
+  }
+  return { body: { ...body, where }, replaced };
 }
 
 async function raw(f: Facets, sid: number): Promise<{ ms: number; bytes: number }> {
   const t0 = Date.now();
   try {
-    const res = await fetch(resultsReq(f, sid).url, { headers: { Accept: "application/x-ndjson" } });
+    const res = await fetch(`${BASE}/reactors/dry-run`, {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify(canonicalBody(queryOf(f, sid), null)),
+    });
     let bytes = 0;
     for await (const chunk of res.body!) bytes += (chunk as Uint8Array).length;
     return { ms: Date.now() - t0, bytes };
@@ -652,97 +799,79 @@ function describe(e: unknown): string {
   return `${err?.message ?? String(e)}${cause ? ` (${cause})` : ""}`;
 }
 
-/**
- * One WINDOW of the same body — the app's paged read, done the app's way.
- *
- * A window cannot be a bind (`limit must be number`), so it is a reactor of its
- * own, made for this read and deleted after it. That is what the app does for any
- * page but the first, so testing paging means creating reactors here too.
- */
+/** One WINDOW of the same body — the app's paged read, done the app's way. A
+ *  window is `limit`/`offset` in the body, so a page is the same dry-run with two
+ *  more numbers in it; it used to be a reactor created for the read and deleted
+ *  after it, which is what `windowViaReactor` still measures. */
 async function windowRows(f: Facets, sid: number, w: PageWindow): Promise<BoardRow[] | null> {
-  const shape = shapeOf(f);
+  return (await runBoard(canonicalBody(queryOf(f, sid), w)))?.rows ?? null;
+}
+
+/**
+ * The SAME page, read the way it used to be: a reactor created for this read,
+ * bound by `sid`, and deleted after. Kept only to keep the cost of what was
+ * removed measurable next to what replaced it — the app has no path that does
+ * this any more.
+ *
+ * `enabled: false` because a reactor made for one bound read should not also be
+ * asked to evaluate itself unbound.
+ */
+async function windowViaReactor(
+  f: Facets,
+  sid: number,
+  w: PageWindow,
+): Promise<{ ms: number; n: number; createMs: number; deleteMs: number }> {
+  const t0 = Date.now();
   const res = await fetch(`${BASE}/reactors`, {
     method: "POST",
     headers: H,
-    // `enabled: false` for the same reason the app does it (session.ts): a reactor
-    // made for one bound read should not also be asked to evaluate itself unbound.
-    body: JSON.stringify({ ...canonicalBody(shape, w), enabled: false }),
+    body: JSON.stringify({ ...canonicalBody(queryOf(f, sid), w), enabled: false }),
   });
+  const createMs = Date.now() - t0;
   const rec = JSON.parse((await res.text()).trim().split("\n")[0]!);
   if (rec["stardust/error"]) {
     lastError = `${rec.message} · window limit ${w.limit} offset ${w.offset}`;
-    return null;
+    return { ms: Date.now() - t0, n: -1, createMs, deleteMs: 0 };
   }
   const rid = typeof rec.reactorId === "object" ? rec.reactorId["#"] : rec.reactorId;
-  const bind = shape.overdue ? `{sid ${sid} now {#utc '${new Date(NOW).toISOString()}'}}` : `{sid ${sid}}`;
-  const url = `${BASE}/reactors/${rid}/results?max=1&bind=${encodeURIComponent(bind)}`;
+  let n = -1;
   try {
-    let parsed: any;
-    try {
-      const r = await fetch(url, { headers: { Accept: "application/x-ndjson" } });
-      parsed = JSON.parse((await r.text()).trim().split("\n")[0] ?? "[]");
-    } catch (e) {
-      parsed = { "stardust/error": true, message: describe(e) };
-    }
-    if (parsed && parsed["stardust/error"]) {
-      lastError = `${parsed.message}\n        sent ${url}\n        bind ${bind}`;
-      console.log(`\x1b[31m  refused\x1b[0m ${lastError}`);
-      return null;
-    }
-    return parsed as BoardRow[];
-  } finally {
-    // A reactor is durable state. A harness that leaves one behind per page read
-    // is a harness that changes the database it is measuring.
-    await fetch(`${BASE}/reactors/${rid}`, { method: "DELETE", headers: { Accept: "application/x-ndjson" } });
+    const r = await fetch(`${BASE}/reactors/${rid}/results?max=1`, { headers: { Accept: "application/x-ndjson" } });
+    const rows = JSON.parse((await r.text()).trim().split("\n")[0] ?? "[]");
+    if (Array.isArray(rows)) n = rows.length;
+  } catch (e) {
+    lastError = describe(e);
   }
+  const t1 = Date.now();
+  // A reactor is durable state. A harness that leaves one behind per page read is a
+  // harness that changes the database it is measuring.
+  await fetch(`${BASE}/reactors/${rid}`, { method: "DELETE", headers: { Accept: "application/x-ndjson" } });
+  return { ms: Date.now() - t0, n, createMs, deleteMs: Date.now() - t1 };
 }
 
 /** What a total for the count pill would cost: the board's body, counting instead
- *  of projecting. Reported as a string so the caller just prints it. */
-async function countLikeTheBoard(f: Facets, sid: number): Promise<string> {
-  const shape = shapeOf(f);
-  const { orderBy: _o, then: _t, ...rest } = canonicalBody(shape, null) as Record<string, unknown>;
-  const res = await fetch(`${BASE}/reactors`, {
+ *  of projecting. The COUNT comes back with the timing, because a timing on its
+ *  own cannot tell a fast query from an empty one. */
+async function countLikeTheBoard(f: Facets, sid: number): Promise<{ ms: number; n: number }> {
+  const { orderBy: _o, then: _t, ...rest } = canonicalBody(queryOf(f, sid), null) as Record<string, unknown>;
+  const t0 = Date.now();
+  const res = await fetch(`${BASE}/reactors/dry-run`, {
     method: "POST",
     headers: H,
-    body: JSON.stringify({ ...rest, find: [["count", "?t"]], enabled: false }),
+    body: JSON.stringify({ ...rest, find: [["count", "?t"]] }),
   });
-  const rec = JSON.parse((await res.text()).trim().split("\n")[0]!);
-  if (rec["stardust/error"]) return `refused — ${rec.message}`;
-  const rid = typeof rec.reactorId === "object" ? rec.reactorId["#"] : rec.reactorId;
-  const bind = shape.overdue ? `{sid ${sid} now {#utc '${new Date(NOW).toISOString()}'}}` : `{sid ${sid}}`;
-  const t0 = Date.now();
-  try {
-    const r = await fetch(`${BASE}/reactors/${rid}/results?max=1&bind=${encodeURIComponent(bind)}`, {
-      headers: { Accept: "application/x-ndjson" },
-    });
-    const rows = JSON.parse((await r.text()).trim().split("\n")[0] ?? "[]");
-    const n = Array.isArray(rows) ? (rows[0]?.[0] ?? 0) : -1;
-    return `${String(Date.now() - t0).padStart(6)}ms   ${Number(n).toLocaleString()} matching`;
-  } finally {
-    await fetch(`${BASE}/reactors/${rid}`, { method: "DELETE", headers: { Accept: "application/x-ndjson" } });
+  const rows = JSON.parse((await res.text()).trim().split("\n")[0] ?? "[]");
+  if (rows && rows["stardust/error"]) {
+    lastError = String(rows.message);
+    return { ms: Date.now() - t0, n: -1 };
   }
+  return { ms: Date.now() - t0, n: Number(rows?.[0]?.[0] ?? 0) };
 }
 
-/** null when the engine refused the query — recorded as a failure, not a crash. */
+/** The unwindowed board for a configuration — the oracle's reference read.
+ *  null when the engine refused the query: recorded as a failure, not a crash. */
 async function board(f: Facets, sid: number): Promise<{ rows: BoardRow[]; ms: number } | null> {
-  const { url, bind } = resultsReq(f, sid);
-  const t0 = Date.now();
-  let parsed: any;
-  try {
-    const res = await fetch(url, { headers: { Accept: "application/x-ndjson" } });
-    parsed = JSON.parse((await res.text()).trim().split("\n")[0] ?? "[]");
-  } catch (e) {
-    parsed = { "stardust/error": true, message: describe(e) };
-  }
-  if (parsed && parsed["stardust/error"]) {
-    // Loud, immediate, and with the request attached — the console line is the
-    // record, since `lastError` is only read by whichever assertion asked.
-    lastError = `${parsed.message}\n        sent ${url}\n        bind ${bind}`;
-    console.log(`\x1b[31m  refused after ${Date.now() - t0}ms\x1b[0m ${lastError}`);
-    return null;
-  }
-  return { rows: parsed as BoardRow[], ms: Date.now() - t0 };
+  return runBoard(canonicalBody(queryOf(f, sid), null));
 }
 
 /**
