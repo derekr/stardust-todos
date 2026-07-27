@@ -212,6 +212,78 @@ docs are explicit that each one costs write work and storage.
 Worth knowing: reading a stored reactor with a bind costs about the same as the
 equivalent dry-run. A stored reactor is not a cache you read for free.
 
+## Searching a value is a THIRD index, and it is the one that backfills
+
+A value index answers "which rows have this exact title". Nothing here ever asked
+that, and for the blocker picker it is the wrong question: every meaningful word
+in this corpus is in the MIDDLE of a title, so a range read over the value index
+(`[>= ?title 'Buy'] [< ?title 'Buz']`, a real 84ms read that correctly finds `Buy
+coffee beans`) can never find `① Design landing page` from "landing". Text search
+is a separate policy on the same `/indexes/{field}` document, and `title` now
+carries both.
+
+**PATCH one section, never PUT.** `PUT` replaces BOTH desired sections, so a PUT
+carrying only `fullText` resets `valueIndex` to `default` — which would cost the
+board its index-ordered scan (36ms against 252ms at ten thousand) with no error
+anywhere. `PATCH fullText {analyzers [english]}` preserves the value index;
+verified on a copy of the demo, where `valueIndex{enabled true source explicit}`
+came back untouched. Both are ETag-guarded, and 412 means someone else moved
+first.
+
+**There was no desired/active gap to observe.** The docs describe `desired` being
+set while `active` catches up and `catchUp.state` reads `building`, and
+`ensureTextIndex` tests the ACTIVE section for exactly that reason — but at 10,003
+titles the backfill happens INSIDE the PATCH: it returned after 3.6s with
+`active{fullText{analyzers[english]}}` and `textSearch{state ready lag 0}` already
+true. (Re-enabling after a disable took 2.1s; disabling took 425ms.) So provisioning
+is synchronous at this size, and `npm run stardust:setup` finishing is what makes
+search work. Expect the documented asynchronous states on a corpus large enough to
+need them, and expect `dormant` — which is healthy — on a field with no text yet.
+
+**The state that DOES appear is lag behind live writes, and it did not bite.**
+Under a burst of title writes `/healthz` showed the Full-text index `lagging` with
+a lag of 9, and search fails closed while it is behind (`fts index not ready:
+sequence <fts>, canonical <eftc>`). Sixty races — a title write and a search issued
+in the same breath, forty at the engine and twenty through the app — produced zero
+errors and zero short answers, because retry-capable execution waits for catch-up
+and retries in a fresh snapshot. Do not build on that being free; do note that the
+app needs no retry arm of its own for it.
+
+**What it costs.** 49,880 postings over 10,036 documents for 10,003 titles; the
+database file 32.2 MiB → 48.4 MiB; a single-field title write p50 2.7ms with the
+analyzer on against 1.8ms with it off, measured by toggling it over the same
+corpus. So it is affordable exactly once, on one field, which is why `TEXT_FIELDS`
+has one entry and the board — which filters on values it already has an index for
+— does not use it.
+
+**It is a stemmer, not a prefix matcher, and that shapes the UI.** The same
+pipeline runs over the stored text and the query text, so "land" finds "landing"
+(both stem to `land`) and "landi" finds NOTHING on the way there. A stop-word-only
+query ("the") returns zero rows rather than erroring. That is a real limitation of
+a typeahead built this way and the picker says so in its empty state rather than
+looking broken.
+
+**`limit` is still a post-filter the moment a real query surrounds the search.**
+The docs give `orderBy [[?score desc] ?entity]` + `limit` as the bounded top-k
+shape and it genuinely is one — for a term matching 2,498 rows, bare, `limit 20`
+costs 4ms against 17ms unlimited. Join `title` on and it is 12ms; join the app,
+workspace and visibility clauses the picker actually needs and it is 42ms, which
+is what that body costs with no `limit` at all. Same lesson as the board, reached
+from a different direction: what bounds an fts read is the TERM (3ms for four
+matches, 11ms for 625, 42ms for 2,498, against a corpus of 10,003), not the cap.
+
+**A search term cannot travel as a bind, and this is the sharp edge.** Stardust
+accepts `[fts ?q ?entity ?score]` and an omitted `?q` FAILS CLOSED — `query: fts
+input ?q is unbound` — which is a third entry for the section above: fts input is
+neither a fact clause that widens nor an expression that needs a row to reach it,
+it simply refuses. The problem is on this side. `ronBind` in stardust.ts is the one
+place this app builds RON by hand, and it wraps a string bind in single quotes with
+no escaping, so binding `q` to `o'brien` produces `{q 'o'brien'}` and the read
+comes back `unknown bind var ?brien`. No caller binds free text today (the string
+binds in use are `scope`, a two-value domain), so it is latent rather than live —
+but it is why the picker's search is a dry-run with the term as a VALUE in a JSON
+body. Fix `ronBind` before the next feature wants a string bind from a user.
+
 ## `limit` is a post-filter, and removing the subqueries did not change that
 
 This was tested again in phase 3, because it looked like it should have changed.
@@ -423,6 +495,14 @@ worth reading before you re-litigate one:
   an import. A writeback reactor cannot take this job: verified in both directions,
   `then.patch` does not fire on a dep edge being added OR retracted, only on a write
   to the blocker's own `status`, so a todo left `blocked:true` stays wrong forever.
+- Full-text search vs a prefix range, for the blocker picker: FULL TEXT, and the
+  deciding measurement was not speed. The range read works today with no setup
+  (84ms, right answer) and the analyzer costs a 3.6s backfill, 16MiB and ~1ms per
+  title write — but a prefix cannot match a word in the middle of a title, which is
+  every word in this data. Speed was a wash; reach was not. The search is a DRY-RUN
+  rather than a stored reactor for a reason that is a bug report as much as a
+  design call: the term cannot safely be a bind while `ronBind` builds RON by hand.
+  See the search section above.
 - The role HIERARCHY is still TypeScript (`roleRank`: any < member < owner). The
   app turns a role into a rank and Stardust compares it, so half of "who may do
   what" is still a deploy away. Making ranks facts is the obvious next step and

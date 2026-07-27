@@ -171,6 +171,27 @@ Highlights of the later stages:
   workspace's actual tag vocabulary; the clause stays a correlated `exists` because a
   plain join returns a todo with two matching labels twice.
 
+- **The blocker picker searches, through a second index on the same field**
+  (`src/board.ts`, `src/indexes.ts`). "Add blocker" used to offer every visible
+  todo — 9,947 buttons, a 686KB read, 307ms of a 361ms detail page — and bounding
+  it to the first 25 by title fixed the cost and left a control that could not
+  reach a blocker further down the alphabet. It has a search box now, debounced in
+  the browser and answered by one `fts` clause. `title` carries an analyzed english
+  TEXT index alongside its value index; the two are independent policies on the
+  same `/indexes/title` document, so enabling one is a `PATCH` that leaves the
+  other alone. What that buys over the value index the field already had: a range
+  read (`[>= ?title 'Buy'] [< ?title 'Buz']`) matches a PREFIX of the whole title,
+  and every meaningful word in this data is in the middle of one — "landing" would
+  never find `① Design landing page`. `fts` matches stemmed TERMS wherever they
+  fall, so "land" finds it too. Measured against the demo's 10,003 todos: 3ms for a
+  term matching four rows, 11ms for one matching 625, 42ms for one matching 2,498,
+  and the detail page stays at ~81ms while the search is idle. The bound that
+  matters is the TERM, not the `limit` — the documented top-k shape really is one
+  (4ms against 17ms unlimited) but only while the fts clause is the whole query,
+  and this one joins workspace and visibility clauses back on. Enabling the
+  analyzer over 10,003 titles took 3.6s inside the `PATCH`, built 49,880 postings,
+  grew the database from 32.2 to 48.4 MiB, and costs a title write 2.7ms against
+  1.8ms.
 - **One reactor = the source of truth for the UI.** Commands (add/toggle/remove) only
   *write facts*; they never render the list. The reactor recomputes and Stardust
   pushes the new result down the open record stream, so every connected client
@@ -200,7 +221,7 @@ Highlights of the later stages:
 - `src/board-query.ts`   — compiles one filter and one page into the board's body; runs it as a dry-run.
 - `src/pageset.ts`       — the fifty rows an open stream is showing, as facts, so a reactor can name them.
 - `src/queries.ts`       — the declared reactors (one definition each, typed readers out).
-- `src/indexes.ts`       — value-index policy for the fields those reactors key on.
+- `src/indexes.ts`       — field-index policy: value indexes for the fields those reactors key on, and the english text index behind the blocker picker's search.
 - `src/commands.ts`      — commands as entities; the role gate lives in the query.
 - `src/cli.ts`           — the CLI (operates in the default workspace).
 - `src/server.ts`        — Node HTTP + Datastar web server (CQRS + workspace switching).

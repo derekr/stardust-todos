@@ -16,10 +16,16 @@ const DATASTAR = "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.2/bun
 
 export type HistEntry = { status: string; at: string; actor?: string; via?: string };
 
+/** What the candidate list was narrowed by, so the list can say so.
+ *  `q` empty means "nothing typed yet"; `capped` means the read returned its whole
+ *  limit, so there are matches this list is not showing. */
+export type CandSearch = { q: string; capped: boolean };
+
 export interface DetailOpts {
   effStatus: Status; // DERIVED effective status (may be "blocked") — drives the eyebrow
   blockers: Blocker[]; // this todo's blockers (dot + title + unblock)
   candidates: { id: number; title: string }[]; // "add blocker" options
+  candSearch: CandSearch; // what narrowed them, and whether the list is the whole answer
   blocks: string[]; // titles of todos THIS todo blocks (metadata "Blocks" row)
   tags: string[]; // optional tag pills
   history: HistEntry[]; // status-history timeline (Activity)
@@ -89,6 +95,44 @@ function timeline(history: HistEntry[]): string {
       .join("") +
     `</div>`
   );
+}
+
+/**
+ * The "add blocker" candidates — the ONE element the search box re-patches.
+ *
+ * Rendered by the detail fragment on first paint and by `GET /todo/<id>/candidates`
+ * on every debounced keystroke afterwards, so it carries its own id and both paths
+ * produce the same markup. The list is always bounded, and the note under it says
+ * which bound applied: without that, "the answer" and "the top of the answer" look
+ * identical, and the second one silently hides the row you were looking for. That
+ * is the failure this control had before it could be searched at all.
+ *
+ * The empty state for a search says what the search DOES, because the analyzer's
+ * one surprise is worth spending a line on: it matches whole words (stemmed — so
+ * "land" finds "landing"), not prefixes, so a half-typed word matches nothing on
+ * the way to matching something.
+ */
+export function candidateList(todoId: number, candidates: { id: number; title: string }[], search: CandSearch): string {
+  const rows = candidates
+    .map(
+      (c) =>
+        `<button class="cand" data-on:click="@post('${B}/todo/${todoId}/block/${c.id}'); $addOpen=false; $candQ=''">
+          <span class="sdot"></span>${esc(c.title)}
+        </button>`,
+    )
+    .join("");
+
+  let note = "";
+  if (!candidates.length) {
+    note = search.q
+      ? `<div class="empty">Nothing matches “${esc(search.q)}”.<br /><span class="candhint">Search matches whole words.</span></div>`
+      : `<div class="empty">No other todos to depend on.</div>`;
+  } else if (search.capped) {
+    note = search.q
+      ? `<div class="empty">Top ${candidates.length} matches — narrow the search for more.</div>`
+      : `<div class="empty">First ${candidates.length} by title — type to search the rest.</div>`;
+  }
+  return `<div id="candlist" class="candlist">${rows}${note}</div>`;
 }
 
 /** The inner detail content the server can re-patch on every mutation. */
@@ -167,26 +211,15 @@ export function detailFragment(todo: Todo, opts: DetailOpts): string {
         )
         .join("")
     : `<div class="empty">Nothing blocking this.</div>`;
-  const cands = opts.candidates.length
-    ? opts.candidates
-        .map(
-          (c) =>
-            `<button class="cand" data-on:click="@post('${B}/todo/${id}/block/${c.id}'); $addOpen=false">
-              <span class="sdot"></span>${esc(c.title)}
-            </button>`,
-        )
-        .join("")
-    : `<div class="empty">No other todos to depend on.</div>`;
-  // The picker is capped (see todoPicker); say so rather than silently truncating.
-  const candsNote =
-    opts.candidates.length >= 20
-      ? `<div class="empty">Showing the first ${opts.candidates.length} by title.</div>`
-      : "";
   const blocks = `<div class="seclabel">BLOCKED BY</div>
     <div class="card blockcard" data-xray="blockers">
       ${blockerRows}
-      <button class="addblock" data-on:click="$addOpen = !$addOpen">+ Add blocker</button>
-      <div class="candlist" style="display:none" data-show="$addOpen">${cands}${candsNote}</div>
+      <button class="addblock" data-on:click="$addOpen = !$addOpen; $candQ = ''">+ Add blocker</button>
+      <div class="candbox" style="display:none" data-show="$addOpen">
+        <input class="candsearch" type="search" placeholder="⌕ Search todos" aria-label="search todos to block this one"
+               data-bind:cand-q data-on:input__debounce.250ms="@get('${B}/todo/${id}/candidates')" />
+        ${candidateList(id, opts.candidates, opts.candSearch)}
+      </div>
     </div>`;
 
   // 9. Activity timeline.
@@ -366,10 +399,16 @@ export function detailPage(todo: Todo, opts: DetailOpts): string {
     .unblock:hover { color:var(--red); }
     .addblock { width:100%; text-align:left; border:0; background:transparent; color:var(--orange);
                 font-size:13px; padding:10px; border-top:1px solid var(--line); border-radius:0; }
+    .candbox { padding:6px 4px 2px; }
+    .candsearch { width:100%; border:0; border-radius:10px; background:var(--elev2); color:var(--fg);
+                  font-family:var(--sans); font-size:14px; padding:9px 11px; appearance:none; }
+    .candsearch::placeholder { color:var(--faint); }
+    .candsearch:focus { outline:0; box-shadow:inset 0 0 0 1px var(--line); }
     .candlist { display:flex; flex-direction:column; gap:2px; padding:4px 0 2px; }
     .cand { display:flex; align-items:center; gap:10px; text-align:left; border:0; background:transparent;
             color:var(--fg); font-size:14px; padding:9px 10px; border-radius:8px; }
     .cand:hover { background:var(--elev2); }
+    .candhint { font-family:var(--mono); font-size:11px; color:var(--faint); }
 
     /* 9. activity timeline */
     .tlcard { padding:14px 16px 14px 18px; }
@@ -414,7 +453,7 @@ export function detailPage(todo: Todo, opts: DetailOpts): string {
     }
   </style>
 </head>
-<body data-signals="{menuOpen:false, prioOpen:false, addOpen:false, toast:''}">
+<body data-signals="{menuOpen:false, prioOpen:false, addOpen:false, candQ:'', toast:''}">
   <!-- Outer wrapper holds the long-lived per-todo stream; it re-patches #detail
        on every change. Actions just POST — the stream reflects the new state. -->
   <div id="detailroot" data-init="@get('${B}/todo/${todo.id}/stream', {retryInterval: 300, retryMaxCount: 100000})">

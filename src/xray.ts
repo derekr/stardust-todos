@@ -171,7 +171,7 @@ await blockedByTodo.read({ todo: {"#": id} });
   },
   blockers: {
     title: "Blocked by — a dependency-graph join",
-    mech: "blockerMap() runs one join over the workspace's kind:'dep' edges (todo → blocker) and buckets by todo id. Dependencies are real edge ENTITIES, not an inline array on the todo — so adding/removing one is a single fact write, and the graph is directly queryable.",
+    mech: 'blockerMap() runs one join over the workspace\'s kind:\'dep\' edges (todo → blocker) and buckets by todo id. Dependencies are real edge ENTITIES, not an inline array on the todo — so adding/removing one is a single fact write, and the graph is directly queryable. The PICKER below it is where reading the graph gets interesting at scale. It used to offer every visible todo — 9,947 buttons, a 686KB read, 307ms of a 361ms page — so it was bounded to the first 25 by title, which made the page 83ms and made a blocker further down the alphabet unpickable. Typing in it now asks a different index: `title` carries an analyzed english TEXT index as well as a value one, and [fts <term> ?t ?score] returns entity ids with BM25 scores that join back to ordinary clauses. What bounds it is the TERM, not the limit: at 10,003 todos a term matching four rows costs 3ms, one matching 625 costs 11ms and one matching 2,498 costs 42ms. Ordered by [[?score desc] ?t] with a limit IS the bounded top-k the docs describe — 4ms against 17ms unlimited for that 2,498-row term — but only while the fts clause is the whole query; join the workspace and visibility clauses back on and it costs the same limited as unlimited, so `limit` is the post-filter it is everywhere else here. It is a stemmer and not a prefix matcher, so "land" finds "① Design landing page" (both stem to `land`) and "landi" finds nothing. Two things it is deliberately not: not a stored reactor, because the term would have to travel as a RON bind and this app\'s bind writer does not escape quotes (a search for o\'brien becomes `unknown bind var ?brien`) — and not exempt from visibility, because the same visibleTo fragment is in the body, so a draft you cannot see is not a candidate you can search up.',
     code: `export const blockers = define("board-blockers", {
   find: ["?t", "?b", "?bt", "?bs"],
   where: [
@@ -185,8 +185,24 @@ await blockedByTodo.read({ todo: {"#": id} });
                      title: "?bt", status: "?bs" } },
 });
 
-await blockers.read({ ws: {"#": ctx.workspaceId} });`,
-    src: "src/queries.ts · blockers · src/board.ts · blockerMap()",
+await blockers.read({ ws: {"#": ctx.workspaceId} });
+
+// the picker's typeahead — the term is a VALUE in the body,
+// never text spliced into a query, and the read is a dry-run:
+{
+  find: ["?t", "?title", "?score"],
+  where: [
+    ["fts", term, "?t", "?score"],   // analyzed title terms
+    ["?t", "app", APP],
+    ["?t", "workspace", {"#": wsId}],
+    ["?t", "title", "?title"],
+    ...visibleTo(viewerId),          // drafts stay invisible
+  ],
+  orderBy: [["?score", "desc"], "?t"],  // bounded top-k
+  limit: 20,
+  then: { project: { id: "?t", title: "?title" } },
+}`,
+    src: "src/queries.ts · blockers · src/board.ts · blockerMap() · searchTodoOptions()",
     reactors: [{ name: "board-blockers", bind: "{ws {# 12}}" }],
   },
   commands: {

@@ -122,6 +122,11 @@ export const workspaceTags = define("board-tags", {
   orderBy: ["?label"],
 } as const);
 
+/** How many candidates the unsearched picker offers. Exported because the render
+ *  has to know whether the list it is holding is the whole answer or the top of
+ *  one — a truncation the page says out loud rather than hiding. */
+export const PICKER_LIMIT = 25;
+
 /** Viewer-visible todos as pickable options (the dependency picker). */
 /**
  * Candidates for "add a blocker" — the FIRST PAGE of them, not all of them.
@@ -134,16 +139,19 @@ export const workspaceTags = define("board-tags", {
  * `limit` is deliberately larger than the list shown, because the caller drops the
  * todo itself and anything already blocking it before rendering.
  *
- * The honest limitation: this is the first 25 by title, so a blocker further down
- * the alphabet cannot be picked. Typeahead is the real answer — `title` is value
- * indexed now, and Stardust has full-text search — and it is a UI change, not a
- * query change, so it is left for one.
+ * What this reactor is NOT is the picker's search. It answers "what does the list
+ * open on", which is a fixed body with two binds, so it stays here. Typing in the
+ * search box asks a different question — "which titles contain this word" — with a
+ * different clause and a different order, and a search term cannot travel as a
+ * bind (see `searchTodoOptions` in board.ts for why), so that one is a dry-run
+ * built per read. The rule this file has followed since the board left it holds:
+ * a stored reactor fits a body that is fixed and inputs that can all be binds.
  */
 export const todoPicker = define("todo-options", {
   find: ["?t", "?title"],
   where: [["?t", "app", APP], ["?t", "workspace", "?ws"], ["?t", "title", "?title"], ...VISIBLE],
   orderBy: ["?title"],
-  limit: 25,
+  limit: PICKER_LIMIT,
   then: { project: { id: "?t", title: "?title" } },
 } as const);
 

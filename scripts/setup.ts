@@ -8,7 +8,7 @@
 // deploy fails here rather than on a user's first request.
 
 import type { Provisioned } from "../src/reactors.ts";
-import { KEYED_FIELDS, ensureValueIndex } from "../src/indexes.ts";
+import { KEYED_FIELDS, TEXT_FIELDS, ensureTextIndex, ensureValueIndex } from "../src/indexes.ts";
 import { ensureSchema } from "../src/registry.ts";
 import { DECLARED } from "../src/queries.ts";
 import { DECLARED_SCHEMAS } from "../src/schemas.ts";
@@ -52,6 +52,15 @@ async function main() {
   for (const f of KEYED_FIELDS) {
     const state = await ensureValueIndex(f);
     console.log(`  ${state === "enabled" ? MARK.created : MARK.current}  index ${f}`);
+  }
+  // Text indexes last of all, because enabling one BACKFILLS: the PATCH does not
+  // return until the analyzer has read every existing text revision of the field
+  // (3.6s over the demo's 10,003 titles). Until it has, a search fails closed
+  // rather than answering short — so this line finishing is what makes the blocker
+  // picker's typeahead work, and it is the one step here that is slow on purpose.
+  for (const f of TEXT_FIELDS) {
+    const state = await ensureTextIndex(f);
+    console.log(`  ${state === "enabled" ? MARK.created : MARK.current}  text index ${f} (english)`);
   }
   console.log("\nreactors provisioned.");
 }

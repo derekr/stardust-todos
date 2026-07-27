@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { visibleTo } from "./derive.ts";
-import { effectiveStatus } from "./board.ts";
+import { SEARCH_LIMIT, effectiveStatus, todoSearchBody } from "./board.ts";
 import { type BoardQuery, PAGE_SIZE, boardQuery, canonicalBody, pageWindow } from "./board-query.ts";
 import {
   type BoardState,
@@ -122,6 +122,28 @@ test("the optional clause groups appear exactly when they are called for", () =>
   assert.ok(clauses({ ...PLAIN, view: "ready" }).includes('["=","?eff","todo"]'));
   assert.ok(clauses({ ...PLAIN, view: "mine" }).includes('["=","?lastActor","Owner"]'));
   assert.equal(clauses(PLAIN).includes('?lastActor","'), false); // `all` adds no view clause
+});
+
+test("the blocker picker's search is bounded, viewer-scoped, and takes the term as a VALUE", () => {
+  const body = todoSearchBody(12, 7, 'o\'brien & "landing"');
+  const json = JSON.stringify(body);
+
+  // The term is one argument of one clause. It is never concatenated into query
+  // text, so quotes, ampersands and apostrophes are data — this is the whole
+  // reason the read is a dry-run with a JSON body rather than a stored reactor
+  // read with a RON bind, where the same apostrophe ends the string early.
+  assert.deepEqual((body.where as unknown[])[0], ["fts", 'o\'brien & "landing"', "?t", "?score"]);
+
+  // Bounded in the QUERY. A picker that reads the whole corpus and slices it in
+  // TypeScript is the bug this control already had once.
+  assert.equal(body.limit, SEARCH_LIMIT);
+  assert.deepEqual(body.orderBy, [["?score", "desc"], "?t"]);
+
+  // Same visibility rule as every other read, with the viewer inlined: a draft you
+  // cannot see must not become findable just because you searched for it.
+  assert.ok(json.includes('["=","?author",{"#":7}]'));
+  assert.ok(json.includes('["?t","workspace",{"#":12}]'));
+  assert.equal(json.includes("?viewer"), false); // nothing left to forget to bind
 });
 
 test("boardQuery carries the scope and the filter, tag labels included", () => {

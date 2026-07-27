@@ -45,11 +45,20 @@ import { lookupRef } from "./registry.ts";
 import { createPersona, createWorkspace, ensureUser, grantAccess, listPersonas, roleOf } from "./tenancy.ts";
 import { authorizeCommand, ensureCommandCatalog, visibleCommands } from "./commands.ts";
 import { addDependency, removeDependency, tagsOf } from "./features.ts";
-import { aggregateCounts, availableTags, blockerMap, blockersOf, effectiveStatus, todoOptions } from "./board.ts";
+import {
+  SEARCH_LIMIT,
+  aggregateCounts,
+  availableTags,
+  blockerMap,
+  blockersOf,
+  effectiveStatus,
+  searchTodoOptions,
+  todoOptions,
+} from "./board.ts";
 import { type BoardScope, boardQuery, readSnapshot } from "./board-query.ts";
 import { type BoardState, FilterError, decodeFilter } from "./filter.ts";
 import { BASE, TxConflictError, lastTx, readEntity, readReactorRon, watchEntity } from "./stardust.ts";
-import { DECLARED, blockedByTodo, pageRows } from "./queries.ts";
+import { DECLARED, PICKER_LIMIT, blockedByTodo, pageRows } from "./queries.ts";
 import {
   type PageSet,
   frameKey,
@@ -73,7 +82,7 @@ import {
   visibleLabel,
   visibleTotal,
 } from "./view.ts";
-import { type DetailOpts, type HistEntry, detailFragment, detailPage } from "./detail.ts";
+import { type DetailOpts, type HistEntry, candidateList, detailFragment, detailPage } from "./detail.ts";
 import {
   type TxView,
   collectReplay,
@@ -339,6 +348,47 @@ async function boardStateOf(
   }
 }
 
+// ---- The "add blocker" picker ------------------------------------------------
+//
+// The longest a search term is allowed to be. Stardust has its own limits (262,144
+// UTF-8 bytes, 256 distinct analyzed terms) and refuses anything past them with a
+// stable diagnostic, so this cap is not what makes the read safe — the term being a
+// VALUE in a JSON body rather than text spliced into a query is what does that.
+// This is here because a search box is an open pipe from a browser into a query,
+// and eighty characters is more than a title, so anything longer is not a search.
+const CAND_QUERY_MAX = 80;
+
+/** A search term as it arrives from the browser's `$candQ` signal. Anything that
+ *  is not a string, or is only whitespace, means "nothing typed" — which is the
+ *  unsearched picker, not an empty search. */
+const candQuery = (v: unknown): string => (typeof v === "string" ? v.trim().slice(0, CAND_QUERY_MAX) : "");
+
+/**
+ * The candidates the picker should show for one todo and one search term.
+ *
+ * The two filters that were always here stay here, and they are the reason this is
+ * one function rather than a query the route calls directly: a todo may not depend
+ * on itself, and a todo already listed above the picker is not a candidate for
+ * being added again. Both apply to the searched list exactly as they applied to the
+ * unsearched one — a search must not be a way around them.
+ *
+ * `capped` is measured against the RAW read, before those two filters, because
+ * that is the question the note under the list answers: did the QUERY stop early,
+ * or is this everything there was. Filtering afterwards can only shrink the list,
+ * and shrinking it does not mean more rows exist.
+ */
+async function pickerCandidates(
+  id: number,
+  blockerIds: Set<number>,
+  term: string,
+): Promise<{ candidates: { id: number; title: string }[]; capped: boolean }> {
+  const found = term ? await searchTodoOptions(ctx, viewPersona, term) : await todoOptions(ctx, viewPersona);
+  return {
+    candidates: found.filter((o) => o.id !== id && !blockerIds.has(o.id)),
+    capped: found.length >= (term ? SEARCH_LIMIT : PICKER_LIMIT),
+  };
+}
+
 // Assemble everything the DETAIL route (/todo/<id>) needs from Stardust.
 async function detailData(id: number): Promise<{ todo: any; opts: DetailOpts } | null> {
   const e = await readEntity(id);
@@ -356,7 +406,12 @@ async function detailData(id: number): Promise<{ todo: any; opts: DetailOpts } |
   const openBlockers = blockers.filter((b) => b.status !== "done");
   const effStatus = effectiveStatus({ status: todo.status, blocked: openBlockers.length > 0 });
   const blockerIds = new Set(blockers.map((b) => b.id));
-  const candidates = (await todoOptions(ctx, viewPersona)).filter((o) => o.id !== id && !blockerIds.has(o.id));
+  // The picker opens unsearched. A repaint of this fragment cannot know what the
+  // browser has typed since — the search lives in a signal, and this stream's
+  // signals were captured when it connected — so a repaint arriving mid-search puts
+  // the default list back under a filled search box. That needs a concurrent change
+  // to THIS todo while the picker is open, and the next keystroke corrects it.
+  const { candidates, capped } = await pickerCandidates(id, blockerIds, "");
   const tags = await tagsOf(ctx, id);
   const history = ((await statusHistory(id)) as HistEntry[]).slice(-8); // most recent changes
   const role = await curRole();
@@ -370,7 +425,19 @@ async function detailData(id: number): Promise<{ todo: any; opts: DetailOpts } |
   const expectTx = await lastTx(id);
   return {
     todo,
-    opts: { effStatus, blockers, candidates, blocks, tags, history, commands, canPublish, due, expectTx },
+    opts: {
+      effStatus,
+      blockers,
+      candidates,
+      candSearch: { q: "", capped },
+      blocks,
+      tags,
+      history,
+      commands,
+      canPublish,
+      due,
+      expectTx,
+    },
   };
 }
 
@@ -510,6 +577,24 @@ const server = http.createServer(async (req, res) => {
       }
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       res.end(detailPage(d.todo, d.opts));
+      return;
+    }
+
+    // BLOCKER PICKER search: GET /todo/<id>/candidates — patches #candlist alone.
+    //
+    // One element, not the fragment: the search box is INSIDE the detail fragment,
+    // so re-patching the fragment would replace the input the user is typing in.
+    // The term arrives the way Datastar sends signals on a GET (`?datastar=<json>`),
+    // debounced in the browser at 250ms, so this is one request per pause rather
+    // than one per keystroke.
+    if (seg[0] === "todo" && seg[2] === "candidates" && method === "GET") {
+      const id = Number(seg[1]);
+      const term = candQuery(getSignals(req).candQ);
+      ServerSentEventGenerator.stream(req, res, async (stream) => {
+        const blockerIds = new Set((await blockersOf(id)).map((b) => b.id));
+        const { candidates, capped } = await pickerCandidates(id, blockerIds, term);
+        stream.patchElements(candidateList(id, candidates, { q: term, capped }));
+      });
       return;
     }
 

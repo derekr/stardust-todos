@@ -1,5 +1,9 @@
-// Value-index policy — the third thing this app provisions, after schemas and
-// reactors.
+// Field-index policy — the third thing this app provisions, after schemas and
+// reactors. Two independent policies live on the same `/indexes/{field}`
+// document: a VALUE index (exact and ordered access to a component's value) and a
+// TEXT index (analyzed terms for `fts`). Everything below the KEYED_FIELDS list is
+// about the first; `TEXT_FIELDS` and `ensureTextIndex` at the bottom are the
+// second, and `title` is the only field carrying both.
 //
 // Stardust maintains entity/transaction/field/backlink paths for free, but a
 // clause that matches a VALUE (`["?c", "kind", "command"]`, or `?sid` supplied as
@@ -29,10 +33,12 @@ import { BASE } from "./stardust.ts";
  * and without an index it still scans every fact of that field.
  *
  * `title` is here for ORDERING, not for matching — nothing looks a todo up by its
- * title. Every key in an `orderBy` must be value-indexed or the engine gives up the
- * index-ordered scan and sorts the whole result: 36ms against 252ms at ten thousand
- * todos. That is the one case where a field earns an index without ever appearing
- * on the left of a comparison.
+ * exact title, and the blocker picker's search does not either: it goes through
+ * the TEXT index at the bottom of this file, which is a different structure over
+ * the same field. Every key in an `orderBy` must be value-indexed or the engine
+ * gives up the index-ordered scan and sorts the whole result: 36ms against 252ms
+ * at ten thousand todos. That is the one case where a field earns an index without
+ * ever appearing on the left of a comparison.
  *
  * Deliberately NOT indexed: fields only ever READ out of a matched row (`order`,
  * `danger`, `minRank`, `showWhenDenied`, `due`). Projection does not need a value
@@ -107,5 +113,65 @@ export async function ensureValueIndex(field: string): Promise<"enabled" | "curr
   // 412 means someone else moved first — their write is as good as ours here.
   if (res.status === 412) return "current";
   if (!res.ok) throw new Error(`index ${field}: ${res.status} ${await res.text()}`);
+  return "enabled";
+}
+
+/**
+ * The analyzed TEXT index — a second, independent policy on the same field.
+ *
+ * A value index answers "which rows have this exact title"; nothing in this app
+ * ever asked that, and it would be the wrong question for a picker anyway. The
+ * blocker picker needs "which rows have this WORD in their title somewhere", and
+ * that is a different index: `fullText` builds one searchable document per entity
+ * per analyzer, out of the field's text components only.
+ *
+ * `title` is the only field that earns one, and it earns it for one control. The
+ * board never searches — it filters on values it already has an index for — so
+ * this list is one entry and should stay short: the text index is the more
+ * expensive of the two per write, and it is the one that can be BEHIND canonical
+ * facts, in which case a search fails closed (`fts index not ready: sequence …`)
+ * rather than answering from stale rows.
+ *
+ * Measured turning it on over the demo's 10,003 titles: the PATCH returned
+ * `active` with `textSearch{state ready lag 0}` in 3.6s, having built 49,880
+ * postings over 10,036 documents, and the database file went from 32.2 to 48.4
+ * MiB. So it is not free, and it is affordable exactly once.
+ */
+export const TEXT_FIELDS = ["title"] as const;
+
+/** The Snowball algorithm the picker's search is analyzed with, on both sides:
+ *  the same pipeline runs over the stored title and over the typed query, which is
+ *  why "land" finds "① Design landing page" — both stem to `land` — and "landi"
+ *  finds nothing. It is a stemmer, not a prefix matcher. */
+const ANALYZER = "english";
+
+/**
+ * Give `field` an analyzed text index, if it does not already have one.
+ *
+ * PATCH rather than PUT, deliberately: PUT replaces BOTH desired sections, so a
+ * PUT carrying only `fullText` would silently reset `title`'s value index back to
+ * `default` and cost the board its ordered scan (36ms against 252ms at ten
+ * thousand todos). PATCH sets one section and preserves the other — verified on
+ * the demo copy, where `valueIndex{enabled true source explicit}` survived
+ * unchanged.
+ *
+ * Like `ensureValueIndex` this reads the ACTIVE section, so a field that is
+ * desired-enabled but still building is not re-patched. Note the third state the
+ * docs call out and this app will not hit: a text index over a field with no text
+ * facts yet reports `dormant`, which is healthy rather than an error.
+ */
+export async function ensureTextIndex(field: string): Promise<"enabled" | "current"> {
+  const { etag, body } = await policy(field);
+  const active = body.slice(body.indexOf("active"), body.indexOf("catchUp"));
+  const analyzers = /fullText\{analyzers\[([^\]]*)\]/.exec(active)?.[1] ?? "";
+  if (analyzers.split(/\s+/).includes(ANALYZER)) return "current";
+
+  const res = await fetch(`${BASE}/indexes/${encodeURIComponent(field)}`, {
+    method: "PATCH",
+    headers: { Accept: RON, "Content-Type": "application/ron", "If-Match": etag },
+    body: `fullText {analyzers [${ANALYZER}]}\n`,
+  });
+  if (res.status === 412) return "current";
+  if (!res.ok) throw new Error(`text index ${field}: ${res.status} ${await res.text()}`);
   return "enabled";
 }
