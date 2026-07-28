@@ -48,7 +48,6 @@ import { addDependency, removeDependency, tagsOf } from "./features.ts";
 import { migrateTagComponents } from "./tags.ts";
 import {
   SEARCH_LIMIT,
-  aggregateCounts,
   availableTags,
   blockersFor,
   blockersOf,
@@ -56,10 +55,11 @@ import {
   searchTodoOptions,
   todoOptions,
 } from "./board.ts";
+import { type Counts, type CountsHold, holdCounts, liveCountScopes } from "./counts.ts";
 import { type BoardScope, boardQuery, readSnapshot } from "./board-query.ts";
 import { type BoardState, FilterError, decodeFilter } from "./filter.ts";
 import { BASE, TxConflictError, lastTx, readEntity, readReactorRon, watchEntity } from "./stardust.ts";
-import { DECLARED, PICKER_LIMIT, blockedByTodo, pageRows } from "./queries.ts";
+import { DECLARED, PICKER_LIMIT, blockedByTodo, boardCounts, pageRows } from "./queries.ts";
 import {
   type PageSet,
   frameKey,
@@ -128,6 +128,11 @@ function runnableBinds(name: string, from: { ps?: string; todo?: string }): Reco
       return { ws, viewer };
     case "board-tags":
       return { ws };
+    // The chips' tally, held open by counts.ts. Pasted bare it counts every
+    // workspace at once and every draft in all of them — the same trap as above,
+    // and the reason a viewer is half of what makes this answer correct.
+    case "board-counts":
+      return { ws, viewer };
     case "todo-tags":
     case "todo-blocks":
       return from.todo ? { todo: `{# ${from.todo}}` } : {};
@@ -339,13 +344,27 @@ async function boardData(t: Trace, state: BoardState, pgset: PageSet | null, tag
 // another. It used to be read twice on the first paint and once per repaint (28ms
 // each at 10,003 todos, over ten labels), which is what made it worth looking at.
 //
-// THE TALLY IS NOT WAITED FOR. It is started here and patched when it lands, and
-// the rows go out in between — because at 10,003 todos it is 127ms against 49ms for
-// the page of rows, and it is what "the board feels laggy" was made of. Nothing
-// about it can be narrowed: the chips answer "how many are there", and a page of
-// fifty cannot say. What it CAN be is late. This is deliberately not the same move
-// as the empty SSR shell that was reversed for flashing (see `BoardView`): the
-// board arrives complete and it is three numerals that follow, not the content.
+// THE TALLY IS NOT READ AT ALL. It is held in memory by a subscription this stream
+// has a hold on (counts.ts), so a paint takes the current value out of a field and
+// issues no query — which is why `counts`, which used to be ~240ms of every record
+// in the log, is not in any of them. What a paint can find there is `null`: the
+// first stream on a (workspace, viewer) nothing is subscribed to yet paints the
+// chips WITHOUT numbers, exactly as the SSR pass already does, and the
+// subscription's first emission patches them a moment later through `chips`. That
+// is the same trade the tally already made when it came off the critical path, and
+// it is unchanged for a reader — the board arrives complete and three numerals
+// follow. Nothing about the number can be narrowed: the chips answer "how many are
+// there", and a page of fifty cannot say.
+//
+// What is new is that they stay right. A paint used to be the only thing that could
+// move them, so a write to a todo NOT on this page left the chips stale until
+// something else happened; the emission now patches them on its own, with no read
+// behind it.
+//
+// `at()` is called per paint rather than once per stream because a REPAINT can move
+// this stream to a different viewer ("view as") or workspace, and the tally is
+// scoped to both — a hold acquired once would go on showing the previous persona's
+// numbers.
 //
 // `why` says what provoked this paint — `open` for the one every stream starts
 // with, `push` for one the page subscription woke, `repaint` for a workspace or
@@ -358,20 +377,18 @@ async function renderBoard(
   state: BoardState,
   pgset: PageSet,
   tags: string[],
+  holder: CountsHold,
   why: string,
 ): Promise<string> {
   const t = new Trace("board-paint", why);
   t.describe(shapeOf(state, tags));
-  const counting = t.read(
-    "counts",
-    () => aggregateCounts(ctx, viewPersona),
-    (c) => Object.values(c.status).reduce((n, x) => n + x, 0), // todos the tally covered
-  ); // in flight, not awaited
+  // Captured before the rows, not re-read after them: if a push lands in between it
+  // patches the chips itself, so this paint is about the numbers it started with.
+  const counts = holder.at(ctx.workspaceId, viewPersona).now;
   const { snap, todos, blockers } = await boardData(t, state, pgset, tags);
   stream.patchElements(
     t.render(() => boardFragment(todos, blockers, state.filter, { state, hasMore: snap.hasMore }, pgset.id)),
   );
-  const counts = await counting; // counts over the SAME visible set as the board
   stream.patchElements(t.render(() => filterBar(state, counts, tags)));
   stream.patchElements(t.render(() => sidebar(state, counts))); // desktop rail (hidden < 900px)
   t.done();
@@ -652,6 +669,7 @@ const server = http.createServer(async (req, res) => {
     // nothing to bind.
     if (url === "/page.json" && method === "GET") {
       const rid = await pageRows.id();
+      const cid = await boardCounts.id();
       const open = pooledPageSets();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
@@ -659,7 +677,13 @@ const server = http.createServer(async (req, res) => {
           {
             reactorId: rid,
             idlePageSets: open,
+            // The other standing subscription, and the answer to "is this process
+            // holding anything it should not be": `<workspace>:<viewer>` → how many
+            // open board streams. With no board open it is `{}` a grace period later.
+            countsReactorId: cid,
+            countScopes: liveCountScopes(),
             page: `curl -N -H 'Accept: application/x-ndjson' -G --data-urlencode 'bind={ps {# ${open[0] ?? "<open a board first>"}}}' "${BASE}/reactors/${rid}/results"`,
+            counts: `curl -N -H 'Accept: application/x-ndjson' -G --data-urlencode 'bind={ws {# ${ctx.workspaceId}} viewer {# ${viewPersona}}}' "${BASE}/reactors/${cid}/results"`,
             transactions: `curl -N -H 'Accept: application/x-ndjson' "${BASE}/events/bus/stardust/transactions"`,
           },
           null,
@@ -693,13 +717,32 @@ const server = http.createServer(async (req, res) => {
       let closed = false;
       let inner: AbortController | null = null;
       const board = { repaint: () => {} };
+      // The chips this stream is showing, patched when the tally MOVES rather than
+      // when the page does. It is a render with no read behind it — the numbers came
+      // out of memory, pushed by the reactor — which is why it is worth its own
+      // record: `board-chips` in the log is a repaint that cost a query nowhere.
+      const chips = { patch: (_c: Counts) => {} };
+      // One hold per STREAM, the same lifetime as the page-set beside it: taken here,
+      // given back on close, re-keyed by each paint if "view as" or the workspace has
+      // moved. The subscription behind it outlives one stream by a grace period and
+      // no longer (counts.ts), so a filter change re-uses it and a closed tab does
+      // not keep it.
+      const holder = holdCounts((c) => chips.patch(c));
       req.on("close", () => {
         closed = true;
         inner?.abort();
         openBoards.delete(board);
         releasePageSet(pgset); // in memory: closing a stream writes nothing
+        holder.release(); // also free: the subscription goes when the last hold does
       });
       ServerSentEventGenerator.stream(req, res, async (stream) => {
+        chips.patch = (c) => {
+          const ct = new Trace("board-chips", "push");
+          ct.describe(shapeOf(state, tags));
+          stream.patchElements(ct.render(() => filterBar(state, c, tags)));
+          stream.patchElements(ct.render(() => sidebar(state, c)));
+          ct.done();
+        };
         // What the page-set currently names, as `page-rows` would project it. An
         // emission matching this is one the render itself caused, or a write that
         // changed nothing this page can show — either way there is nothing to
@@ -708,7 +751,7 @@ const server = http.createServer(async (req, res) => {
         // seen can be dropped by it.
         let painted = "";
         const paint = (why: string) =>
-          void renderBoard(stream, state, pgset, tags, why)
+          void renderBoard(stream, state, pgset, tags, holder, why)
             .then((k) => {
               painted = k;
             })
@@ -723,7 +766,7 @@ const server = http.createServer(async (req, res) => {
           // reactor — so subscribing first meant an empty first emission, a full
           // render, and then an echo that triggered a second identical render. One
           // board read per stream instead of two.
-          await renderBoard(stream, state, pgset, tags, first ? "open" : "reopen")
+          await renderBoard(stream, state, pgset, tags, holder, first ? "open" : "reopen")
             .then((k) => {
               painted = k;
             })

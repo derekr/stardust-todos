@@ -4,8 +4,9 @@ A todo app backed by [Stardust](http://localhost:1980/docs/) facts, with **two f
 a CLI and a **Datastar** web UI. Both read a *reactor*, and Stardust pushes the new
 result when one changes, so a todo written from either side turns up in the other
 without anything polling. They do not share a reactor: the web board subscribes to
-the fifty rows it is showing (`page-rows`, bound per open stream), the CLI reads
-its workspace's own.
+the fifty rows it is showing (`page-rows`, bound per open stream) and to the count
+chips' whole-workspace tally (`board-counts`, bound per workspace and viewer), the
+CLI reads its workspace's own.
 
 Nothing in the app watches for changes. Every live update is a Stardust
 subscription re-emitting — see [AGENTS.md](./AGENTS.md) for what that does and does
@@ -68,6 +69,7 @@ Run `node src/cli.ts add "..."` in a terminal and watch the browser update too.
 | delete             | `DELETE /entities/{id}` (retracts every field)               |
 | the live list      | a **reactor** (`find`/`where`/`then.project`) read as a record stream — `page-rows` for the web board, a per-workspace reactor for the CLI |
 | the board's rows   | a one-shot **dry-run**, built per read from the filter in the URL (`src/board-query.ts`) |
+| the count chips    | a **subscription** per (workspace, viewer) — `board-counts`, held in memory and pushed, never read per render (`src/counts.ts`) |
 
 ## Multi-tenancy: user → persona → workspace
 
@@ -158,15 +160,28 @@ Highlights of the later stages:
   * A **bind is not a literal.** The counts body read through a stored reactor with
     `?ws`/`?viewer` costs 197ms; the same body as a dry-run with both inlined costs
     132ms. The fact-clause bind is ~28ms of that and the expression bind ~51ms.
+    That is a price PER READ, and it reverses for a subscription — see the tally
+    below, which pays it once and is a stored reactor again because of it.
   * **An unbounded read behind a bounded UI**, for the third time in this repo. The
     ⊘ badges used to read every dependency edge in the workspace (34ms) to decorate
     fifty rows; they read the ids on the page now (9ms, or no read at all when
     nothing on the page is blocked). The membership set holds REFS — bare ids match
     nothing, fast and silently.
-  * The **tally moved off the critical path.** It is the one read that has to be
-    whole-workspace, and at 132ms it was most of the page. The render sends the rows
-    and patches the numbers when they arrive over the stream that was already open.
-    The pill reads `50 · …` for the moment in between.
+  * The **tally stopped being a read at all.** It is the one number that has to be
+    whole-workspace, and at 132ms it was most of the page. It first moved off the
+    critical path — the render sent the rows and patched the numbers when they
+    landed — and it is a SUBSCRIPTION now (`src/counts.ts`): one per (workspace,
+    viewer) in use, whose latest emission is held in memory, so a paint reads a
+    field and issues no query. The chips are the one thing on the board a reader
+    cannot change, so nothing a reader does can invalidate them; only a write can,
+    and that is what the engine already watches for. Measured through the app's own
+    instrumentation over fifteen navigations at 10,003 todos, the counts read is in
+    none of the request records and the ~190ms subscribe was paid once: a paint went
+    170ms → 65ms unfiltered, 191ms → 38ms on `?pr=high`, 167ms → 72ms on
+    `?st=blocked`. The pill reads `50 · …` for the length of one subscribe on a
+    scope nothing is watching yet, and never again. It also made the numbers LIVE —
+    a write to a todo that is not on the page you are reading moves them now, where
+    before only a repaint could.
 - **Clause order is the plan** (`src/board-query.ts`). Once the page was ~95ms the
   next thing the instrumentation showed was that a FILTERED board cost far more than
   an unfiltered one: `?st=blocked` was 249ms against 94ms, and 143 of the 154ms sat
@@ -295,6 +310,7 @@ Highlights of the later stages:
 - `src/filter.ts`        — the Filter ⇄ query-string codec, and the domains every value is checked against.
 - `src/board-query.ts`   — compiles one filter and one page into the board's body; runs it as a dry-run.
 - `src/pageset.ts`       — the fifty rows an open stream is showing, as facts, so a reactor can name them.
+- `src/counts.ts`        — the count chips' tally, held open per (workspace, viewer) instead of read per render.
 - `src/queries.ts`       — the declared reactors (one definition each, typed readers out).
 - `src/indexes.ts`       — field-index policy: value indexes for the fields those reactors key on, and the english text index behind the blocker picker's search.
 - `src/commands.ts`      — commands as entities; the role gate lives in the query.

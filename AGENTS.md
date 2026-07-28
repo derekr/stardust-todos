@@ -169,6 +169,11 @@ holds it. What that has already removed:
   EVALUATING them for anything, and a value the app reads back and compiles in is a
   parameter wearing a fact's clothes. It is a query string now.
 - A revision counter used to force re-emits. Writing the facts re-emits.
+- The whole-workspace TALLY behind the count chips, as a read. It is a
+  subscription per (workspace, viewer) now (counts.ts) — the engine says when the
+  answer moved instead of being asked on every render — and it is the clearest case
+  the rule has produced: the chips cannot be narrowed by anything a reader does, so
+  a render had no business asking in the first place.
 - Per-render dry-runs, promoted to stored reactors read with a per-call bind, so
   one reactor serves every workspace, viewer and todo. Partly REVERSED for the
   board, and for a reason worth carrying: a stored reactor is only a fit when the
@@ -203,6 +208,39 @@ computes `enabled`/`visible` with `>=` and `or`, and still woke on both writes.
 emitted on the global stream and the todo stream stayed silent. A bind is the
 subscription's scope, not a client-side filter over a shared firehose — which is
 what makes one stored reactor serving many callers sound.
+
+**An AGGREGATE over the whole workspace pushes on the same rule, and the bind
+scoping it is a security property as much as a performance one.** `board-counts`
+groups every viewer-visible todo by (effectiveStatus, priority); every clause it
+has is top-level, so it behaves exactly as the paragraphs above predict — but this
+is the app's one subscription whose answer depends on WHO is asking, so it was
+verified rather than reasoned about. On a throwaway, two subscriptions on that one
+reactor bound to two personas, written to from a third process:
+
+| write | owner's stream | teammate's stream |
+| --- | --- | --- |
+| a status change | one emission, the group moved | one emission |
+| a new PUBLISHED todo | one emission, total +1 | one emission |
+| a new DRAFT authored by the teammate | **nothing at all** | one emission, total +1 |
+| completing a blocker + unblocking its dependent, ONE transaction | one emission, `blocked` and the target group both moved | one emission |
+| a TITLE write | nothing | nothing |
+| retracting the new todo | one emission, total −1 | one emission |
+
+Five writes and five emissions on the owner's stream, six on the teammate's, in
+order and with no duplicates. The third row is the one to take away: a viewer bind
+is not a filter applied to a shared answer, it is what the subscription IS, so a
+draft the other persona cannot see does not merely fail to appear in their numbers
+— it does not wake their stream. The fifth row is the other one: a write to a field
+no clause names pushes nothing, so a subscription over an aggregate is not a
+firehose.
+
+The same sequence through the app on the demo's 10,003 todos, with a board stream
+held open from another shell, agreed row for row — and added one thing the
+throwaway could not show. Completing a blocker arrives as TWO emissions 173ms
+apart, not one, because the app writes the blocker's own status and then patches
+its dependents in a second transaction (`refreshDerived`). Both are correct and a
+reader sees the intermediate state for a sixth of a second. That is a property of
+this app's write discipline, not of the engine.
 
 **The gap is what only enters through a bound `exists`.** Adding a TAG to a todo
 pushed nothing to the board reactor — verified from a background script, and again
@@ -393,6 +431,33 @@ That does not make binds wrong — it makes them a price. `page-rows` and the pi
 are still stored reactors read with a bind, because what a bind buys them is a
 subscription and one definition serving every caller, which no literal can. It
 means: if a read is hot and its inputs are known to the process, inline them.
+
+**And the direction of that trade REVERSES for a subscription, which is why the
+counts body is a stored reactor again.** Everything above is per READ. A
+subscription pays the bind ONCE, at subscribe, and every push after it is free — so
+the question stops being "what does this cost per render" and becomes "how many
+renders is one subscribe amortised over". Re-measured on the demo's 10,003 todos,
+same body, same 11 groups, same 9,947 todos counted every time:
+
+| board-counts, three ways | p50 |
+| --- | --- |
+| dry-run, both spelled as LITERALS | 145ms |
+| stored reactor, `?bind={ws … viewer …}` | 192ms |
+| SUBSCRIBE with the same bind, to its first emission | 191ms |
+
+So the bind is still ~47ms and a subscribe costs exactly what a bound read costs —
+there is no extra charge for the stream. Through the app, over fifteen navigations
+by one reader (a board, a page turn, two filters, back), that ~190ms was paid ONCE
+and every paint after it read the answer out of memory. `counts` used to be
+166–190ms of every `board-paint` record and is not in any of them now; the paint
+itself went 170ms → 65ms unfiltered, 191ms → 38ms on `?pr=high`, 167ms → 72ms on
+`?st=blocked`. The rule to carry: **inline a bind you are going to pay per read,
+and keep it when what it buys is a subscription.**
+
+The alternative that keeps the literals — one reactor per (workspace, viewer) with
+both inlined — was refused rather than measured, on the ground the ephemeral-reactor
+entry already establishes: creating one costs 31–44ms and a BLOCK of entity ids that
+deleting it does not give back. That is a permanent write for a one-time 47ms.
 
 ## Clause order IS the plan, and nothing will fix it for you
 
@@ -840,8 +905,49 @@ worth reading before you re-litigate one:
   Also gone with the sessions: the `Session` and `SessionFacet` schemas, and the
   generated `facet`/`value` validators that existed only because the atomic facet
   write bypassed the schema route it was declared for.
-- The count chips: ON the critical path vs BESIDE it — BESIDE, and it is the
-  largest single thing the board's latency was made of. One page view at 10,003
+- The count chips: READ vs SUBSCRIBED — SUBSCRIBED, and this entry is the third
+  position this one read has held. It went ON the critical path → BESIDE it → not
+  on any path at all, and the last step is the one that stopped paying for it
+  rather than hiding it. The two paragraphs below are the history and still true of
+  the body; what follows them is what the app does now.
+
+  A tally is the ONE thing on the board a reader cannot change. The chips are
+  deliberately not narrowed by the active facets — that is what makes them mean
+  "what you would get if you picked this" — so a page turn cannot move them and
+  neither can a filter change. Only a write can, which is exactly the thing the
+  engine is already watching for. So `board-counts` is a stored reactor again
+  (`src/queries.ts`) and `src/counts.ts` holds ONE subscription per (workspace,
+  viewer) actually in use: the latest emission sits in memory, a paint takes it out
+  of a field, and a push patches the chips on its own. `counts` used to be 166–190ms
+  of every `board-paint` record and appears in none of them; over fifteen
+  navigations by one reader the ~190ms subscribe was paid once. The bind that made
+  this expensive as a read is what makes it possible as a subscription — see the
+  reversal in the bind entry above.
+
+  What it gives up, precisely. **Per-process state with a lifetime to get right**,
+  on an app whose worst bug of this kind was 84 session entities for twelve todos.
+  The subscription is refcounted by the open board streams holding that scope,
+  re-keyed per paint (so "view as" and a workspace switch move it rather than
+  leaving it serving the previous persona), and it LINGERS 30s at zero holders
+  because a filter change closes one stream before opening the next — without the
+  grace period every filter click would re-pay the subscribe. `/page.json` reports
+  `countScopes` so the question is answerable from outside: it reads `{}` a grace
+  period after the last board closes, verified. Nothing here writes.
+
+  What it buys that was not the point: the numbers are LIVE for the first time. A
+  paint used to be the only thing that could move them, so a write to a todo not on
+  the page you were reading left them stale; a `board-chips` record is a repaint
+  with `reads: []` and 0.2–0.5ms of render behind it.
+
+  The first paint on a scope nothing is subscribed to yet still shows `50 · …` for
+  the length of one subscribe, which is the same behaviour the entry below already
+  describes and the same reason. That is the thing to reverse if it ever reads as
+  broken.
+
+  ---
+
+  The two positions before this one. ON the critical path vs BESIDE it — BESIDE,
+  and it was the largest single thing the board's latency was made of. One page view at 10,003
   todos was ~280ms, and 207ms of it was one read: the (effectiveStatus, priority)
   tally behind the chips, the sidebar and the total in the title pill. Inlining its
   binds took it to 132ms (see the bind entry above) and that is its FLOOR — clause

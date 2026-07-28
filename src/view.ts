@@ -14,8 +14,9 @@
 
 import type { Todo, Priority, Status } from "./todos.ts";
 import { type BoardState, type Filter, boardHref, encodeFilter, toggled } from "./filter.ts";
-import type { Blocker, Counts } from "./board.ts";
+import type { Blocker } from "./board.ts";
 import { effectiveStatus } from "./board.ts";
+import type { Counts } from "./counts.ts";
 import type { ProjectedCommand } from "./commands.ts";
 import { xrayAssets } from "./xray.ts";
 import { readFileSync } from "node:fs";

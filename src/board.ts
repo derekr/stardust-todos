@@ -3,16 +3,15 @@
 // only handles single-fact absence, and an `or(owned, not …)` scope was verified to
 // leak across tenants — so those shapes are avoided. Blocked-ness and the effective
 // status are no longer derived on read at all: they are stored facts the board and
-// counts bodies JOIN, so the counts fold here is a plain tally over a group key
-// Stardust already handed us.
+// counts bodies JOIN rather than compute.
 //
 // Two of the three reads beside the board used to be stored reactors read with a
-// bind, and both are dry-runs with their scope inlined now. That is not a change of
-// mind about stored reactors — `page-rows` and the picker are still stored, and
-// still for the reason in queries.ts. It is what measuring the binds at ten
-// thousand todos said: a bind is not a literal, and the counts read is where that
-// was worth 65ms. The blocker read went further and stopped being whole-workspace
-// at all, which is the same fix the picker and the counts had before it.
+// bind. The blocker read is a dry-run with its scope inlined now, and it went
+// further than that: it stopped being whole-workspace at all, which is the same fix
+// the picker had before it. The TALLY has left this file entirely — it is a stored
+// reactor again (queries.ts) and a standing subscription (counts.ts), because a
+// bind that is a price on every read is a price paid once on a subscription, and
+// the chips are the one thing on this page a reader can never change.
 
 import type { WorkspaceCtx } from "./workspace.ts";
 import type { Status, Todo } from "./todos.ts";
@@ -43,59 +42,12 @@ export const effectiveStatus = (t: Pick<Todo, "status" | "blocked" | "effectiveS
  * and arrives in the URL; the body that applies it is board-query.ts.)
  */
 
-export interface Counts {
-  status: Record<string, number>;
-  priority: Record<string, number>;
-}
-
-/**
- * Effective-status + priority counts for the filter chips — VIEWER-SCOPED.
- *
- * Once visibility is per-viewer (drafts), ws-wide counts would leak and mislead
- * ("Blocked 3" when you can see 1), so counts must be tallied over the SAME
- * visible set as the board. It projects {effectiveStatus, priority} for the
- * viewer's visible todos, grouped in the engine.
- *
- * The tally stays app-side, but it no longer DERIVES the group key — it used to
- * fold a per-row `blocked` (a correlated exists, at the board's own cost) into an
- * effective status here. Both are stored facts now, so this is a count. Making it a
- * `groupBy` aggregate in the reactor is finally possible and deliberately not done:
- * the chips want every value present with a zero, and two tallies over the same
- * hundreds of rows are not what costs anything on this page.
- *
- * It was a STORED reactor read with `ws` and `viewer` as binds, and it is a
- * dry-run with both INLINED, which is the third time this app has made that trade
- * and the first time the number was big enough to argue with the note in
- * AGENTS.md. "Reading a stored reactor with a bind costs about the same as a
- * dry-run" was measured on twelve todos and is still true of the ROUTE; what is
- * not free is the BIND. The same body, the same 11 groups and the same 9,947 rows,
- * at 10,003 todos: 197ms through the stored reactor, 194ms as a dry-run with the
- * binds still in the body, 132ms with both spelled as literals. Isolated, the
- * workspace bind (a value in a fact clause) costs ~28ms and the viewer bind (a
- * value in an expression) ~51ms, reproduced with the four combinations run in both
- * orders. A literal is something the planner can narrow on; a bind arrives after
- * it has decided. So this read follows the rows: no free vars, nothing to omit.
- */
-export async function aggregateCounts(ctx: WorkspaceCtx, viewerPersonaId: number): Promise<Counts> {
-  const rows = (await query<unknown>({
-    find: ["?eff", "?priority", ["count", "?t"]],
-    where: [
-      ["?t", "app", APP],
-      ["?t", "workspace", { "#": ctx.workspaceId }],
-      ["?t", "effectiveStatus", "?eff"],
-      ["?t", "priority", "?priority"],
-      ...visibleTo(viewerPersonaId),
-    ],
-    groupBy: ["?eff", "?priority"],
-  })) as unknown as [string, string, number][];
-  const status: Record<string, number> = {};
-  const priority: Record<string, number> = {};
-  for (const [eff, pri, n] of rows) {
-    status[eff] = (status[eff] ?? 0) + n;
-    priority[pri] = (priority[pri] ?? 0) + n;
-  }
-  return { status, priority };
-}
+// The (effectiveStatus, priority) tally the chips draw lived here, as a dry-run
+// with its scope inlined. It is `board-counts` in queries.ts again, and counts.ts
+// holds one subscription per (workspace, viewer) instead of reading it per render
+// — the bind it costs is paid once at subscribe rather than on every paint, which
+// is the direction that measurement runs in for a subscription and the opposite of
+// the direction it runs in for a read.
 
 export interface Blocker {
   id: EntityId;

@@ -107,27 +107,33 @@ await reconcileTags()   // [] means the two still agree
     reactors: [{ name: "page-rows", bind: "{ps {# 1519}}" }],
   },
   counts: {
-    title: "Counts — a viewer-scoped tally",
-    mech: "aggregateCounts() runs over the viewer-VISIBLE set — the same visibility rule as the board, so a draft you can't see can't leak into the numbers — but deliberately NOT narrowed by the active facets, which is why the chips can show what you'd get if you picked them. It projects {effectiveStatus, priority} per visible todo and the tally is a plain app-side count. It used to bind a correlated `exists` per row to get `blocked` and fold an effective status out of it here, which put this read under the board's own 10,000-execution ceiling for a number in a chip; the effective status is a stored fact now, so this is an ordinary join. It is grouped in the ENGINE by (effectiveStatus, priority) — eleven rows out of 9,947 — and the app folds those into the two tallies the chips want, because the chips want every value present including the zeroes. It was a STORED reactor read with `ws` and `viewer` as BINDS and it is a dry-run with both spelled as literals, which is the whole of why this page got faster: at 10,003 todos the identical body costs 197ms through the stored reactor, 194ms as a dry-run with the binds still in it, and 132ms with the literals — the workspace bind ~28ms and the viewer bind ~51ms, isolated four ways and reproduced in both orders. Reading a stored reactor is not what costs; a value the planner only learns at read time is. This is the largest read left on the board and it is the one that has to be whole-workspace: \"how many are there\" cannot be answered from fifty rows.",
-    code: `// a dry-run, built per read. This WAS a stored reactor taking
-// ?ws and ?viewer as binds; the body is the same and the two
-// literals are worth 197ms -> 132ms at ten thousand todos:
-{
+    title: "Counts — a viewer-scoped tally, subscribed rather than read",
+    mech: "These numbers are NOT read when this page renders. `board-counts` is a stored reactor and the server holds ONE subscription per (workspace, viewer) actually in use; the latest emission sits in memory, a paint takes it out of a field, and Stardust pushes a new one when the underlying data moves. The chips are the one thing on this page a reader cannot change — they are deliberately not narrowed by the active facets, which is exactly what makes them mean \"how many you would get if you picked this\" — so a page turn cannot move them and neither can a filter change. Only a write can, and a write is what the engine is already watching for. It runs over the viewer-VISIBLE set, the same visibility rule as the board, so a draft you can't see cannot leak into the numbers; that is why the key is (workspace, viewer) and not workspace alone. It is grouped in the ENGINE by (effectiveStatus, priority) — eleven rows out of 9,947 — and the app folds those into the two tallies the chips want, because the chips want every value present including the zeroes. This body has been a stored reactor, then a dry-run with its scope INLINED, and now a stored reactor again, and the measurement did not change: at 10,003 todos it is 197ms read through the reactor with `?ws`/`?viewer` as binds and 132ms as a dry-run with both spelled as literals, because a value the planner has when it plans is one it can narrow on. What changed is that a bind is a price PER READ and a subscription pays it once — the 65ms buys a body that can be subscribed at all, and every push after it is free. So the tally went from ~240ms on every paint to 0ms on every paint but the first for a scope. The invalidation was verified rather than assumed, from a second process, with two subscriptions on this one reactor bound to two personas: a status write moved the tally, a new todo appeared in it, completing a blocker moved the `blocked` group and the target group in ONE emission, a title-only write pushed nothing at all, and a draft authored by one persona woke that persona's subscription and NOT the other's. It also bought something nobody asked for: the emission patches the chips itself, so a write to a todo that is not on the page you are reading moves these numbers now, where before only a repaint could.",
+    code: `// stored again, and subscribed — not read per render:
+export const boardCounts = define("board-counts", {
   find: ["?eff", "?priority", ["count", "?t"]],
   where: [
     ["?t", "app", "todo-app"],
-    ["?t", "workspace", {"#": 12}],      // was ?ws  (~28ms)
-    ["?t", "effectiveStatus", "?eff"],   // stored, not derived
+    ["?t", "workspace", "?ws"],           // a bind: ~28ms, ONCE
+    ["?t", "effectiveStatus", "?eff"],    // stored, not derived
     ["?t", "priority", "?priority"],
     ["?t", "draft", "?draft"], ["?t", "author", "?author"],
     ["or", ["=", "?draft", false],
-           ["=", "?author", {"#": 7}]],  // was ?viewer  (~51ms)
+           ["=", "?author", "?viewer"]],  // a bind: ~51ms, ONCE
   ],
-  groupBy: ["?eff", "?priority"],        // 11 rows, not 9,947
-}
-// -> [["todo","med",3858], ["doing","high",430], …]
-// the app adds those up two ways; the group key arrives decided`,
-    src: "src/board.ts · aggregateCounts() · src/derive.ts · visibleTo()",
+  groupBy: ["?eff", "?priority"],         // 11 rows, not 9,947
+});
+
+// one subscription per (workspace, viewer) in use, refcounted by the
+// board streams looking at it — the render just reads the field:
+boardCounts.watch({ ws: {"#": 12}, viewer: {"#": 7} },
+                  (rows) => { sub.now = tally(rows); }, signal);
+
+// -> [["todo","med",3858], ["doing","high",430], …]  on connect,
+//    and again on every write that moves one of those clauses.
+// A title write moves none of them and pushes nothing.`,
+    src: "src/counts.ts · holdCounts() · src/queries.ts · boardCounts · src/derive.ts · visibleTo()",
+    reactors: [{ name: "board-counts", bind: "{ws {# 12} viewer {# 7}}" }],
   },
   blocked: {
     title: "Blocked — recorded by the write that causes it",
@@ -157,7 +163,7 @@ await reconcileBlocked()   // [] means every write path kept its promise
   },
   visibility: {
     title: "Draft visibility — an app predicate, server-side",
-    mech: "Stardust does authentication, not authorization — so row-level visibility is an APP predicate: a todo is visible if it's published OR you authored it. ONE definition of that rule (visibleTo) serves every read. On the board the viewer is an INLINED literal, taken from the server's own \"view as\" state; on the counts/options reactors it is a per-read bind. Either way the rule is an expression-`or`, and the browser never sends a persona id at all: the URL carries what to NARROW to, never what scope to read in, so no query string can widen it. It stays join-free, paginates, and keeps hidden rows off the wire.",
+    mech: "Stardust does authentication, not authorization — so row-level visibility is an APP predicate: a todo is visible if it's published OR you authored it. ONE definition of that rule (visibleTo) serves every read. On the board the viewer is an INLINED literal, taken from the server's own \"view as\" state; on the counts and options reactors it is a per-read BIND \u2014 and on the counts one that bind is the whole point, because a bind is what a subscription is scoped by and a literal cannot be. Either way the rule is an expression-`or`, and the browser never sends a persona id at all: the URL carries what to NARROW to, never what scope to read in, so no query string can widen it. It stays join-free, paginates, and keeps hidden rows off the wire.",
     code: `// One rule. A "?var" leaves the viewer to a per-read bind (reactors);
 // a persona id pins it into the query (one-shot dry-runs).
 function visibleTo(viewer) {
@@ -173,8 +179,12 @@ function visibleTo(viewer) {
 ...visibleTo(viewPersona)   // ["or", ["=","?draft",false],
                             //        ["=","?author",{"#":7}]]
 
-// counts / todo-options reactors — supplied at read time:
-await counts.read({ ws: {"#": wsId}, viewer: {"#": personaId} });`,
+// board-counts / todo-options — supplied per read, and per
+// SUBSCRIPTION: two subscriptions on one reactor bound to two
+// personas were woken separately, and a draft one of them
+// authored did not wake the other at all.
+await boardCounts.watch({ ws: {"#": wsId}, viewer: {"#": personaId} },
+                        onRows, signal);`,
     src: "src/board-query.ts · canonicalBody() · src/derive.ts · visibleTo() (bound as ?viewer in src/queries.ts)",
   },
   "detail-meta": {

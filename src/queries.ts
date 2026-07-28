@@ -25,20 +25,54 @@ import { APP } from "./tenancy.ts";
 /** The one visibility rule, with the viewer left as a per-read bind. */
 const VISIBLE = visibleTo("?viewer");
 
-// `board-counts` and `board-blockers` used to live here, and both are gone — not
-// because a stored reactor was the wrong idea, but because their INPUTS could not
-// carry their weight at ten thousand rows.
+// `board-blockers` used to live here and is gone: it read EVERY dependency edge in
+// the workspace to draw ⊘ badges on fifty rows. Its replacement asks for the ids on
+// the page (`blockersFor`), which is a set literal that varies per read, so it is a
+// dry-run for the same reason the board's rows are.
 //
-// `board-counts` grouped every viewer-visible todo by (effectiveStatus, priority)
-// with `?ws` and `?viewer` as binds. The body is unchanged; it is a dry-run with
-// both spelled as literals now, and that alone is 197ms -> 132ms on the demo (see
-// `aggregateCounts` in board.ts for the four-way isolation). A bind is the thing
-// that made it a stored reactor and the thing that made it slow.
-//
-// `board-blockers` read EVERY dependency edge in the workspace to draw ⊘ badges on
-// fifty rows. Its replacement asks for the ids on the page (`blockersFor`), which
-// is a set literal that varies per read, so it is a dry-run for the same reason the
-// board's rows are.
+// `board-counts` left too, and CAME BACK — which makes it the one entry in this
+// file worth reading twice, because the measurement that removed it is still true
+// and no longer decides the question. Per READ a bind is a real price: the same
+// counts body is 197ms through the stored reactor with `?ws`/`?viewer` and 132ms as
+// a dry-run with both spelled as literals, because a value the planner has when it
+// plans is one it can narrow on. That is why it was inlined. It is also PER READ,
+// and the whole point of putting it back is to stop reading it — a subscription
+// pays the bind once at subscribe and every push after it is free. The trade did
+// not get re-litigated; the read it was about stopped existing.
+
+/**
+ * Every viewer-visible todo in one workspace, grouped by (effectiveStatus,
+ * priority) — the numbers on the filter chips, the sidebar and the total pill.
+ *
+ * Held open by counts.ts rather than read per render, which is the only reason it
+ * is stored: a fixed body whose two inputs are both binds is exactly what this file
+ * is for, and a bind is what buys a SUBSCRIPTION — the one thing no literal can.
+ *
+ * Every clause is TOP-LEVEL, which is what makes the push reliable, and it was
+ * verified rather than assumed (this app has twice been caught by an emission that
+ * never came). On a throwaway, two subscriptions on this one reactor bound to two
+ * personas, written to from a separate process: a status write moved the tally, a
+ * new todo appeared in it, completing a blocker moved the `blocked` group and the
+ * target group in ONE emission, a retraction moved it back, a title-only write
+ * pushed nothing at all, and a draft authored by one persona woke that persona's
+ * subscription and NOT the other's. Five writes, five emissions, in order.
+ *
+ * It is NOT narrowed by the board's filter, and must not be: the chips answer "how
+ * many would you get if you picked this". That is also what makes a subscription
+ * the right shape — nothing a reader does can change these numbers, so a render has
+ * no business asking.
+ */
+export const boardCounts = define("board-counts", {
+  find: ["?eff", "?priority", ["count", "?t"]],
+  where: [
+    ["?t", "app", APP],
+    ["?t", "workspace", "?ws"],
+    ["?t", "effectiveStatus", "?eff"],
+    ["?t", "priority", "?priority"],
+    ...VISIBLE,
+  ],
+  groupBy: ["?eff", "?priority"],
+} as const);
 
 /** The blockers OF one todo, walked from the todo end: bound by `?todo`, so the
  *  detail page reads the handful of rows it renders instead of every edge in the
@@ -269,6 +303,7 @@ export const commandAuthzRows = (cmdId: string, rank: number) => commandAuthz.re
 
 /** Everything `npm run stardust:setup` provisions, besides the board reactor. */
 export const DECLARED = [
+  boardCounts,
   workspaceTags,
   todoPicker,
   tagsOfTodo,
