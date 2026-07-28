@@ -202,6 +202,18 @@ async function main() {
     await tx(BASE, slice);
   }
   console.log(`  edges ${keys.length.toLocaleString()} (tags + deps)`);
+
+  // The workspace's tag VOCABULARY. Same argument as the tag component above, one
+  // level up: the chips are a fact on the workspace rather than an aggregate over
+  // these edges, so a seed that writes edges and stops leaves a board with no chips
+  // on it until the server's boot backfill notices. The seeder knows the label set,
+  // so it writes it.
+  const labels = Object.values(edges)
+    .map((x) => (x as { label?: string }).label)
+    .filter((l): l is string => l !== undefined);
+  const vocab = [...new Set(labels)].sort();
+  if (vocab.length) await tx(BASE, { [String(ctx.workspaceId)]: { tagVocab: vocab } });
+  console.log(`  vocabulary [${vocab.join(" ")}]`);
   console.log(`\nseeded ${want.toLocaleString()} todos in ${((Date.now() - t0) / 1000).toFixed(1)}s.`);
   console.log("run `npm run stardust:setup` so the value indexes cover them.");
 }

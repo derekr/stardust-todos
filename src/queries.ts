@@ -125,7 +125,24 @@ export const pageRows = define("page-rows", {
   },
 } as const);
 
-/** Distinct tag labels in use across the workspace (deduped by the caller). */
+/**
+ * Distinct tag labels in use across the workspace — an aggregate over every tag
+ * edge in it.
+ *
+ * NOTHING ON A PAGE READS THIS ANY MORE, and the reason it is still here is the
+ * point of the change that removed it: the vocabulary is a fact on the workspace
+ * entity now (`tagVocab`, tags.ts), because it changes when a label is first used
+ * or last removed and otherwise never, while this body cost 29.5ms of every board
+ * render to answer the same ten rows. What a materialised fact needs is a guard,
+ * and this is the guard's question — `reconcileTagVocabulary` compares the stored
+ * list against what this returns, and the write paths consult it to find out
+ * whether a label they just removed had any edge left behind it.
+ *
+ * It stays a stored reactor with a `?ws` bind rather than becoming a dry-run
+ * because it is still one fixed body whose only input is a scope, which is this
+ * file's whole test — and because the x-ray hands it to a reader with a bind, which
+ * a dry-run cannot be.
+ */
 export const workspaceTags = define("board-tags", {
   find: ["?label", ["count", "?e"]],
   where: [

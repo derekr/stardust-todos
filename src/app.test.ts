@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 
 import { visibleTo } from "./derive.ts";
 import { SEARCH_LIMIT, effectiveStatus, todoSearchBody } from "./board.ts";
-import { type BoardQuery, PAGE_SIZE, boardQuery, canonicalBody, pageWindow } from "./board-query.ts";
+import { type BoardQuery, PAGE_SIZE, boardQuery, canonicalBody, pageWindow, windowRows } from "./board-query.ts";
 import {
   type BoardState,
   FilterError,
@@ -263,6 +263,22 @@ test("a page window is limit/offset on the body, and asks for one row too many",
   // unwindowed body it tiles must therefore order by exactly the same keys
   assert.deepEqual((windowed as { orderBy: string[] }).orderBy, ["?prank", "?title"]);
   assert.deepEqual((unpaged as { orderBy: string[] }).orderBy, ["?prank", "?title"]);
+});
+
+test("a page past the end is answered without a read, and only when that is sound", () => {
+  // The guard is one comparison against the chips' tally, and what makes it safe is
+  // that the tally is NOT narrowed by the filter: it is an upper bound on every
+  // filtered subset of the board, so an offset past it is an offset past all of
+  // them. It must never claim a page is empty that the filter could still fill.
+  assert.equal(windowRows(0, 9947), PAGE_SIZE + 1); // a full window, read it
+  assert.equal(windowRows(198, 9947), 47); // the last partial window
+  assert.equal(windowRows(199, 9947), 0); // offset 9,950 — past the end
+  assert.equal(windowRows(200, 9947), 0); // the ?p=200 that cost 303ms for 0 rows
+  // the boundary in both directions: one row left is still a read, none is not
+  assert.equal(windowRows(1, 51), 1);
+  assert.equal(windowRows(1, 50), 0);
+  // an empty board is entirely past its end, including its first page
+  assert.equal(windowRows(0, 0), 0);
 });
 
 // ---- the filter codec ------------------------------------------------------

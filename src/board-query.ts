@@ -546,12 +546,41 @@ const viewTail = (q: BoardQuery): unknown[][] =>
     : [];
 
 /**
+ * How many rows the window at `page` could hold, given an upper bound on how many
+ * rows the whole board could have. Zero means the page is past the end.
+ *
+ * The bound is the count chips' total — the workspace's VISIBLE todos, not narrowed
+ * by the filter — so it is an over-estimate of a filtered board and an exact answer
+ * for an unfiltered one. Over-estimating is the safe direction and the only reason
+ * this is sound: if the offset is past even the unfiltered total, no filter can put
+ * a row there.
+ */
+export const windowRows = (page: number, bound: number): number =>
+  Math.max(0, Math.min(PAGE_SIZE + 1, bound - page * PAGE_SIZE));
+
+/**
  * The current board PAGE — a one-shot dry-run, so it always recomputes.
  *
  * One read, where it used to be two: the session's facts had to be fetched before
  * the rows could be compiled, and the filter arrives with the request now.
+ *
+ * `bound` is what makes `?page=200` cheap. Walking to an offset beyond the end is a
+ * full scan that returns nothing — measured at 285.9ms and 303ms on the demo, twice,
+ * for zero rows — because `offset` is applied after the work rather than instead of
+ * it, the same way `limit` is (see the header). The process usually already knows
+ * the answer: the chips' tally is in memory, so a page past THAT is a page past
+ * every filtered subset of it, and the read is skipped rather than executed.
+ *
+ * What it costs is honesty about staleness, and it is worth stating rather than
+ * hiding. The tally is the last emission of a subscription, so a write that lands
+ * between that emission and this read makes the bound momentarily low; a page turn
+ * to the very end, at the instant a write extends the board past it, can paint an
+ * empty page that a repaint fills in. The alternative was a 300ms scan on every
+ * arrival at an out-of-range URL, and a bound that is absent (a cold scope) simply
+ * disables the guard.
  */
-export async function readSnapshot(q: BoardQuery, page: number): Promise<Snapshot> {
+export async function readSnapshot(q: BoardQuery, page: number, bound?: number): Promise<Snapshot> {
+  if (bound !== undefined && windowRows(page, bound) === 0) return { rows: [], page, hasMore: false };
   const rows = await query<SnapshotRow>(canonicalBody(q, pageWindow(page)));
   return { rows: rows.slice(0, PAGE_SIZE), page, hasMore: rows.length > PAGE_SIZE };
 }

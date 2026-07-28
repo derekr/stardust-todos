@@ -18,7 +18,7 @@ import type { EntityId } from "./stardust.ts";
 import { deleteEntity, readEntity, transact } from "./stardust.ts";
 import { query as tquery } from "./typed-query.ts";
 import { tagsOfTodo } from "./queries.ts";
-import { canonicalTags, tagLabel } from "./tags.ts";
+import { canonicalTags, recordTagAdded, recordTagsRemoved, tagLabel } from "./tags.ts";
 import { type Status, effectiveStatusOf, refreshDerived } from "./todos.ts";
 
 /** Confirm a todo id belongs to this workspace before writing an edge to it.
@@ -60,6 +60,12 @@ export async function addTag(ctx: WorkspaceCtx, todoId: EntityId, label: string)
   const patch: Record<string, Record<string, unknown>> = { [todoId]: { tags: canonicalTags([...current, l]) } };
   if (!current.includes(l)) patch["#_e"] = { kind: "tag", todo: { "#": todoId }, label: l };
   await transact(patch);
+  // The workspace's VOCABULARY is the third thing this label is stored in, and the
+  // one a reader waits on — so the transaction that could have moved it says so.
+  // It cannot ride along in the patch above: whether the label is new to the
+  // workspace is a question about the stored list, and the answer decides whether
+  // there is anything to write at all. Almost always there is not.
+  await recordTagAdded(ctx.workspaceId, l);
 }
 
 /**
@@ -90,6 +96,11 @@ export async function removeTag(ctx: WorkspaceCtx, todoId: EntityId, label: stri
   // fact asserting "no tags" rather than the absence of one — and would then match
   // the board's `[?t tags ?tags]` clause for nothing.
   await transact({ [todoId]: { tags: rest.length ? rest : null } });
+  // …and the vocabulary, if that was the workspace's last edge carrying `l`. This
+  // is the half of the invariant a chip is drawn from, so a label nothing carries
+  // any more must stop being offered — and must stop being a value `decodeFilter`
+  // will accept in a URL.
+  await recordTagsRemoved(ctx.workspaceId, [l]);
 }
 
 export async function tagsOf(ctx: WorkspaceCtx, todoId: EntityId): Promise<string[]> {

@@ -63,7 +63,7 @@ import {
 import { BASE as APP_BASE, readEntity } from "../../src/stardust.ts";
 import { addTodo, reconcileBlocked, removeTodo, setDone, setStatus, toggleTodo } from "../../src/todos.ts";
 import { addDependency, addTag, removeDependency, removeTag, tagsOf } from "../../src/features.ts";
-import { reconcileTags } from "../../src/tags.ts";
+import { reconcileTagVocabulary, reconcileTags } from "../../src/tags.ts";
 import { createPersona, createWorkspace, ensureUser } from "../../src/tenancy.ts";
 import { type WorkspaceCtx, openWorkspace } from "../../src/workspace.ts";
 import {
@@ -844,6 +844,16 @@ async function tagsHold(ctx: WorkspaceCtx, ws: number, live: number[]): Promise<
           .map((d) => `#${d.id} [${(d.stored ?? []).join(" ")}] != [${d.actual.join(" ")}]`)
           .join(", "),
     );
+  }
+  // The THIRD copy of a label: the workspace's own vocabulary, which is what the
+  // chips are drawn from and what a `?tag=` in a URL is checked against. It is the
+  // copy this sequence is most likely to catch out, because the two ends are not
+  // symmetric: an add can only widen it and is decided without a query, while a
+  // removal only narrows it when it took the LAST edge — and a deleted todo takes
+  // its labels out of the vocabulary without retracting a single tag edge.
+  const vocab = await reconcileTagVocabulary(ws);
+  if (vocab.length) {
+    problems.push(`reconcileTagVocabulary reported [${vocab[0].stored.join(" ")}] != [${vocab[0].actual.join(" ")}]`);
   }
   return [problems.length === 0, problems.slice(0, 3).join(" · ")];
 }

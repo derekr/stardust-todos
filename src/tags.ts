@@ -1,11 +1,13 @@
-// Tags, in two representations, and the one file that keeps them equal.
+// Tags, in three representations, and the one file that keeps them equal.
 //
 // A tag has always been an EDGE ENTITY here (`kind:'tag'`, `todo`, `label`) and
-// still is: the edge is the vocabulary `availableTags()` groups over, it is what
+// still is: the edge is the source of truth for everything below it, it is what
 // `tagsOfTodo` reads for the detail page, and it keeps a label a piece of data
-// rather than a column. What is new is that the todo ALSO carries its labels as a
-// component of its own — `tags ['design' 'launch']` — written by the same
-// transaction that writes the edge.
+// rather than a column. The todo ALSO carries its labels as a component of its own
+// — `tags ['design' 'launch']` — written by the same transaction that writes the
+// edge, which is what the board's filter matches. And the WORKSPACE carries the set
+// of labels in use as one more fact, `tagVocab`, which is what the filter chips are
+// drawn from; that one is the bottom half of this file.
 //
 // ## Why the board could not filter on the edge
 //
@@ -88,6 +90,7 @@
 // the component.
 
 import { type EntityId, query, refId, transact } from "./stardust.ts";
+import { workspaceTags } from "./queries.ts";
 import { APP } from "./tenancy.ts";
 
 /** A label longer than this is not a label. Titles are the field for sentences. */
@@ -241,4 +244,187 @@ export async function migrateTagComponents(): Promise<number> {
   for (const d of diverged) patch[d.id] = { tags: d.actual.length ? d.actual : null };
   await transact(patch);
   return diverged.length;
+}
+
+// ---------------------------------------------------------------------------
+// The VOCABULARY: which labels this workspace uses at all.
+//
+// This is a third representation of the same information and it earns its keep on
+// a different axis from the other two. The edge says which todo carries which
+// label; the component says the same thing from the todo's end so a filter can
+// match it; the vocabulary says only "these ten strings are the labels here" — the
+// filter chips, and the DOMAIN a `?tag=` in a URL is checked against.
+//
+// It was an aggregate over the edges, `board-tags`, read on EVERY board render:
+// 29.5ms at 4,246 edges to produce the same ten rows every time, the largest slice
+// left of a 95ms board. Four ways to make it cheaper were measured on a copy of the
+// demo, all returning the same ten labels:
+//
+//   | how the vocabulary is answered                        | p50   | rows |
+//   | ---                                                   | ---   | ---  |
+//   | `board-tags` stored reactor + `?ws` bind (what was)    | 32.7  | 10   |
+//   | the same body as a dry-run, workspace inlined          | 28.9  | 10   |
+//   | ditto, with `workspace` denormalised onto the EDGE     | 17.5  | 10   |
+//   | ten interned `labelDef` ENTITIES, listed               | 8.1   | 10   |
+//   | ONE fact on the workspace entity — this               | 5.5   | 1    |
+//
+// 5.5ms is the floor: reading one unrelated fact off one entity by id measures
+// 3.6-7.8ms on the same server, so the vocabulary now costs a round trip and
+// nothing else.
+//
+// WHY NOT INTERN THE LABEL AS AN ENTITY, which is the more obvious modelling move
+// and was measured rather than argued about. Listing ten `labelDef` entities is
+// 8.1ms — real, but it buys the extra 2.6ms by adding a join everywhere a label
+// STRING is needed (the detail page reads labels, the board's filter matches a list
+// of strings, and neither wants an id), a lookup-or-create on the write path, and a
+// second question the entity list cannot answer on its own: a `labelDef` outlives
+// the last edge that referenced it, so "what labels exist" stops being "what labels
+// are in USE" and the chips grow dead entries. The interned label pays for itself
+// when a label needs to carry something — a colour, an order, a rename that is one
+// write — and this app's labels carry nothing. It is the right answer to a question
+// nobody here is asking.
+//
+// WHY NOT HOLD IT IN MEMORY, which is what the count chips do one file over and
+// what would make it 0ms. Because the two are not the same case, and the difference
+// is the write frequency: the tally moves on EVERY write, so materialising it would
+// append facts forever on an append-only store, and a subscription is the only
+// shape that stays current for free. A vocabulary moves when a label is used for
+// the first time or removed for the last, which is almost never — so materialising
+// it costs nothing to maintain, and it is durable, visible to every process,
+// queryable, and shows up in the x-ray as data rather than as a field in this
+// process. Materialise what changes rarely, subscribe to what changes often.
+//
+// WHAT IT GIVES UP is what `blocked` and the `tags` component gave up, for the
+// third time: correctness moves from the query into write discipline plus a guard.
+// `recordTagAdded`/`recordTagsRemoved` below are called by every path that can move
+// the vocabulary, `reconcileTagVocabulary` asks both questions plainly and reports
+// a workspace where they disagree, and `migrateTagVocabularies` writes what it
+// reports — which is also what backfills a database whose edges predate the fact.
+
+/** The workspace field holding its tag vocabulary. */
+const VOCAB = "tagVocab";
+
+/**
+ * The labels this workspace uses — ONE fact, read off the workspace entity.
+ *
+ * The subject is a bare id rather than `{"#": id}`: a fact pattern's entity
+ * position takes an id or a var and refuses a ref (`query: entity must be id or
+ * var`), which is the opposite of every VALUE position in this app.
+ *
+ * The list comes back resolved because the `find` is a bare TUPLE — the same rule
+ * the `tags` component follows, and the same trap: `then.project` would hand back a
+ * ref to the list entity instead.
+ */
+export async function tagVocabulary(workspaceId: EntityId): Promise<string[]> {
+  const rows = (await query({
+    find: ["?vocab"],
+    where: [[workspaceId, VOCAB, "?vocab"]],
+  })) as [string[]][];
+  return rows.length ? (rows[0][0] ?? []) : [];
+}
+
+/** What the EDGES say the vocabulary is — the plain question, asked of the same
+ *  `board-tags` body the board used to read per render. Nothing on a page reads
+ *  this now; it is the guard's half of the comparison, and the write paths' way of
+ *  finding out whether a label they just touched still has any edge behind it. */
+async function tagVocabularyFromEdges(workspaceId: EntityId): Promise<string[]> {
+  const rows = (await workspaceTags.read({ ws: { "#": workspaceId } })) as unknown as [string, number][];
+  return rows.map(([label]) => label);
+}
+
+/** A workspace whose stored vocabulary disagrees with its tag edges. */
+export interface VocabDivergence {
+  workspaceId: EntityId;
+  stored: string[];
+  actual: string[];
+}
+
+/**
+ * Does every workspace's stored vocabulary still equal what its edges say?
+ *
+ * Reports, never repairs — the shape `reconcileBlocked` established and
+ * `reconcileTags` copied, so a caller can tell a bug from a backfill. One workspace
+ * or all of them; `[]` means the two still agree.
+ */
+export async function reconcileTagVocabulary(workspaceId?: EntityId): Promise<VocabDivergence[]> {
+  const ids =
+    workspaceId === undefined
+      ? ((await query({ find: ["?w"], where: [["?w", "kind", "workspace"]] })) as [EntityId][]).map(([w]) => refId(w))
+      : [workspaceId];
+  const out: VocabDivergence[] = [];
+  for (const id of ids) {
+    const [stored, actual] = await Promise.all([tagVocabulary(id), tagVocabularyFromEdges(id)]);
+    if (stored.join(" ") !== actual.join(" ")) out.push({ workspaceId: id, stored, actual });
+  }
+  return out;
+}
+
+/**
+ * Backfill the vocabulary onto workspaces whose edges predate it.
+ *
+ * Idempotent by construction like `migrateTagComponents`: it writes exactly what
+ * `reconcileTagVocabulary` reports, so a second run finds nothing and writes
+ * nothing. `null` retracts — a workspace with no tags left should carry no fact,
+ * not an empty list.
+ */
+export async function migrateTagVocabularies(): Promise<number> {
+  const diverged = await reconcileTagVocabulary();
+  if (!diverged.length) return 0;
+  const patch: Record<string, Record<string, unknown>> = {};
+  for (const d of diverged) patch[d.workspaceId] = { [VOCAB]: d.actual.length ? d.actual : null };
+  await transact(patch);
+  return diverged.length;
+}
+
+/**
+ * A label has just been given an edge in this workspace: put it in the vocabulary
+ * if it is new there.
+ *
+ * No query behind the decision, because there is nothing to ask: the transaction
+ * that called this wrote the edge, so the label IS in use — the only question is
+ * whether the stored list already says so, and the stored list is the 5ms read the
+ * board makes anyway. The overwhelmingly common case (a label the workspace already
+ * uses) is that one read and no write at all.
+ */
+export async function recordTagAdded(workspaceId: EntityId, label: string): Promise<void> {
+  const stored = await tagVocabulary(workspaceId);
+  if (stored.includes(label)) return;
+  await transact({ [workspaceId]: { [VOCAB]: canonicalTags([...stored, label]) } });
+}
+
+/**
+ * Labels have just LOST an edge in this workspace — drop the ones that were the
+ * last of their kind.
+ *
+ * This is the direction that needs a question, and the only one: a removal is not a
+ * vocabulary change unless it was the final edge carrying that label. So the edges
+ * are asked, once, for the labels in hand — and the `contains` narrows the group
+ * before the workspace join rather than after it, which is what keeps this a write
+ * that happens rarely rather than a second copy of the read this whole change was
+ * about.
+ *
+ * Deleting a TODO comes through here too, and it is the case a per-todo view gets
+ * wrong: a deleted todo's tag edges outlive it, but they stop joining to a
+ * workspace, so the vocabulary can shrink without a single tag edge being retracted.
+ */
+export async function recordTagsRemoved(workspaceId: EntityId, labels: readonly string[]): Promise<void> {
+  const stored = await tagVocabulary(workspaceId);
+  const suspect = [...new Set(labels)].filter((l) => stored.includes(l));
+  if (!suspect.length) return;
+  const surviving = (await query({
+    find: ["?label", ["count", "?e"]],
+    where: [
+      ["?e", "kind", "tag"],
+      ["?e", "label", "?label"],
+      ["contains", { "#set": suspect }, "?label"],
+      ["?e", "todo", "?t"],
+      ["?t", "workspace", { "#": workspaceId }],
+    ],
+    groupBy: ["?label"],
+  })) as [string, number][];
+  const alive = new Set(surviving.map(([label]) => label));
+  const gone = suspect.filter((l) => !alive.has(l));
+  if (!gone.length) return;
+  const rest = stored.filter((l) => !gone.includes(l));
+  await transact({ [workspaceId]: { [VOCAB]: rest.length ? rest : null } });
 }

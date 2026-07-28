@@ -70,6 +70,7 @@ Run `node src/cli.ts add "..."` in a terminal and watch the browser update too.
 | the live list      | a **reactor** (`find`/`where`/`then.project`) read as a record stream — `page-rows` for the web board, a per-workspace reactor for the CLI |
 | the board's rows   | a one-shot **dry-run**, built per read from the filter in the URL (`src/board-query.ts`) |
 | the count chips    | a **subscription** per (workspace, viewer) — `board-counts`, held in memory and pushed, never read per render (`src/counts.ts`) |
+| the tag chips      | one **fact** on the workspace — `tagVocab`, maintained by the tag writes and guarded by `reconcileTagVocabulary()` (`src/tags.ts`) |
 
 ## Multi-tenancy: user → persona → workspace
 
@@ -151,9 +152,9 @@ Highlights of the later stages:
   the same `where`, so paging bounds the response and the render, not the query,
   and a "showing 50 of N" pill would have doubled the work of every page view.
 - **What a page view actually costs** (`src/board.ts`, `src/server.ts`). Paging the
-  board did not make the page fast, because three reads beside it were still
-  whole-workspace. At 10,003 todos one board URL was ~280ms; it is ~95ms now, and
-  none of the four things that got it there was the rows query being clever:
+  board did not make the page fast, because the reads beside it were still
+  whole-workspace. At 10,003 todos one board URL was ~280ms; it is ~62ms now, and
+  none of the things that got it there was the rows query being clever:
   * A **filter that filtered nothing.** An empty facet selection compiled to an `or`
     over its whole domain — a comparison every row passes, seven of them per row.
     Deleting both: 85ms → 54ms for one page, byte-identical rows.
@@ -186,6 +187,16 @@ Highlights of the later stages:
     made the numbers LIVE —
     a write to a todo that is not on the page you are reading moves them now, where
     before only a repaint could.
+  * The **tag vocabulary stopped being an aggregate**, which is the same problem with
+    the opposite answer. `groupBy` over 4,246 tag edges, 29.5ms per render for the
+    same ten labels; it is a fact on the workspace now, 5.3ms, maintained by the tag
+    writes rather than by a subscription — because a vocabulary changes when a label
+    is first used or last removed and otherwise never, while a tally changes on every
+    write. Materialise what changes rarely, subscribe to what changes often.
+  * **A page past the end costs a whole board and returns nothing.** `?p=200` was
+    285.9ms and 303.0ms for 0 rows in the traces, because `offset` is applied after
+    the work. The tally in memory is an upper bound on every filtered subset of the
+    board, so one comparison answers it with no read at all: 343.2ms → 0.0ms.
 - **Clause order is the plan** (`src/board-query.ts`). Once the page was ~95ms the
   next thing the instrumentation showed was that a FILTERED board cost far more than
   an unfiltered one: `?st=blocked` was 249ms against 94ms, and 143 of the 154ms sat
@@ -237,8 +248,8 @@ Highlights of the later stages:
   400 rather than a dropped clause — dropping widens the board, which is the failure
   you do not notice. Tag labels have no fixed domain, so they are checked against the
   workspace's actual tag vocabulary instead.
-- **Tags are stored twice, on purpose** (`src/tags.ts`, `src/features.ts`). A tag is
-  still an edge ENTITY — that is the vocabulary the chips are grouped from — and the
+- **Tags are stored three times, on purpose** (`src/tags.ts`, `src/features.ts`). A
+  tag is still an edge ENTITY — the source of truth the other two derive from — and the
   todo now also carries its labels as a list component of its own, written by the
   same transaction as the edge. The board filters on the component, and the reason is
   not speed but a hard failure: filtering on the edges meant a correlated `exists`,
@@ -251,6 +262,20 @@ Highlights of the later stages:
   selected labels it carries. What it gives up is the same trade `blocked` made —
   the invariant is now write discipline plus `reconcileTags()`, which asks both
   questions plainly and reports every todo where the two disagree.
+
+  The third copy is the **vocabulary**: which labels the workspace uses at all, which
+  is what the chips are drawn from and the only domain a `?tag=` in a URL can be
+  checked against. It was a `groupBy` over 4,246 edges on every render — the same ten
+  rows every time, 29.5ms of a 95ms board — and it is one fact on the workspace
+  entity now, read in 5.3ms. Four other shapes were measured and lost: the stored
+  reactor with a bind (32.7ms), the same body inlined (28.9ms), `workspace`
+  denormalised onto the edge (17.5ms), and ten interned `labelDef` ENTITIES (8.1ms),
+  which would also have needed a join wherever a label string is used and would list
+  labels nothing carries any more. Holding it in memory like the tally would be 0ms
+  and is the one this deliberately refuses: a tally moves on every write, a
+  vocabulary moves when a label is first used or last removed, and a fact survives a
+  restart, is visible to every process, and is queryable. Materialise what changes
+  rarely, subscribe to what changes often.
 
 - **The blocker picker searches, through a second index on the same field**
   (`src/board.ts`, `src/indexes.ts`). "Add blocker" used to offer every visible

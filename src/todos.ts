@@ -29,7 +29,8 @@ import {
   streamResults,
   transact,
 } from "./stardust.ts";
-import { blockedByTodo } from "./queries.ts";
+import { blockedByTodo, tagsOfTodo } from "./queries.ts";
+import { recordTagsRemoved } from "./tags.ts";
 import { validators } from "./field-registry.ts";
 import type { SchemaFieldTypes } from "./generated/schema-fields.ts";
 
@@ -605,12 +606,23 @@ export async function toggleTodo(ctx: WorkspaceCtx, id: EntityId, actor?: string
 
 /** Deleting a todo unblocks everything it was blocking: its dep edges survive it,
  *  but `[?b status ?bs]` no longer matches, so the dependents are open again. The
- *  reverse lookup has to happen BEFORE the delete, while the edges still resolve. */
+ *  reverse lookup has to happen BEFORE the delete, while the edges still resolve.
+ *
+ *  Its TAG edges survive it in exactly the same way, and that is why the labels are
+ *  read here too. Nothing retracts a tag edge when its todo goes, but the edge stops
+ *  joining to a workspace — so a delete can empty the workspace's vocabulary of a
+ *  label without any tag write happening at all, and the chips would go on offering
+ *  a label nothing carries. Read first, delete, then let `recordTagsRemoved` ask
+ *  whether any of them were the last of their kind. */
 export async function removeTodo(ctx: WorkspaceCtx, id: EntityId): Promise<void> {
   await authorizeWrite(ctx, id);
-  const dependents = await dependentsOf(id);
+  const [dependents, labels] = await Promise.all([
+    dependentsOf(id),
+    tagsOfTodo.read({ todo: { "#": id } }).then((rows) => rows.map((r) => r.label as string)),
+  ]);
   await deleteEntity(id); // DELETE /entities/{id} — not a transact, so it takes no patch
   await refreshDerived(dependents);
+  if (labels.length) await recordTagsRemoved(ctx.workspaceId, labels);
 }
 
 // ---- Reads: Stardust projects the exact shape; no positional mapping -----

@@ -17,7 +17,8 @@ import type { WorkspaceCtx } from "./workspace.ts";
 import type { Status, Todo } from "./todos.ts";
 import { effectiveStatusOf } from "./todos.ts";
 import { type EntityId, query, refId } from "./stardust.ts";
-import { blockersOfTodo, todoPicker, workspaceTags } from "./queries.ts";
+import { blockersOfTodo, todoPicker } from "./queries.ts";
+import { tagVocabulary } from "./tags.ts";
 import { visibleTo } from "./derive.ts";
 import { APP } from "./tenancy.ts";
 
@@ -115,13 +116,18 @@ export async function blockersOf(todoId: EntityId): Promise<Blocker[]> {
   return rows.map((r) => ({ id: refId(r.blocker), title: r.title as string, status: r.status as Status }));
 }
 
-/** Distinct tag labels used in the workspace. */
+/**
+ * The tag labels in use in this workspace — the filter chips, and the domain a
+ * `?tag=` in a URL is checked against.
+ *
+ * ONE fact off the workspace entity. It used to be a `groupBy` over every tag edge
+ * in the workspace, read on every board render: the same ten labels every time, for
+ * 29.5ms of a 95ms board. The aggregate still exists — it is what the guard asks and
+ * what the write paths consult — it is just no longer what a reader waits for. See
+ * tags.ts for the four shapes that were measured and why the fact won.
+ */
 export async function availableTags(ctx: WorkspaceCtx): Promise<string[]> {
-  // `groupBy` already made these distinct and ordered, so there is nothing left to
-  // dedupe: the query returns the ten labels in use rather than the 4,246 tag edges
-  // that carry them.
-  const rows = (await workspaceTags.read({ ws: { "#": ctx.workspaceId } })) as unknown as [string, number][];
-  return rows.map(([label]) => label);
+  return await tagVocabulary(ctx.workspaceId);
 }
 
 /** VISIBLE todos as {id,title} — what the "add blocker" picker opens on, before

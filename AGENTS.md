@@ -459,6 +459,95 @@ both inlined — was refused rather than measured, on the ground the ephemeral-r
 entry already establishes: creating one costs 31–44ms and a BLOCK of entity ids that
 deleting it does not give back. That is a permanent write for a one-time 47ms.
 
+A subscription was right for the tally because a tally moves on every write. It is
+the wrong shape for the read that replaced it at the top of the board's cost — see
+the next section, which is the other half of this rule.
+
+## Materialise what changes rarely, subscribe to what changes often
+
+The counts entry above is one half of a distinction, and the tag VOCABULARY is the
+other. Both were whole-workspace aggregates read on every board render. The tally
+became a subscription; the vocabulary became a FACT. The thing that decides which is
+not the size of the answer, it is **how often the answer moves**.
+
+The vocabulary — "which labels does this workspace use", the filter chips and the
+domain a `?tag=` in a URL is checked against — was a `groupBy` over 4,246 tag edges
+at p50 29.5ms, returning the same ten rows on every render, against a 95ms board.
+Five ways to answer it, all measured on a copy of the demo, all returning the same
+ten labels:
+
+| how the vocabulary is answered | p50 | rows |
+| --- | --- | --- |
+| `board-tags` stored reactor + `?ws` bind (what was) | 32.7ms | 10 |
+| the same body as a dry-run, workspace inlined | 28.9ms | 10 |
+| ditto, with `workspace` denormalised onto the tag EDGE | 17.5ms | 10 |
+| ten interned `labelDef` ENTITIES, listed | 8.1ms | 10 |
+| ONE `tagVocab` fact on the workspace entity | 5.5ms | 1 |
+| held in memory by a subscription | 0ms | — |
+
+5.5ms is the FLOOR, not a good score: reading one unrelated fact off one entity by
+id measures 3.6–7.8ms on the same server, so the materialised vocabulary costs a
+round trip and nothing else. Through the app at 10,003 todos the `tags` read went
+28.4ms p50 to 5.3ms p50, same ten rows, and the board's own p50 went ~95ms to 62ms.
+
+Why NOT the subscription, which is 0ms and is what the tally does. Because the two
+reads differ by three orders of magnitude in write frequency. A tally moves on every
+write, so materialising it would append facts forever on an append-only store — and
+this repo has already measured what that costs everything else (a three-fact patch
+goes 4ms → 9ms → 17ms as a database grows from 7.5k to 369k facts, on writes that
+never touch the rows being added). A vocabulary moves when a label is used for the
+first time or removed for the last, which on a real board is almost never. So the
+maintenance is free, and what the fact buys over the field in memory is everything
+memory does not have: it survives a restart, every process sees the same answer, it
+is queryable, and it shows up in the x-ray as data — which on an app whose whole
+subject is how much can live in the database is not a tiebreaker, it is the point.
+
+Why NOT intern the label as an ENTITY, which is the more obvious modelling move.
+Measured rather than argued: 8.1ms, and the 2.6ms it gives back buys a join
+everywhere a label STRING is needed (the detail page, and the board's filter, which
+matches a list of strings on the todo), a lookup-or-create on the write path, and a
+question the entity list cannot answer on its own — a `labelDef` outlives the last
+edge that referenced it, so "what labels exist" stops being "what labels are in
+USE". Interning pays when the label needs to CARRY something: a colour, a display
+order, a rename that is one write instead of 4,246. This app's labels carry nothing.
+
+**And the engine has no cheaper answer, which was checked first and is the reason
+any of the above was necessary.** The `label` field is value-indexed and a value
+index is ordered by value, so the ten distinct labels are ten adjacent keys in it —
+but nothing in 0.0.6 exposes a distinct-key walk:
+
+- `groupBy` REQUIRES an aggregate. `find ["?label"] groupBy ["?label"]` is refused
+  with `query: groupBy and having require aggregate expressions`, so there is no
+  "distinct" query shape to ask for.
+- The classic loose index scan does not pay. `min(?label)` bounded by the previous
+  label, eleven times, is 26ms globally and **347ms** scoped to a workspace;
+  `orderBy [?label] limit 1` per step is 6.4ms × 11 ≈ 70ms. Both are worse than the
+  single `groupBy` they were meant to replace.
+- `/indexes` has exactly two optional indexes — value and text — and no
+  materialised-projection primitive. `/indexes/{field}` reports policy, `desired`,
+  `active` and `catchUp`, and the field detail page paginates that field's FACTS. No
+  route anywhere answers "the distinct values of field F".
+- Dropping the workspace join is not an option either, and the reason is worth its
+  own line: **a stored reactor's clauses are FACTS, on the same field names the app
+  uses.** `find [[max "?t"]] where [["?x","title","?t"]]` over the demo returns a
+  REF, and `min` returns `"?bt"` — a var name out of `todo-blocks`'s stored body.
+  `countDistinct(?label)` over the whole database is 18, not 10, because the command
+  catalog and the reactor definitions carry `label` too. The `[?e kind tag]` clause
+  that queries.ts calls "cheap insurance against a future entity carrying the same
+  field shape" is not hypothetical insurance; the reactors already do it.
+
+The rule to carry: **materialise what changes rarely, subscribe to what changes
+often** — and before either, check whether the read is a whole-workspace aggregate
+of something the workspace could simply STATE. What materialising costs is the same
+thing `blocked` and the `tags` component cost: the invariant moves out of the query
+and into write discipline, so it needs a `reconcile…()` that asks both questions
+plainly and a `migrate…()` that writes what it reports, and the stress harness has
+to drive the sequence that gets it wrong. For a vocabulary that sequence is not
+symmetric — an add can only widen it and needs no query at all, a removal narrows it
+only when it took the LAST edge, and **deleting a todo takes its labels out of the
+vocabulary without retracting a single tag edge**, because a dangling edge stops
+joining to a workspace.
+
 ## Clause order IS the plan, and nothing will fix it for you
 
 Stardust evaluates a `where` in the order it is WRITTEN. It does not reorder
@@ -606,6 +695,39 @@ errors and zero short answers, because retry-capable execution waits for catch-u
 and retries in a fresh snapshot. Do not build on that being free; do note that the
 app needs no retry arm of its own for it.
 
+**"Do not build on that being free" was the right sentence, and here is the bill.**
+One search in the demo's instrumented traces cost **301.3ms and returned 0 rows**
+where every other empty search cost 5–8ms. It is not the term, not the analyzer, and
+not a cold cache: it is the catch-up above, paid by the FIRST fts read after writes,
+in front of whoever typed. Reproduced on a copy of the demo, same body, same 0 rows,
+`textSearch{lag N}` read off `/indexes/title` before each one:
+
+| title writes since the last search | first search | the next two |
+| ---: | ---: | ---: |
+| 0 (steady state) | 5.5ms | 4.5 / 5.8ms |
+| 1 | 81.6ms | 5.8 / 5.8ms |
+| 4 | 110.8ms | 5.5 / 4.4ms |
+| 8 | 152.3ms | 4.5 / 7.3ms |
+| 16 | 258.6ms | 5.2 / 6.6ms |
+| 32 | 452.3ms | 5.3 / 4.7ms |
+
+So it is roughly 65ms plus ~12ms per lagging TEXT write, it lands entirely on the
+first reader, and the lag goes to 0 the moment one search has paid it. Writes that
+touch no text field cost a flat ~40ms rather than a slope (1/8/32 status writes gave
+7.2/46.1/40.5ms), and an ordinary non-fts read does NOT absorb it — a plain query
+issued between the writes and the search left the search at 155.1ms. Waiting does
+not help either: +1s, +3s and +6s after a title write were still 82/85/71ms, because
+catch-up is lazy and a reader is what triggers it.
+
+It is INHERENT, and it is deliberately not "fixed" here. The work has to happen
+somewhere, and the only way to move it off the reader is to issue speculative fts
+reads the app has no other reason to make — 149 picker renders in the demo's traces
+against 8 searches. What is worth knowing is the shape: this cost is proportional to
+TEXT writes since the last search, so an app that searches rarely and edits titles
+constantly gets a slow first search, and one that searches constantly never sees it.
+Assert the row count when you measure it, or you will read a catch-up as a slow
+query — this one returns zero rows.
+
 **What it costs.** 49,880 postings over 10,036 documents for 10,003 titles; the
 database file 32.2 MiB → 48.4 MiB; a single-field title write p50 2.7ms with the
 analyzer on against 1.8ms with it off, measured by toggling it over the same
@@ -668,11 +790,26 @@ and the response get smaller. Three consequences worth carrying:
 - Paging bounds the RESPONSE, the render, and the memory a result set occupies. It
   does not bound the query. Narrowing the FILTER is what bounds the query, and that
   is what the inlining change turned out to be about — see the tension entry. The
-  counts/blockers/tags reads beside the board are still whole-workspace and not
-  paged at all, so a page view is still O(workspace) even when the board is not.
+  reads beside the board used to be whole-workspace and unpaged, which kept a page
+  view O(workspace) even when the board was not — and one by one they stopped
+  being: the blockers read asks about the ids on the page, the tally is a
+  subscription, and the tag vocabulary is a fact on the workspace. The board's own
+  rows are the only whole-workspace read a paint still waits for.
 - A count for a "showing 50 of N" pill costs a second full board. That is why the
   pill says `50+`: the board asks for `PAGE_SIZE + 1` rows and spends the extra one
   on "is there a next page", which is the only question the pager has.
+- **An `offset` past the end costs a full board and returns nothing.** Two records
+  in the demo's traces are `?p=200` at 285.9ms and 303.0ms for **0 rows**, which is
+  what "offset is applied after the work" means at the far end of the list. The
+  guard is one comparison and no read at all, because the process is already holding
+  a bound: the chips' tally is NOT narrowed by the filter, so an offset past the
+  whole workspace is an offset past every filtered subset of it (`windowRows` in
+  board-query.ts). Measured through the app on the demo corpus, holding a stream
+  open so the tally is warm — plain curl never does, and a cold scope simply
+  disables the guard: `?p=200` went 343.2ms to 0.0ms, `rows 0 in 0`, and an
+  in-range page still reads with `in 51`. What it costs is one honest caveat: the
+  tally is the last emission of a subscription, so a write landing between that
+  emission and this read makes the bound momentarily low.
 - `limit` and `offset` are BODY fields and refuse a bind — `limit ?n`, `offset
   ?off` and `offset {#bind off}` are all `limit/offset must be number`. So a page is
   part of the query TEXT and one stored reactor cannot serve every page. That used
@@ -886,8 +1023,8 @@ worth reading before you re-litigate one:
   number of labels, returning exactly the rows the `exists` returned where the
   `exists` could still run (420 for one label, 841 for two, identical and in order).
 
-  Why BOTH, and not one. The EDGE stays because it is the vocabulary
-  `availableTags` groups over and what the detail page reads, and because it keeps a
+  Why BOTH, and not one — and now THREE. The EDGE stays because it is the source of
+  truth the other two are derived from, what the detail page reads, and what keeps a
   label a piece of data. The COMPONENT is what a filter can use: matching the edge is
   a join that returns a todo carrying two selected labels TWICE, and de-duplicating
   that is a subquery, which is where the ceiling came from. A LIST rather than a
@@ -902,6 +1039,15 @@ worth reading before you re-litigate one:
   the harness drives the sequence a denormalised set gets wrong — add, add again, add
   a second, remove one, remove the last, and delete a tagged todo, whose edges
   OUTLIVE it, which is why the guard requires the todo to still have a title.
+
+  The THIRD copy arrived later and is a different trade rather than more of the same
+  one: the workspace's `tagVocab`, the ten labels the chips are drawn from, which
+  used to be a `groupBy` over all 4,246 edges on every render. Interning the label as
+  an entity was measured against it and lost; so did a subscription, on durability
+  rather than on speed. That comparison is the "materialise what changes rarely,
+  subscribe to what changes often" section above, and it is the one to read before
+  reaching for memory again.
+
   Also gone with the sessions: the `Session` and `SessionFacet` schemas, and the
   generated `facet`/`value` validators that existed only because the atomic facet
   write bypassed the schema route it was declared for.
@@ -923,6 +1069,14 @@ worth reading before you re-litigate one:
   navigations by one reader the ~190ms subscribe was paid once. The bind that made
   this expensive as a read is what makes it possible as a subscription — see the
   reversal in the bind entry above.
+
+  **What decided it was the write frequency, not the read cost, and the read one
+  entry up is the control.** The tag vocabulary was the same shape — a
+  whole-workspace aggregate on every render — and it became a FACT rather than a
+  subscription, because a vocabulary moves almost never while a tally moves on every
+  write. Read "materialise what changes rarely, subscribe to what changes often"
+  before reaching for memory for the next one: memory is right here, and it was the
+  wrong answer thirty lines away.
 
   What it gives up, precisely. **Per-process state with a lifetime to get right**,
   on an app whose worst bug of this kind was 84 session entities for twelve todos.

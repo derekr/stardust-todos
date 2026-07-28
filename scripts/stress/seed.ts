@@ -131,6 +131,18 @@ export async function seed(base: string, n: number, batchSize = 5000, log = cons
   }
   log(`  edges ${keys.length.toLocaleString()} (tags + deps)`);
 
+  // The workspace's tag VOCABULARY, written with the corpus for the same reason the
+  // derived fields are: the board reads it as a fact rather than aggregating the
+  // edges, and a fact nobody wrote is not a chip that renders oddly — it is a chip
+  // that is missing, and a `?tag=` the app then answers 400 for. The seeder knows
+  // the label set exactly, so it says so instead of leaving the harness to backfill.
+  const labels = Object.values(edges)
+    .map((e) => (e as { label?: string }).label)
+    .filter((l): l is string => l !== undefined);
+  const vocab = [...new Set(labels)].sort();
+  if (vocab.length) await tx(base, { [String(workspace)]: { tagVocab: vocab } });
+  log(`  vocabulary [${vocab.join(" ")}]`);
+
   return { base, workspace, owner, member, idOf: (k) => idByK[k]!, n };
 }
 

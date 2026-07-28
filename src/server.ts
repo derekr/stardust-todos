@@ -45,7 +45,7 @@ import { lookupRef } from "./registry.ts";
 import { createPersona, createWorkspace, ensureUser, grantAccess, listPersonas, roleOf } from "./tenancy.ts";
 import { authorizeCommand, ensureCommandCatalog, visibleCommands } from "./commands.ts";
 import { addDependency, removeDependency, tagsOf } from "./features.ts";
-import { migrateTagComponents } from "./tags.ts";
+import { migrateTagComponents, migrateTagVocabularies } from "./tags.ts";
 import {
   SEARCH_LIMIT,
   availableTags,
@@ -56,7 +56,7 @@ import {
   todoOptions,
 } from "./board.ts";
 import { type Counts, type CountsHold, holdCounts, liveCountScopes, peekCounts } from "./counts.ts";
-import { type BoardScope, boardQuery, readSnapshot } from "./board-query.ts";
+import { type BoardScope, boardQuery, readSnapshot, windowRows } from "./board-query.ts";
 import { type BoardState, FilterError, decodeFilter } from "./filter.ts";
 import { BASE, TxConflictError, lastTx, readEntity, readReactorRon, watchEntity } from "./stardust.ts";
 import { DECLARED, PICKER_LIMIT, blockedByTodo, boardCounts, pageRows } from "./queries.ts";
@@ -179,6 +179,12 @@ await migrateDerivedFields();
 // findable by its own label. Idempotent the same way: it writes exactly what
 // `reconcileTags` reports diverging, so a second boot writes nothing.
 await migrateTagComponents();
+// The workspace's tag VOCABULARY, the third place a label is stored and the one the
+// chips are drawn from. Same shape and the same reason: it writes exactly what
+// `reconcileTagVocabulary` reports, so a second boot writes nothing — and a database
+// whose tag edges were seeded rather than added through `addTag` gets its chips back
+// here rather than staying empty until somebody tags something.
+await migrateTagVocabularies();
 const OWNER_PERSONA = ctx.personaId;
 const demoUser = await ensureUser("default@local");
 if (!(await listPersonas(demoUser)).some((p) => p.name === "Teammate")) {
@@ -297,11 +303,19 @@ async function serveStatic(parts: string[], res: http.ServerResponse): Promise<v
 // is the rows the query returned, which is 51 on a page with a next one — the
 // 51st is never rendered but it was read, and the number in the log is what the
 // engine did rather than what the template used.
-async function boardData(t: Trace, state: BoardState, pgset: PageSet | null, tags: string[]) {
+async function boardData(t: Trace, state: BoardState, pgset: PageSet | null, tags: string[], counts: Counts | null) {
+  // The bound the tally already gives us, and what it is FOR: a page past the whole
+  // workspace is a page past every filtered subset of it, so the read is skipped
+  // instead of scanning to an offset that has nothing behind it. `in` is what makes
+  // that legible in the log, exactly as it is for the blockers below — `in 0` is a
+  // query that was never issued, and the absence of `in` is a cold scope with no
+  // bound to check against.
+  const bound = visibleTotal(counts);
   const snap = await t.read(
     "rows",
-    () => readSnapshot(boardQuery(scopeNow(), state.filter), state.page),
+    () => readSnapshot(boardQuery(scopeNow(), state.filter), state.page, bound),
     (s) => s.rows.length + (s.hasMore ? 1 : 0),
+    bound === undefined ? undefined : windowRows(state.page, bound),
   );
   const todos = snap.rows as unknown as Todo[]; // SnapshotRow is Todo-shaped
   // Only the rows that will actually draw a ⊘ need their blockers, and `row()` draws
@@ -387,7 +401,7 @@ async function renderBoard(
   // Captured before the rows, not re-read after them: if a push lands in between it
   // patches the chips itself, so this paint is about the numbers it started with.
   const counts = holder.at(ctx.workspaceId, viewPersona).now;
-  const { snap, todos, blockers } = await boardData(t, state, pgset, tags);
+  const { snap, todos, blockers } = await boardData(t, state, pgset, tags, counts);
   stream.patchElements(
     t.render(() => boardFragment(todos, blockers, state.filter, { state, hasMore: snap.hasMore }, pgset.id)),
   );
@@ -434,7 +448,7 @@ async function renderBoard(
 // that scope has been shut for the grace period.
 async function boardView(t: Trace, state: BoardState, tags: string[]): Promise<BoardView> {
   const counts = peekCounts(ctx.workspaceId, viewPersona);
-  const { snap, todos, blockers } = await boardData(t, state, null, tags);
+  const { snap, todos, blockers } = await boardData(t, state, null, tags, counts);
   // `counts` in the record says which of the two this render was, with no read
   // beside it either way — so "a warm render issues no query" stays checkable from
   // `?debug=1` rather than being an argument about the code.
