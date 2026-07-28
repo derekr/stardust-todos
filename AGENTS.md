@@ -939,10 +939,47 @@ worth reading before you re-litigate one:
   the page you were reading left them stale; a `board-chips` record is a repaint
   with `reads: []` and 0.2–0.5ms of render behind it.
 
-  The first paint on a scope nothing is subscribed to yet still shows `50 · …` for
-  the length of one subscribe, which is the same behaviour the entry below already
-  describes and the same reason. That is the thing to reverse if it ever reads as
-  broken.
+  IT SHOWED, AND IT WAS REVERSED. The entry below ends "if the flash ever reads as
+  broken, this is the entry to reverse", and it did — for a reason that had nothing
+  to do with the trade that entry weighed. The SSR pass emitted the placeholder
+  UNCONDITIONALLY, which was the only thing it could do while the tally was a
+  per-render read. Once counts.ts started holding the answer, that line stopped
+  being a trade and became a bug: `/`, `?p=3`, `?p=7` and `?pr=high` each served
+  `count-total = …` from a process whose subscription had the number sitting in a
+  field, so every page turn and every filter click painted `50 · …` and filled it in
+  over an answer the server already had. A navigation cannot move these numbers —
+  that is the entire premise of the chips — so the placeholder is right only when
+  the value is genuinely unknown, and never merely because the render is the SSR
+  one.
+
+  So `boardView` PEEKS: `peekCounts(ws, viewer)` in counts.ts hands back the last
+  emission out of the map, takes no hold, issues no query and starts no
+  subscription. **The 30s linger is what makes that work, and it is worth spelling
+  out that it is not luck.** A navigation closes the old stream and the browser
+  requests the new document before the new stream opens, so at SSR time the scope
+  sits at zero holders with its idle timer running — still in the map, still holding
+  its emission. Verified both ways at 10,003 todos: with a stream held open from a
+  second shell, and again with every stream closed and only the timer running, `/`,
+  `?p=3`, `?p=7` and `?pr=high` all carried `count-total = 9947` in the HTML,
+  `?debug=1` recorded `counts:"warm"` with `reads` still only tags / rows /
+  blockers, and no `{"t":"counts"}` line appeared for any of them. Against a process
+  with no board open at all it is `…` and `counts:"cold"` — which is exactly why
+  this was missed, because `countScopes` reads `{}` under precisely the plain-curl
+  conditions an agent checks in.
+
+  **A cold scope still shows the placeholder, and that is a measurement rather than
+  a preference.** This response is 75-96ms and the tally is 246-273ms, so counting
+  synchronously would take a cold first paint to ~330ms — and it would not even
+  replace the subscribe, because a one-shot read cannot seed a subscription and the
+  stream opening a moment later still pays its own. That is counting the workspace
+  TWICE to move three numerals earlier, on the one paint per scope where nobody has
+  asked yet. The variant that avoids the double count — have the SSR pass acquire
+  the hold and AWAIT the first emission — is one read instead of two, but it puts an
+  engine round trip in front of the document on the one path whose whole point is
+  that it has none, and it gives a broken reactor body a way to hang the page rather
+  than to leave three numerals blank. Both refused on the same arithmetic: a cold
+  scope happens once per (workspace, viewer) per process, plus once more after every
+  board on it has been shut for the grace period. A navigation happens constantly.
 
   ---
 
@@ -967,7 +1004,11 @@ worth reading before you re-litigate one:
   SSR HTML used to be complete on its own. That is deliberately NOT a re-run of the
   empty-shell decision this file records elsewhere — the board arrives complete and
   it is the counts that follow, not the content — but it is the same axis, and if
-  the flash ever reads as broken, this is the entry to reverse.
+  the flash ever reads as broken, this is the entry to reverse. It did, and it was:
+  see the top of this entry. What actually broke was narrower than what was weighed
+  here — the SSR pass went on emitting the placeholder after the tally stopped being
+  a read, so a value the process was already holding was withheld from the one
+  response a browser blocks on.
 
   One faster shape was measured and REFUSED. The visible tally equals (everything,
   grouped) minus (drafts this viewer cannot see, grouped): 64ms and 46ms, 83ms run

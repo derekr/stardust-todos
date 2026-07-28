@@ -104,9 +104,11 @@ const cnum = (id: string, n: number | string) => `<span id="${id}" class="cnum">
  * pill — comes from one whole-workspace read, and it is the slowest thing a board
  * waits on: 127ms against 49ms for the fifty rows, at 10,003 todos, and it cannot
  * be narrowed, because "how many are there" is not a question fifty rows can
- * answer. So the render no longer waits for it. `null` means the numbers are still
- * being counted, and every count-bearing element already had an "unknown" state,
- * because the tag chips have never carried one.
+ * answer. So the render no longer waits for it, and no longer reads it at all: it
+ * is subscribed (counts.ts) and every render — the SSR pass included — takes it out
+ * of memory. `null` is what is left of that, a scope nothing has counted yet, and
+ * every count-bearing element already had an "unknown" state, because the tag chips
+ * have never carried one.
  *
  * The total is the one place that shows something rather than nothing, because its
  * span is morphed by id and has to exist to be morphed into.
@@ -114,8 +116,8 @@ const cnum = (id: string, n: number | string) => `<span id="${id}" class="cnum">
 const PENDING = "…";
 
 /** "all·N" — N is the total shown (sum of the viewer-scoped status counts), or
- *  `undefined` while the tally is still in flight. */
-const visibleTotal = (counts: Counts | null): number | undefined =>
+ *  `undefined` when nothing has counted this scope yet. */
+export const visibleTotal = (counts: Counts | null): number | undefined =>
   counts === null ? undefined : Object.values(counts.status).reduce((a, b) => a + b, 0);
 
 /** The filter bar element on its own — shared by the SSE patch and the SSR shell. */
@@ -362,7 +364,8 @@ export interface BoardView {
   board: string;
   /** rows on THIS page — a string, because a further page renders as "50+". */
   visible: string;
-  /** the whole-workspace tally, or undefined while it is still being counted */
+  /** the whole-workspace tally, or undefined when nothing is subscribed to this
+   *  scope yet and the number is not known to this process at all */
   total?: number;
 }
 

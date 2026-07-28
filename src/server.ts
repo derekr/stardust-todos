@@ -55,7 +55,7 @@ import {
   searchTodoOptions,
   todoOptions,
 } from "./board.ts";
-import { type Counts, type CountsHold, holdCounts, liveCountScopes } from "./counts.ts";
+import { type Counts, type CountsHold, holdCounts, liveCountScopes, peekCounts } from "./counts.ts";
 import { type BoardScope, boardQuery, readSnapshot } from "./board-query.ts";
 import { type BoardState, FilterError, decodeFilter } from "./filter.ts";
 import { BASE, TxConflictError, lastTx, readEntity, readReactorRon, watchEntity } from "./stardust.ts";
@@ -81,6 +81,7 @@ import {
   palette,
   sidebar,
   visibleLabel,
+  visibleTotal,
 } from "./view.ts";
 import { type DetailOpts, type HistEntry, candidateList, detailFragment, detailPage } from "./detail.ts";
 import {
@@ -349,12 +350,13 @@ async function boardData(t: Trace, state: BoardState, pgset: PageSet | null, tag
 // issues no query — which is why `counts`, which used to be ~240ms of every record
 // in the log, is not in any of them. What a paint can find there is `null`: the
 // first stream on a (workspace, viewer) nothing is subscribed to yet paints the
-// chips WITHOUT numbers, exactly as the SSR pass already does, and the
-// subscription's first emission patches them a moment later through `chips`. That
-// is the same trade the tally already made when it came off the critical path, and
-// it is unchanged for a reader — the board arrives complete and three numerals
-// follow. Nothing about the number can be narrowed: the chips answer "how many are
-// there", and a page of fifty cannot say.
+// chips WITHOUT numbers, exactly as the SSR pass does for a scope that cold, and
+// the subscription's first emission patches them a moment later through `chips`.
+// That is the whole of what the tally still costs a reader, and it is one paint per
+// scope rather than one per navigation — the SSR pass peeks at the same memory, so
+// every page turn after the first ships the numbers in the document. Nothing about
+// the number can be narrowed: the chips answer "how many are there", and a page of
+// fifty cannot say.
 //
 // What is new is that they stay right. A paint used to be the only thing that could
 // move them, so a write to a todo NOT on this page left the chips stale until
@@ -403,22 +405,46 @@ async function renderBoard(
 // page. Datastar morphs its first patch over identical markup, so this is purely
 // additive — nothing downstream changes.
 //
-// It renders the chips with NO numbers, which is what makes a filter change feel
-// like one: this is the response a browser blocks on, and it is 75ms rather than
-// 200ms without the tally in it. The numbers arrive on the stream this document
-// opens a few milliseconds later, from the one read that computes them — so a page
-// view now counts the workspace ONCE, where the SSR pass and the stream used to do
-// it separately.
-//
 // No page-set: the SSR pass has no subscription to point at one. The stream that
 // the document opens a moment later leases its own and writes it.
+//
+// THE CHIPS ARE DRAWN FROM MEMORY, NOT FROM A READ, and not from nothing either.
+// This pass used to emit the placeholder unconditionally, and that was right only
+// while the tally was a per-render read worth 200ms; once counts.ts started holding
+// the answer, an unconditional `…` meant every navigation painted `50 · …` and
+// filled it in a moment later — over numbers the process already had, for a
+// question the navigation could not have changed. So it PEEKS: no query, no
+// subscribe, no hold, just the emission a live scope is already holding.
+//
+// A navigation is what makes that work rather than a coincidence. The browser
+// closes the old stream and requests this document before the new stream opens, so
+// the scope is momentarily at zero holders — and the 30s linger counts.ts keeps for
+// exactly that gap means it is still in the map with its last emission in it. Every
+// page turn and every filter click after the first therefore ships real numbers in
+// the HTML the browser blocks on, and the stream that follows morphs identical
+// markup over them.
+//
+// A genuinely cold scope still gets the placeholder, and that is a measurement
+// rather than a preference. This response is 75-96ms at 10,003 todos; the tally is
+// 246-273ms, and reading it here would not even replace the subscribe — the stream
+// opening a moment later still pays its own, because a one-shot read cannot seed a
+// subscription. So the cold path would count the workspace twice to move three
+// numerals earlier on the one paint per scope where nobody has asked yet. It is
+// paid once per (workspace, viewer) per process, plus once more if every board on
+// that scope has been shut for the grace period.
 async function boardView(t: Trace, state: BoardState, tags: string[]): Promise<BoardView> {
+  const counts = peekCounts(ctx.workspaceId, viewPersona);
   const { snap, todos, blockers } = await boardData(t, state, null, tags);
+  // `counts` in the record says which of the two this render was, with no read
+  // beside it either way — so "a warm render issues no query" stays checkable from
+  // `?debug=1` rather than being an argument about the code.
+  t.describe({ ...shapeOf(state, tags), counts: counts === null ? "cold" : "warm" });
   return t.render(() => ({
-    sidebar: sidebar(state, null),
-    filterbar: filterBarEl(state, null, tags),
+    sidebar: sidebar(state, counts),
+    filterbar: filterBarEl(state, counts, tags),
     board: boardEl(todos, blockers, state.filter, { state, hasMore: snap.hasMore }),
     visible: visibleLabel(todos.length, snap.hasMore),
+    total: visibleTotal(counts),
   }));
 }
 

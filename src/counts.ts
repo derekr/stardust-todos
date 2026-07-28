@@ -132,6 +132,31 @@ const keyOf = (ws: EntityId, viewer: EntityId): string => `${ws}:${viewer}`;
  *  holding" is a question this app has had to answer the hard way before. */
 export const liveCountScopes = (): Record<string, number> => Object.fromEntries([...subs].map(([k, s]) => [k, s.refs]));
 
+/**
+ * What is already in memory for a scope, for a render that holds nothing.
+ *
+ * The SSR pass has no stream, so it has no hold — it is the response the browser
+ * BLOCKS on, and the stream that will hold this scope opens a moment after it. So
+ * it asks this: no subscribe, no read, no refcount, just the last emission if
+ * something has one. Emitting the placeholder while a value is known is not a
+ * trade, it is simply wrong — a page turn and a filter click cannot move these
+ * numbers, so a document that paints `50 · …` and fills it in is flashing at a
+ * reader over an answer the process was already holding.
+ *
+ * The gap this reads across is exactly the one the linger above exists for. A
+ * navigation closes the old stream and opens a new one, and the new DOCUMENT is
+ * served between them: at that instant the scope is at zero holders with its idle
+ * timer running, still in the map and still holding its last emission. Peeking
+ * does not touch the timer — the stream that follows acquires and clears it —
+ * because a render is not a reason to keep a subscription alive.
+ *
+ * `null` means the scope is genuinely COLD: nothing is subscribed to it and
+ * nothing has been for a grace period. Then the placeholder is right, and the
+ * subscribe the stream is about to pay fills the chips in — see AGENTS.md for the
+ * measurement behind not counting synchronously instead.
+ */
+export const peekCounts = (ws: EntityId, viewer: EntityId): Counts | null => subs.get(keyOf(ws, viewer))?.now ?? null;
+
 function open(ws: EntityId, viewer: EntityId): Sub {
   const key = keyOf(ws, viewer);
   const sub: Sub = { key, refs: 1, now: null, holders: new Set(), ac: new AbortController(), idle: null };

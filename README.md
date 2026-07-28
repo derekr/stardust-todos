@@ -178,8 +178,12 @@ Highlights of the later stages:
     instrumentation over fifteen navigations at 10,003 todos, the counts read is in
     none of the request records and the ~190ms subscribe was paid once: a paint went
     170ms → 65ms unfiltered, 191ms → 38ms on `?pr=high`, 167ms → 72ms on
-    `?st=blocked`. The pill reads `50 · …` for the length of one subscribe on a
-    scope nothing is watching yet, and never again. It also made the numbers LIVE —
+    `?st=blocked`. The server-rendered document reads that same field, so a page turn
+    and a filter click ship the numbers in the HTML the browser blocks on; the pill
+    reads `50 · …` only on a scope nothing is watching yet, for the length of one
+    subscribe — 246-273ms here, against 75-96ms for the rest of the page, which is
+    why that one paint waits rather than counting in front of the reader. It also
+    made the numbers LIVE —
     a write to a todo that is not on the page you are reading moves them now, where
     before only a repaint could.
 - **Clause order is the plan** (`src/board-query.ts`). Once the page was ~95ms the
