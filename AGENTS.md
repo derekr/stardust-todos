@@ -1282,9 +1282,55 @@ worth reading before you re-litigate one:
   paths are funnelled through `patchTodo` and why `addDependency`/`removeDependency`
   /`removeTodo` are the only other doors. `reconcileBlocked()` asks the plain query
   and reports every row that disagrees; it is ~10ms, so run it in tests and after
-  an import. A writeback reactor cannot take this job: verified in both directions,
-  `then.patch` does not fire on a dep edge being added OR retracted, only on a write
-  to the blocker's own `status`, so a todo left `blocked:true` stays wrong forever.
+  an import. A writeback reactor cannot take this job — but the reason first
+  written down here was wrong, and the correct one is narrower and more useful.
+  Re-measured on 0.0.6: a reactor computing `blocked` from an `exists`-bind DOES
+  fire when a dep edge is created AND when one is deleted. Stardust re-runs the
+  WHOLE reactor when a changed fact matches no top-level `where` clause, so an edge
+  write is a full sweep and gets the right answer. What it does not do is propagate
+  the BLOCKER's own `status`, and that is the fatal case: `status` matches
+  `[?t status ?s]`, so invalidation narrows to the blocker's own row and the
+  dependent is never recomputed — `unchanged 1` for a write whose answer changed
+  for somebody else. The dependent keeps `blocked:true` until some UNRELATED edge
+  write triggers the next full sweep and silently repairs it, which is worse than
+  never repairing: the drift is intermittent and nobody can reproduce it. The sweep
+  is also the correlated query this whole entry is about, so it inherits the cliff —
+  65ms per edge write at 2,000 todos, 322ms at 10,000, and at 14,000 the edge write
+  itself is REFUSED (`where subquery execution count limit exceeded (max 10000)`),
+  so you cannot add a dependency at all. `blocked` stays app-side, now for two
+  reasons instead of one.
+
+  `effectiveStatus` and `prank` were then measured SEPARATELY, because they are
+  same-entity — pure functions of `status`/`blocked`/`priority` on the very row
+  being patched, which is the case invalidation handles perfectly. It does handle
+  it perfectly, and `then.patch` is not limited to literals: `[[cond [= ?p high] 0
+  [= ?p med] 1 true 2] ?prank]` then `patch {?t {prank ?prank}}` fired on every
+  transition tried — each priority, each status, `blocked` both ways, a row created
+  without the fields, a row created with WRONG values (corrected inside the
+  creating transaction), a source field added later. The writeback lands in the
+  CAUSING transaction rather than a second one, and cascades to fixpoint, so one
+  reactor sees another's write in the same commit; a non-converging pair does not
+  run away, it fails the transaction with `reactors did not converge after 100
+  cycles`. `runOnSave` defaults to backfilling and filled 14,000 rows in ~524ms,
+  asynchronously — which is also why it cannot replace `migrateDerivedFields`, a
+  boot step that is awaited and returns a count.
+
+  It was still not adopted, and the reasons are cost and governance rather than
+  correctness. Today these fields ride in the SAME merge-patch as their cause
+  (`selfDerived`) and cost zero extra facts. A reactor costs about six facts per
+  firing transaction per reactor — the `stardust/reactors` link plus a run record —
+  measured as 2,000 single-field writes going from 5,802 asserted facts to 19,340,
+  and 4.7ms mean to 6.6ms. On an append-only store where this repo has already
+  measured that fact count taxes every unrelated write, paying eleven facts a write
+  for an invariant that is already atomic is the wrong direction. Governance is the
+  harder objection: a reactor writeback BYPASSES the schema. `prank 999` went
+  straight into a field declared `maximum 2`, through the schema-validated patch
+  route, with no error — so the two fields the Todo schema constrains would stop
+  being constrained, and the validator check in `refreshDerived` would have nothing
+  left to guard. Retracting a source leaves its derived value stale forever
+  (retract `priority`, `prank` keeps its old number), a hole `reconcileBlocked`
+  does not cover. And the rule would exist twice: once in RON, once in TypeScript
+  for the render fallback. Revisit if writeback ever validates against the schema.
 - Full-text search vs a prefix range, for the blocker picker: FULL TEXT, and the
   deciding measurement was not speed. The range read works today with no setup
   (84ms, right answer) and the analyzer costs a 3.6s backfill, 16MiB and ~1ms per
