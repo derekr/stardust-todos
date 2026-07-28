@@ -18,6 +18,7 @@ import {
   encodeFilter,
   toggled,
 } from "./filter.ts";
+import { CATALOG } from "./commands.ts";
 import { validators } from "./field-registry.ts";
 import { TAG_LABEL_MAX, TagLabelError, canonicalTags, tagClauses, tagLabel } from "./tags.ts";
 import { validationPlan } from "./typed-query.ts";
@@ -406,4 +407,53 @@ test("a timing is never recorded without the row count it was measured over", as
   assert.deepEqual(rec.shape, { st: ["blocked"], page: 0 });
   for (const r of rec.reads) assert.equal(typeof r.ms, "number");
   assert.equal(recentRequests()[0], rec); // newest first, so /inspect reads top-down
+});
+
+// ---------------------------------------------------------------------------
+// The command catalog. These are checks on DATA, which is the point: applicability
+// is a fact on the command, so the things that can go wrong with it are things a
+// query cannot catch — a state no command covers reads as an empty menu, and a
+// state two mutually exclusive commands both cover reads as a menu offering to
+// complete a completed todo. Neither is an error anywhere.
+// ---------------------------------------------------------------------------
+const TODO_STATE_DOMAIN = ["todo", "doing", "done"];
+const appliesTo = (cmdId: string) => CATALOG.find((c) => c.cmdId === cmdId)?.appliesTo;
+
+test("every command declares the states it applies to, from its scope's domain", () => {
+  // A command with no `appliesTo` is not a permissive command, it is an invisible
+  // one: the reactor names the field in a fact clause, and a row that has never
+  // been written a field a clause names is skipped in silence.
+  for (const c of CATALOG) {
+    assert.ok(c.appliesTo.length > 0, `${c.cmdId} applies to nothing`);
+    const domain = c.scope === "global" ? ["global"] : TODO_STATE_DOMAIN;
+    for (const s of c.appliesTo) assert.ok(domain.includes(s), `${c.cmdId} applies to unknown state '${s}'`);
+  }
+  assert.equal(new Set(CATALOG.map((c) => c.cmdId)).size, CATALOG.length); // cmdId names one command
+});
+
+test("complete and reopen PARTITION the todo states — never both, never neither", () => {
+  // The bug this replaced was a done todo offering "Mark complete". The fix is only
+  // as good as the data, and the data is only right if these two cover every state
+  // between them and overlap in none of them.
+  const complete = appliesTo("todo.complete") ?? [];
+  const reopen = appliesTo("todo.reopen") ?? [];
+  assert.deepEqual([...complete].sort(), ["doing", "todo"]);
+  assert.deepEqual([...reopen], ["done"]);
+  assert.deepEqual([...complete, ...reopen].sort(), [...TODO_STATE_DOMAIN].sort());
+  assert.equal(complete.filter((s) => reopen.includes(s)).length, 0);
+  // Same slot in the menu, seen from either side of `done`.
+  assert.equal(
+    CATALOG.find((c) => c.cmdId === "todo.complete")?.order,
+    CATALOG.find((c) => c.cmdId === "todo.reopen")?.order,
+  );
+});
+
+test("no todo state leaves the ••• menu empty", () => {
+  // `blocked` is deliberately absent from this list: the predicate keys on the
+  // stored `status`, which is user intent and never holds it, so a blocked todo
+  // arrives here as `todo` or `doing` and still gets offered completion.
+  for (const state of TODO_STATE_DOMAIN) {
+    const n = CATALOG.filter((c) => c.scope === "todo" && c.appliesTo.includes(state)).length;
+    assert.ok(n > 0, `no command applies to a '${state}' todo`);
+  }
 });

@@ -47,6 +47,9 @@ interface DeclaredFields {
   danger: boolean;
   scope: "global" | "todo";
   order: number;
+  // the states a command applies to, as a list component — the same shape `tags`
+  // uses, and for the same reason: one field per state cannot express two.
+  appliesTo: string[];
 }
 
 /**
@@ -88,4 +91,5 @@ export const validators: Record<string, (v: unknown) => boolean> = {
   danger: (v) => typeof v === "boolean",
   scope: (v) => v === "global" || v === "todo",
   order: (v) => typeof v === "number",
+  appliesTo: (v) => Array.isArray(v) && v.every((x) => typeof x === "string"),
 };

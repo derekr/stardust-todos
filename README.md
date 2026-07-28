@@ -342,7 +342,7 @@ Highlights of the later stages:
 - `src/counts.ts`        — the count chips' tally, held open per (workspace, viewer) instead of read per render.
 - `src/queries.ts`       — the declared reactors (one definition each, typed readers out).
 - `src/indexes.ts`       — field-index policy: value indexes for the fields those reactors key on, and the english text index behind the blocker picker's search.
-- `src/commands.ts`      — commands as entities; the role gate lives in the query.
+- `src/commands.ts`      — commands as entities; the role gate AND the state rule ("Mark complete" does not apply to a done todo) both live in the query.
 - `src/cli.ts`           — the CLI (operates in the default workspace).
 - `src/server.ts`        — Node HTTP + Datastar web server (CQRS + workspace switching).
 - `src/view.ts`          — server-rendered HTML: `#wsbar` switcher + morph-friendly `#list`.

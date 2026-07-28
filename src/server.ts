@@ -137,10 +137,14 @@ function runnableBinds(name: string, from: { ps?: string; todo?: string }): Reco
     case "todo-tags":
     case "todo-blocks":
       return from.todo ? { todo: `{# ${from.todo}}` } : {};
+    // `state` is not optional decoration: both bodies read it through an
+    // expression, so a paste without it is `unbound input var ?state` rather than a
+    // menu. The global sample uses the workspace's one state; a todo-scoped paste
+    // wants a status ('todo', 'doing' or 'done') in its place.
     case "command-menu":
-      return { scope: "'global'", rank: "2" };
+      return { scope: "'global'", rank: "2", state: "'global'" };
     case "command-authz":
-      return { cmdId: "'workspace.archive'", rank: "2" };
+      return { cmdId: "'workspace.archive'", rank: "2", state: "'global'" };
     default:
       return {};
   }
@@ -618,9 +622,13 @@ async function detailData(t: Trace, id: number): Promise<{ todo: any; opts: Deta
     (h) => h.length,
   )) as HistEntry[];
   const role = await curRole();
+  // The menu is asked about THIS todo, not about todos in general: `status` is the
+  // bind that decides whether it offers "Mark complete" or "Reopen todo". It is the
+  // stored status rather than `effStatus` computed two lines up — see TODO_STATES
+  // in commands.ts for why a blocked todo still gets offered completion.
   const commands = await t.read(
     "commands",
-    () => visibleCommands("todo", role),
+    () => visibleCommands({ scope: "todo", status: todo.status }, role),
     (c) => c.length,
   );
   const canPublish = e.draft === true && (e.author as { "#": number } | undefined)?.["#"] === viewPersona;
@@ -932,27 +940,52 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         const role = await curRole();
-        stream.patchElements(palette(await visibleCommands("global", role)));
+        stream.patchElements(palette(await visibleCommands({ scope: "global" }, role)));
       });
       return;
     }
 
     // Execute a command: /command/<cmdId>[/<targetTodoId>]. The write boundary
-    // re-checks the SAME catalog + role, so a denied command can't slip through.
+    // re-checks the SAME catalog, role AND state, so neither a denied command nor
+    // one that does not apply here can slip through by being POSTed directly.
+    //
+    // Reading the target's status costs this path one read, and that is the honest
+    // price of checking state at the boundary rather than trusting the menu that
+    // rendered a minute ago: the todo may have been completed in between, by anyone.
+    // A todo that no longer exists has no state, so nothing applies to it — the
+    // absent status is a refusal rather than a bind of `undefined`.
     if (seg[0] === "command" && method === "POST") {
       const cmdId = seg[1];
       const target = seg[2] ? Number(seg[2]) : null;
       const role = await curRole();
-      const allowed = await authorizeCommand(cmdId, role);
+      let allowed: Awaited<ReturnType<typeof authorizeCommand>> = null;
+      if (target === null) {
+        allowed = await authorizeCommand(cmdId, { scope: "global" }, role);
+      } else {
+        const status = (await readEntity(target))?.status as Status | undefined;
+        if (status) allowed = await authorizeCommand(cmdId, { scope: "todo", status }, role);
+      }
       ServerSentEventGenerator.stream(req, res, async (stream) => {
         if (!allowed) {
-          stream.patchSignals(JSON.stringify({ toast: `Denied: your role cannot run "${cmdId}".` }));
+          // One message for all three empties, because the query makes no
+          // distinction between them and this copy should not claim one: saying
+          // "your role cannot run this" over a completed todo would be a lie.
+          stream.patchSignals(
+            JSON.stringify({ toast: `Refused: "${cmdId}" does not apply here, or your role cannot run it.` }),
+          );
           return;
         }
         let msg = "";
         if (cmdId === "todo.complete" && target) {
           await setStatus(ctx, target, "done", actorName());
           msg = "Marked complete.";
+        } else if (cmdId === "todo.reopen" && target) {
+          // The same door every other status write uses: `setStatus` keeps `done`
+          // consistent with `status` and `patchTodo` refreshes the derived fields,
+          // so reopening a todo puts its dependents' `blocked` back where writing
+          // `status` directly would leave `reconcileBlocked` reporting divergences.
+          await setStatus(ctx, target, "todo", actorName());
+          msg = "Reopened.";
         } else if (cmdId === "todo.delete" && target) {
           await removeTodo(ctx, target);
           msg = "Todo deleted.";

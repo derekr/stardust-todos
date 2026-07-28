@@ -50,6 +50,10 @@ import { BASE } from "./stardust.ts";
  * by the value of a whole list, and a value index over one would be an index of
  * list identities. Verified on the demo rather than assumed: one page under a tag
  * filter is ~270ms at 10,003 todos with no index on the field at all.
+ *
+ * `appliesTo` is absent for exactly that reason and is the cheap case of it: the
+ * command reactors bind it as a var and test the read's `?state` against it with
+ * `any`, over a catalog of eight rows that `[?c kind command]` has already found.
  */
 export const KEYED_FIELDS = [
   "kind",

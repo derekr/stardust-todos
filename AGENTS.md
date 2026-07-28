@@ -349,8 +349,12 @@ earlier where, bind, or scalar clause binds it.
 So a gate expressed this way FAILS CLOSED, which is why the command
 authorization check is shaped that way — forgetting `?rank` cannot quietly
 return every command. Guards built this way hold under rephrasing: comparing
-directly, binding the comparison to a var and testing it, and wrapping it in
-`not` were all measured, and all refuse the omitted bind.
+directly, binding the comparison to a var and testing it, wrapping it in
+`not`, and comparing INSIDE A LAMBDA were all measured, and all refuse the
+omitted bind. The last one is what let the command reactors take a second gate:
+`?state` is read by a `fn` inside an `any`, and omitting it is the same
+`unbound input var` refusal rather than a menu of everything (see the
+applicability entry below).
 
 **But the check is EVALUATION-time, not plan-time — it needs a row to reach the
 predicate.** This is the part to be careful about, because the same reactor with
@@ -895,6 +899,50 @@ so outright. This is the same shape as the omitted-bind hazard above: not an err
 not a subset, a SUPERSET. Assert a row count against a query you have just
 rewritten, every time.
 
+**A per-ROW list tested against a per-READ value is `any` over a lambda, and the
+lambda SEES THE BIND.** The entry above says what to reach for when the values are
+in the query and the row has one of them; the command menu needed the mirror image —
+each command carries the states it applies to, and the state to test arrives with
+the reader. Neither obvious spelling survives: a disjunction of fact patterns is the
+constant `true` above, and `contains` wants a `{#set}` LITERAL, which a STORED body
+cannot vary per read (`[contains ?applies 'done']` over a list var is `invalid
+argument type for contains`). What works is the shape tags.ts already uses from the
+other side, with the set literal replaced by the bind:
+
+```
+["?c", "appliesTo", "?applies"],
+["any", ["fn", ["s"], ["=", "s", "?state"]], "?applies"]
+```
+
+`?state` is not a parameter of the `fn` and nothing says a lambda body may read the
+enclosing query's binds. It can, which is the whole finding — one stored reactor
+then serves every state. Measured on a throwaway with the catalog seeded and one
+reactor read six ways:
+
+| bind | rows |
+| --- | --- |
+| `{scope 'todo' rank 2 state 'todo'}` | complete, delete |
+| `{scope 'todo' rank 2 state 'doing'}` | complete, delete |
+| `{scope 'todo' rank 2 state 'done'}` | **reopen**, delete |
+| `{scope 'todo' rank 0 state 'done'}` | reopen |
+| `{scope 'global' rank 2 state 'global'}` | invite |
+| the same, with `state` omitted | `unbound input var ?state` |
+
+The last row is the reason this is a boundary and not a decoration: the same two
+clauses are in `command-authz`, so POSTing `todo.complete` at a todo that is already
+done is REFUSED rather than merely absent from a menu — and a caller who forgets the
+bind gets an error, never the whole catalog. An app-side `if` in the renderer would
+have hidden the button and left the write open, which is the drift the role gate was
+put in the query to avoid.
+
+Two modelling notes that are not about the engine. A workspace-scoped command needs
+a state to apply to or the same clause cannot serve both scopes, so it carries
+`appliesTo ['global']` and the palette binds `state 'global'` — a wildcard would be
+a second rule inside the predicate. And the todo state to key on is `status`, not
+`effectiveStatus`: they differ only for a blocked todo, and completing a blocked
+todo is perfectly meaningful, so keying on the derived one would force every command
+to remember to list `blocked` and would hide them silently when it forgot.
+
 **And a filter that filters NOTHING is not free — which is the same sentence read
 for cost rather than for correctness.** An empty facet selection means "all", and
 the board spelled that as the whole domain: `[or [= ?priority low] [= ?priority
@@ -1194,6 +1242,27 @@ worth reading before you re-litigate one:
   longer than the `project()` they replaced. It was taken for the fail-closed
   bind and for one definition serving menu and write boundary, NOT for brevity —
   the same trade as promoting the per-render queries. Expect it again.
+- Command APPLICABILITY: a fact on the command vs an `if` in the renderer — the
+  FACT, and it is the same call as the role gate made for a rule that is not about
+  permission at all. A done todo used to be offered "Mark complete", because the
+  catalog knew the viewer's rank and nothing about the thing the menu was opened
+  on. `appliesTo` is a list on the command and `?state` is a bind, so both reactors
+  filter on it and the write boundary refuses what the menu would not have shown.
+  What it gives up is a second fact per command to keep true, and the check that
+  replaces the type system here is a DATA test (app.test.ts): every command applies
+  to something, no state leaves the menu empty, and `complete`/`reopen` partition
+  the three states rather than overlapping. Two rules in one query also means one
+  empty result for three different reasons, so the refusal copy can no longer say
+  "your role cannot run this" — it says both, because the query makes no
+  distinction and neither should the sentence.
+- A done todo REOPENS rather than showing a shorter menu. The catalog is data, so
+  the alternative was free — two entries and no `todo.reopen` — and a menu that
+  quietly shrinks is honest. It was still the wrong choice: "Mark complete"
+  disappearing with nothing in its place reads as a bug in the menu, while
+  "Reopen todo" in the same slot says WHY it went, and it is the more useful
+  action. The two carry the same `order` on purpose, because they can never both
+  apply. Reopening goes through `setStatus`, not a bare `status` write, for the
+  reason the `blocked` entry below spells out.
 - Derive-on-read vs materialise, for `blocked`: REVERSED, and this is the entry
   that contradicts the advice at the top of this file. A correlated `exists` is
   executed once per candidate row, and Stardust caps TOTAL subquery executions at

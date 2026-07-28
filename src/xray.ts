@@ -256,15 +256,19 @@ await blockedByTodo.read({ todo: {"#": id} });
     src: "src/board.ts · blockersFor() · searchTodoOptions()",
   },
   commands: {
-    title: "Commands — the role gate is the query",
-    mech: 'Every command in this menu is a Stardust ENTITY (kind:"command") carrying its label, the role rank it needs, whether a denied viewer sees it grayed, and its scope. The viewer\'s rank is a BIND, so the gate is a clause: [">=", "?rank", "?minRank"] decides enabled, ["or", "?enabled", "?showWhenDenied"] decides visible, and rows that fail never leave the database. The app does no filtering and holds no visibility flag — this menu reads {scope \'todo\' rank N} and the ⌘K palette reads {scope \'global\' rank N}, same definition. The write boundary (POST /command/<id>) asks a second reactor for that one cmdId at that rank: an EMPTY result is the denial, so the verdict is not re-derived in TypeScript. Granting Teammate the right to archive stays a fact write, not a deploy. Forgetting the rank cannot silently open the gate — ?rank is read by an expression, and an expression cannot invent a variable, so the read fails with \'unbound input var ?rank\' rather than matching every row. That is the opposite of a fact-clause var like ?scope, where an absent bind quietly returns everything.',
-    code: `// the menu: Stardust decides what you may SEE
+    title: "Commands — the role gate AND the state rule are the query",
+    mech: 'Every command in this menu is a Stardust ENTITY (kind:"command") carrying its label, the role rank it needs, whether a denied viewer sees it grayed, its scope, and the states it APPLIES TO. Two things decide what you get, and both are clauses. The viewer\'s rank is a BIND: [">=", "?rank", "?minRank"] decides enabled, ["or", "?enabled", "?showWhenDenied"] decides visible, and rows that fail never leave the database. The subject\'s state is a bind too: the command\'s `appliesTo` is a LIST and ["any", ["fn", ["s"], ["=", "s", "?state"]], "?applies"] keeps only the commands that mean something on a thing in that state — which is why a DONE todo offers "Reopen todo" where an open one offers "Mark complete", with no `if` anywhere in the renderer. The two rules are different in kind and the query treats them differently: a denied command can still be advertised greyed with a reason, an inapplicable one is simply not a member of this menu. The app does no filtering and holds no visibility flag — this menu reads {scope \'todo\' rank N state \'done\'} and the ⌘K palette reads {scope \'global\' rank N state \'global\'}, same definition. The write boundary (POST /command/<id>) asks a second reactor for that one cmdId at that rank in that state, reading the target\'s status fresh: an EMPTY result is the refusal, so POSTing todo.complete at a todo that was completed a second ago is REFUSED rather than merely hidden, and the verdict is never re-derived in TypeScript. Granting Teammate the right to archive, or letting an action apply to one more state, stays a fact write rather than a deploy. Forgetting either bind cannot silently open the gate — ?rank and ?state are both read by expressions, and an expression cannot invent a variable, so the read fails with \'unbound input var ?rank\' rather than matching every row. That is the opposite of a fact-clause var like ?scope, where an absent bind quietly returns everything.',
+    code: `// the menu: Stardust decides what you may SEE, here
 const commandMenu = define("command-menu", {
   find: ["?cmdId", "?label", "?minRank",
          "?enabled", "?danger", "?order"],
   where: [
     ["?c", "kind", "command"],
     ["?c", "scope", "?scope"],            // supplied per read
+    ["?c", "appliesTo", "?applies"],      // e.g. ['todo' 'doing']
+    ["any", ["fn", ["s"],                 // …does this state
+             ["=", "s", "?state"]],       //    make it meaningful?
+     "?applies"],
     ["?c", "minRank", "?minRank"],
     ["?c", "showWhenDenied", "?showWhenDenied"],
     [[">=", "?rank", "?minRank"], "?enabled"],
@@ -275,19 +279,23 @@ const commandMenu = define("command-menu", {
   orderBy: ["?order"],
 });
 
-// the write boundary: no rows IS the denial
+// the write boundary: no rows IS the refusal
 const commandAuthz = define("command-authz", {
   where: [["?c", "cmdId", "?cmdId"],
+          ["?c", "appliesTo", "?applies"],
+          ["any", ["fn", ["s"], ["=", "s", "?state"]], "?applies"],
           ["?c", "minRank", "?minRank"],
           [">=", "?rank", "?minRank"], /* … */],
 });
 
-await visibleCommands("todo", role)   // this menu
-await authorizeCommand(cmdId, role)   // same rule, on write`,
-    src: "src/queries.ts · commandMenu + commandAuthz · src/commands.ts · visibleCommands() + authorizeCommand()",
+// this menu, asked about THIS todo
+await visibleCommands({ scope: "todo", status }, role)
+// same two rules, on the write
+await authorizeCommand(cmdId, { scope: "todo", status }, role)`,
+    src: "src/queries.ts · commandMenu + commandAuthz · src/commands.ts · CATALOG + visibleCommands() + authorizeCommand()",
     reactors: [
-      { name: "command-menu", bind: "{scope 'global' rank 2}" },
-      { name: "command-authz", bind: "{cmdId 'workspace.archive' rank 2}" },
+      { name: "command-menu", bind: "{scope 'global' rank 2 state 'global'}" },
+      { name: "command-authz", bind: "{cmdId 'workspace.archive' rank 2 state 'global'}" },
     ],
   },
   activity: {

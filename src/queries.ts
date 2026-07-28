@@ -235,9 +235,11 @@ export const blockedByTodo = define("todo-blocks", {
 } as const);
 
 // ---------------------------------------------------------------------------
-// Commands. The role gate is IN the query: both reactors below take `?rank` and
-// compare it against each command's `minRank`, so "may this persona run this"
-// is answered by Stardust rather than reconstructed in TypeScript afterwards.
+// Commands. BOTH halves of "may this persona run this, on this thing" are IN the
+// query: the reactors below take `?rank` and compare it against each command's
+// `minRank`, and they take `?state` and test it against the command's `appliesTo`.
+// So neither the role rule nor the applicability rule is reconstructed in
+// TypeScript afterwards.
 //
 // `?rank` is read by an expression, and that changes the bind hazard for these
 // two specifically. An ordinary fact clause BINDS its var by scanning, so an
@@ -252,13 +254,39 @@ export const blockedByTodo = define("todo-blocks", {
 // the general rule is weaker than "an absent bind always errors". It is "an absent
 // expression-only bind never widens the answer". See AGENTS.md for where that
 // distinction bites (`visibleTo`).
+//
+// `?state` is the second half of the same shape, and it is what stopped a DONE todo
+// offering "Mark complete". Which states a command applies to is a fact on the
+// command — `appliesTo`, a list — and the test is an expression over it:
+//
+//   ["?c", "appliesTo", "?applies"],
+//   ["any", ["fn", ["s"], ["=", "s", "?state"]], "?applies"]
+//
+// The lambda CAPTURES the outer bind (measured — the interesting result, since
+// nothing documents it), so one stored body serves every state, and an omitted
+// `?state` fails exactly the way an omitted `?rank` does: `unbound input var
+// ?state`, never a superset. That is why applicability lives here rather than in
+// the renderer — `command-authz` gets the same two clauses, so a command the menu
+// would not have shown is REFUSED at the write boundary rather than merely hidden.
+//
+// A disjunction of fact patterns would have been the obvious way to write this and
+// is a constant `true` (see derive.ts); `contains` wants a `{#set}` LITERAL, which a
+// stored body cannot vary per read. A list component plus `any` is the shape that
+// is left, and it is the one tags.ts already uses.
 
-/** Commands of ONE scope that a rank may SEE, ordered — the ⌘K palette and the
- *  per-todo ••• menu are this one reactor read with a different bind.
+/** Commands of ONE scope that a rank may SEE on a thing in ONE state, ordered —
+ *  the ⌘K palette and the per-todo ••• menu are this one reactor read with a
+ *  different bind.
  *
  *  `visible` is `enabled || showWhenDenied`: a command the persona cannot run
  *  still appears greyed when it is meant to advertise itself, and vanishes
  *  entirely otherwise. Both the filter and the ordering are the engine's.
+ *
+ *  Applicability is not the same kind of rule as the rank, and the difference is
+ *  why it filters instead of projecting: a command that does not apply is not
+ *  denied, it is MEANINGLESS here, so there is no greyed-out form of it and no
+ *  copy to write. "Mark complete" and "Reopen todo" are the demonstration — they
+ *  carry the same `order` because they can never both apply.
  *
  *  `?minRank` stays in `find` even though the gate already used it, because the
  *  DENIAL COPY is derived from it app-side ("Owner only" vs "Members only").
@@ -273,6 +301,8 @@ const commandMenu = define("command-menu", {
   where: [
     ["?c", "kind", "command"],
     ["?c", "scope", "?scope"],
+    ["?c", "appliesTo", "?applies"],
+    ["any", ["fn", ["s"], ["=", "s", "?state"]], "?applies"],
     ["?c", "minRank", "?minRank"],
     ["?c", "showWhenDenied", "?showWhenDenied"],
     [[">=", "?rank", "?minRank"], "?enabled"],
@@ -286,16 +316,24 @@ const commandMenu = define("command-menu", {
   orderBy: ["?order"],
 } as const);
 
-/** ONE command, returned only if this rank may RUN it — the write boundary.
+/** ONE command, returned only if this rank may RUN it ON A THING IN THIS STATE —
+ *  the write boundary.
  *
- *  Not scoped: a cmdId names one command wherever it lives. A denied command and
- *  an unknown one are both the empty result, which is exactly the distinction the
- *  caller already declined to make. */
+ *  Not scoped: a cmdId names one command wherever it lives. A denied command, an
+ *  inapplicable one and an unknown one are all the empty result, which is exactly
+ *  the distinction the caller already declined to make.
+ *
+ *  The applicability clauses are the SAME two the menu has, in the same order, and
+ *  that is the whole point: `todo.complete` posted for a done todo returns nothing
+ *  here, so hiding it in the menu and refusing it on the write are one rule read
+ *  twice rather than two rules that can drift. */
 const commandAuthz = define("command-authz", {
-  find: ["?cmdId", "?label", "?minRank", "?showWhenDenied", "?danger", "?scope", "?order"],
+  find: ["?cmdId", "?label", "?minRank", "?showWhenDenied", "?danger", "?scope", "?order", "?applies"],
   where: [
     ["?c", "kind", "command"],
     ["?c", "cmdId", "?cmdId"],
+    ["?c", "appliesTo", "?applies"],
+    ["any", ["fn", ["s"], ["=", "s", "?state"]], "?applies"],
     ["?c", "minRank", "?minRank"],
     [">=", "?rank", "?minRank"],
     ["?c", "label", "?label"],
@@ -309,14 +347,19 @@ const commandAuthz = define("command-authz", {
 /**
  * Both readers take their scope as required ARGUMENTS rather than a bind the
  * caller assembles, and the `Declared`s above are unexported so `.read({})` is
- * unreachable. `?rank` now fails closed on its own, but `?scope` and `?cmdId` are
- * fact-clause vars and still do not: omit `?scope` and you get both scopes,
- * omit `?cmdId` and you get every command the rank allows — ordered, and looking
- * perfectly healthy. A missing function argument is the same mistake the
+ * unreachable. `?rank` and `?state` now fail closed on their own, but `?scope` and
+ * `?cmdId` are fact-clause vars and still do not: omit `?scope` and you get both
+ * scopes, omit `?cmdId` and you get every command the rank allows — ordered, and
+ * looking perfectly healthy. A missing function argument is the same mistake the
  * compiler catches for free.
+ *
+ * `state` is a string here rather than a union because its domain is the union of
+ * two: a todo's `status` and the one state a workspace has. `stateOf` in
+ * commands.ts is the only thing that builds one, and it is where that is checked.
  */
-export const commandMenuRows = (scope: Scope, rank: number) => commandMenu.read({ scope, rank });
-export const commandAuthzRows = (cmdId: string, rank: number) => commandAuthz.read({ cmdId, rank });
+export const commandMenuRows = (scope: Scope, rank: number, state: string) => commandMenu.read({ scope, rank, state });
+export const commandAuthzRows = (cmdId: string, rank: number, state: string) =>
+  commandAuthz.read({ cmdId, rank, state });
 
 /** Everything `npm run stardust:setup` provisions, besides the board reactor. */
 export const DECLARED = [
